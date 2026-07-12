@@ -1,0 +1,226 @@
+================================================================================
+                    PPE (Packet Processing Engine) Feature Description
+                         Based on RTL Code Review
+================================================================================
+
+1. OVERVIEW
+--------------------------------------------------------------------------------
+The PPE is a packet processing engine that receives packets from multiple input
+lanes, schedules them through an array of Forward Engine (FE) units for
+processing, and outputs results in strict sequence order.
+
+The design consists of three modules:
+  - ppe_top.v   : Top-level wrapper instantiating ppe_core + FE mock array
+  - ppe_core.v  : Core scheduler with ROB, dependency tracking, reorder logic
+  - fe_mock.v   : Mock Forward Engine for bring-up / debug (not production FE)
+
+2. ARCHITECTURE
+--------------------------------------------------------------------------------
+2.1 Top-Level (ppe_top)
+    - Instantiates one ppe_core and LANE_NUM (default 4) fe_mock instances
+    - Wires input packets/descriptors directly to ppe_core
+    - Wires ppe_core outputs directly to top-level outputs
+    - FE array connected to ppe_core via valid/ready handshake pairs and
+      packet/result data buses
+
+2.2 Core Scheduler (ppe_core)
+    The core maintains a Reorder Buffer (ROB) with configurable depth
+    (default 32 entries). Each ROB entry tracks one in-flight packet through
+    its lifecycle.
+
+    2.2.1 ROB Entry States:
+          ST_EMPTY      (0): Entry is free / available
+          ST_WAIT_DELAY (1): Waiting for a configurable delay timer to expire
+          ST_WAIT_DEP   (2): Waiting for a dependency (prior result) to resolve
+          ST_READY_FE   (3): Ready to be dispatched to a Forward Engine lane
+          ST_IN_FE      (4): Currently being processed by an FE lane
+          ST_DONE       (5): FE processing complete, awaiting in-order commit
+
+    2.2.2 Input Path:
+          - Packets arrive on LANE_NUM parallel input ports with valid signals
+          - Each packet is 128 bits wide, accompanied by a 5-bit descriptor
+          - The lower 32 bits of the packet are interpreted as the sequence
+            number (seq); the lower ROB_AW bits (5 bits) of seq are used as
+            the ROB index for storage
+          - Backpressure (bkps) is asserted when:
+            a) An error condition is active (error_valid), OR
+            b) Free ROB entries < number of simultaneously valid inputs
+          - On the first valid input after reset, the "started" flag is set
+            and next_output_seq is initialized to the minimum seq among
+            the current valid inputs
+
+    2.2.3 Descriptor Format (5 bits):
+          desc[1:0] : Delay count (0-3 cycles of stall before dependency check)
+          desc[4:2] : Dependency offset — the number of sequence steps back
+                      to the dependency source. 0 means no dependency (bypass).
+
+    2.2.4 Dependency Tracking:
+          - When a packet has desc[4:2] != 0, its dependency target is
+            (rob_seq - desc[4:2])
+          - The scheduler searches the result buffer (res_valid[]) for a
+            matching sequence number
+          - Once the dependency result is found, the packet can advance to
+            ST_READY_FE
+          - Dependencies are resolved both in the combinational dispatch path
+            (for immediate dispatch) and the sequential state machine path
+            (for waking up waiting entries)
+
+    2.2.5 Dispatch / Scheduling:
+          - Combinational block scans lanes 0..LANE_NUM-1, and for each
+            available lane (fe_busy=0, fe_in_ready=1, no error), scans
+            ROB entries 0..ROB_DEPTH-1 for entries in ST_READY_FE state
+          - Priority: lower ROB index wins within each lane
+          - When dependency is resolved, packet data is transformed:
+            packet[127:32] ^= dep_data[127:32] (XOR with dependency result)
+            packet[31:0] stays unchanged (preserves sequence number)
+          - If no dependency (desc[4:2]==0), packet is dispatched unmodified
+          - Per-entry mutual exclusion via selected_mask prevents double-dispatch
+
+    2.2.6 FE Return Path:
+          - When FE asserts fe_out_valid, the core writes the processed packet
+            and result back to the ROB entry (rob_out_pkt, res_data)
+          - ROB state advances to ST_DONE; res_valid is set for dependency
+            resolution by other entries
+          - Spurious FE output (fe_out_valid when fe_busy=0) triggers
+            ERR_FE_SPUR error
+
+    2.2.7 Output Commit Path (Strict Ordering):
+          - Output is committed in strict sequence number order
+          - Each cycle, the core searches for up to LANE_NUM ST_DONE entries
+            whose seq equals (next_output_seq + emit_count)
+          - Found entries are emitted on rotating output lanes (round-robin
+            starting from out_start_lane)
+          - Emitted entries are freed (rob_active=0, state=ST_EMPTY)
+          - next_output_seq and out_start_lane are updated
+
+    2.2.8 Error Handling:
+          ERR_DUP_SEQ (0x01): New input maps to an already-active ROB index
+          ERR_BAD_DEP (0x02): Defined but NOT IMPLEMENTED in RTL
+          ERR_FE_SPUR (0x03): FE returns data for a lane not marked busy
+
+2.3 Mock Forward Engine (fe_mock)
+    - Simulates a real FE with a configurable processing delay
+    - Delay is computed from packet[33:32] + 1 (range: 1-4 cycles)
+    - fe_in_ready = !busy && !fe_out_valid (can accept new work when idle
+      and previous output has been consumed)
+    - Processing: after delay, transforms packet:
+      * packet[31:0] preserved (seq unchanged)
+      * packet[127:32] = {pkt[126:32], pkt[127]} ^ 96'h13579bdf2468ace055aa0000
+      * result = packet ^ 128'h0f0ff0f055aaaa55123456789abcdef0
+    - FE_ID parameter allows per-instance identification (not functionally used)
+
+3. KEY DESIGN PARAMETERS (defaults)
+--------------------------------------------------------------------------------
+    LANE_NUM  = 4      (parallel processing lanes)
+    PACKET_W  = 128    (packet width in bits)
+    DESC_W    = 5      (descriptor width in bits)
+    RESULT_W  = 128    (result data width in bits)
+    ROB_DEPTH = 32     (reorder buffer depth)
+    ROB_AW    = 5      (ROB address width = log2(ROB_DEPTH))
+
+4. INTERFACE SIGNALS
+--------------------------------------------------------------------------------
+    Inputs:
+      clk, rst_n                          : Clock and active-low reset
+      in_valid  [LANE_NUM-1:0]            : Input valid per lane
+      in_packet [LANE_NUM*PACKET_W-1:0]   : Input packet data (packed lanes)
+      in_desc   [LANE_NUM*DESC_W-1:0]     : Input descriptor (packed lanes)
+
+    Outputs:
+      bkps                                : Backpressure (stall upstream)
+      out_valid  [LANE_NUM-1:0]           : Output valid per lane
+      out_packet [LANE_NUM*PACKET_W-1:0]  : Output packet data (packed lanes)
+      error_valid                         : Error flag
+      error_code  [7:0]                   : Error type code
+
+5. DATA FLOW SUMMARY
+--------------------------------------------------------------------------------
+    Input → [Backpressure check] → ROB allocation (seq[4:0] as index)
+    → ST_WAIT_DELAY (if delay>0) → ST_WAIT_DEP (if has dependency)
+    → ST_READY_FE → Scheduler dispatch → FE processing (ST_IN_FE)
+    → ST_DONE → In-order commit → Output
+
+================================================================================
+                         RISK ANALYSIS (from RTL review)
+================================================================================
+
+[HIGH] R1: ROB Index Aliasing
+    The ROB index is derived from seq[4:0] (lower 5 bits of 32-bit sequence
+    number). Two packets with different full sequence numbers that share the
+    same lower 5 bits (e.g., seq=1 and seq=33) map to the same ROB slot.
+    The ERR_DUP_SEQ check only catches the case when the slot is still active.
+    If a packet with seq=33 arrives while seq=1 is still in-flight, an error
+    is raised. But after seq=1 commits and the slot frees, seq=33 will
+    overwrite it — this is by design but means the ROB can only hold 32
+    in-flight packets TOTAL, not 32 per any 32-seq window.
+
+[HIGH] R2: Deadlock — Unresolvable Dependency
+    If a packet depends on a sequence number that never arrives (desc[4:2]
+    pointing to a non-existent or dropped seq), the ROB entry will be stuck
+    in ST_WAIT_DEP forever. There is NO timeout, NO error detection, and NO
+    recovery mechanism. This will eventually consume all ROB entries and
+    deadlock the entire pipeline. ERR_BAD_DEP is defined but NEVER asserted.
+
+[HIGH] R3: Output Commit Head-of-Line Blocking
+    Output commit requires strict sequence order. If any packet gets stuck
+    (in ST_WAIT_DEP, ST_IN_FE, or simply lost), ALL subsequent packets with
+    higher sequence numbers are blocked from output indefinitely. There is no
+    timeout, no skip mechanism, no exception path.
+
+[HIGH] R4: ERR_DUP_SEQ Silent Overwrite on Pre-existing Error
+    In the input collector (line 308-326): if error_valid is already high
+    and a new packet arrives with rob_active[rob_idx]=1, the condition
+    `rob_active[rob_idx] && !error_valid` is FALSE, so execution falls into
+    the `else` branch, SILENTLY OVERWRITING the active ROB entry. This
+    corrupts in-flight packet state.
+
+[MEDIUM] R5: No ROB Entry Timeout
+    There is no mechanism to detect or recover from an FE lane that never
+    returns a result. If fe_mock (or real FE) hangs, the ROB entry stays in
+    ST_IN_FE permanently, consuming an ROB slot and an FE lane (fe_busy=1).
+
+[MEDIUM] R6: Backpressure (bkps) is Combinational
+    bkps is generated by combinational logic. Downstream synchronous logic
+    sampling it may see glitches. Should be registered for clean timing.
+
+[MEDIUM] R7: "started" Flag Never Cleared
+    Once started=1, it stays set until reset. next_output_seq is initialized
+    to the minimum seq of the first input batch. If the first batch does NOT
+    contain sequence 0 (or the true minimum), the output ordering baseline
+    may be wrong for the entire session.
+
+[MEDIUM] R8: ERR_BAD_DEP Defined but Unused
+    ERR_BAD_DEP (0x02) is declared as a localparam but is NEVER assigned to
+    error_code in any code path. This suggests incomplete implementation of
+    dependency validation.
+
+[MEDIUM] R9: No Input Validation on Descriptor
+    The descriptor is used directly without bounds checking. desc[1:0]=3
+    means 3-cycle delay (valid), but desc[4:2] can be 1-7. If a dependency
+    offset is larger than the actual sequence number, the subtraction
+    (rob_seq - desc[4:2]) could underflow — the search through res_valid
+    would simply find nothing, leading to permanent ST_WAIT_DEP stall.
+
+[MEDIUM] R10: FE Mock — Ready Signal During Transition
+    fe_in_ready = (!busy) && (!fe_out_valid). In the cycle where processing
+    completes (delay_cnt reaches 0), busy is cleared and fe_out_valid is set
+    simultaneously with fe_out_packet/fe_out_result. fe_in_ready becomes 1
+    in the same cycle. If the consumer (ppe_core) sees fe_out_valid=1 AND
+    fe_in_ready=1 in the same cycle, it might accept new input while trying
+    to consume output — though ppe_core's fe_out_ready is always 1, so the
+    FE will deassert fe_out_valid next cycle. The window is narrow but exists.
+
+[LOW] R11: No Performance Counters / Debug Observability
+    No cycle counters, event counters, or status registers are implemented,
+    making hardware debug and performance profiling difficult.
+
+[LOW] R12: FE_ID Parameter Unused
+    The FE_ID parameter in fe_mock is not used for any functional purpose
+    (no per-instance behavior differentiation).
+
+[LOW] R13: Combinational Scheduling Loop Complexity
+    The nested triple-loop (lanes × ROB entries × ROB entries for dependency
+    search) in the combinational always block may result in long timing paths
+    at higher ROB_DEPTH or LANE_NUM values. No pipelining or staging.
+
+================================================================================

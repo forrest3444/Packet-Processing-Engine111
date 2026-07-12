@@ -1,0 +1,11 @@
+# VCS / Simulation build artifacts
+sim/build/
+sim/run/
+csrc/
+*.daidir
+vc_hdrs.h
+ucli.key
+DVEfiles/
+AN.DB/
+inter.vpd
+vcs.log
