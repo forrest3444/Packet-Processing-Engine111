@@ -20,12 +20,14 @@ SIMV_DIR      := $(BUILD_DIR)/simv
 SIMV_IMAGE    := $(SIMV_DIR)/$(TB_TOP).simv
 
 FILELIST ?= ./script/filelist.f
+RTL_FILELIST ?= ./script/rtl_filelist.f
 USER_SIM_OPTS ?=
 
 ###############################################################################
 # Tools / Options
 ###############################################################################
 VCS       ?= vcs
+VERILATOR ?= verilator
 TIMESCALE ?= 1ns/1ps
 
 VCS_OPTS = -full64                 \
@@ -38,14 +40,22 @@ VCS_OPTS = -full64                 \
 SIM_OPTS = +ntb_random_seed=$(SEED)  \
            +UVM_TESTNAME=$(TESTNAME) \
            +UVM_VERBOSITY=$(VERB)    \
-           $(USER_SIM_OPTS)
+	   $(USER_SIM_OPTS)
+
+VERILATOR_LINT_OPTS = --lint-only       \
+                      --language 1364-2001 \
+                      --Wall            \
+                      --top-module ppe_top
 
 ###############################################################################
 # Targets
 ###############################################################################
-.PHONY: all prepare_build prepare_run check_elab elab run sim clean clean_all help
+.PHONY: all prepare_build prepare_run check_elab lint elab run sim clean clean_all help
 
 all: sim
+
+lint:
+	$(VERILATOR) $(VERILATOR_LINT_OPTS) -f $(RTL_FILELIST)
 
 prepare_build:
 	mkdir -p $(BUILD_LOG_DIR) $(SIMV_DIR)
@@ -82,8 +92,10 @@ clean_all:
 
 help:
 	@echo "Targets:"
+	@echo "  make lint    Lint Verilog-2001 RTL with Verilator"
 	@echo "  make elab    Compile/elaborate UVM testbench"
 	@echo "  make run     Run existing elaboration"
 	@echo "  make sim     Compile and run"
 	@echo "Variables:"
+	@echo "  VERILATOR=$(VERILATOR) RTL_FILELIST=$(RTL_FILELIST)"
 	@echo "  TESTNAME=$(TESTNAME) SEED=$(SEED) VERB=$(VERB) BUILD_NAME=$(BUILD_NAME)"

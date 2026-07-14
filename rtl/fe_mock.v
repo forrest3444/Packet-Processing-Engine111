@@ -1,67 +1,60 @@
-// -----------------------------------------------------------------------------
-// File       : fe_mock.v
-// Author     : Codex
-// Description: Mock Forward Engine for PPE bring-up and debug.
-// -----------------------------------------------------------------------------
-
 `timescale 1ns/1ps
 
 module fe_mock #(
     parameter integer PACKET_W = 128,
-    parameter integer RESULT_W = 128,
-    parameter integer FE_ID    = 0
+    parameter integer FE_ID = 0
 ) (
     input                       clk,
     input                       rst_n,
-
     input                       fe_in_valid,
-    output                      fe_in_ready,
-    input      [PACKET_W-1:0]   fe_in_packet,
-
+    input      [PACKET_W-1:0]   fe_in_data,
+    input                       fe_dep_valid,
+    input      [PACKET_W-1:0]   fe_dep_data,
+    input      [1:0]            fe_desc_delay,
     output reg                  fe_out_valid,
-    input                       fe_out_ready,
-    output reg [PACKET_W-1:0]   fe_out_packet,
-    output reg [RESULT_W-1:0]   fe_out_result
+    output reg [PACKET_W-1:0]  fe_out_data
 );
 
-    reg                  busy;
-    reg [2:0]            delay_cnt;
-    reg [PACKET_W-1:0]   pkt_q;
+    reg                       busy;
+    reg [2:0]                 delay_count;
+    reg [PACKET_W-1:0]        packet_q;
+    reg                       dep_valid_q;
+    reg [PACKET_W-1:0]        dep_data_q;
+    reg [1:0]                 delay_q;
 
-    wire [2:0] next_delay;
+    wire [PACKET_W-1:0] fe_id_mask;
+    wire [PACKET_W-1:0] delay_mask;
 
-    assign fe_in_ready = (!busy) && (!fe_out_valid);
-    assign next_delay  = {1'b0, fe_in_packet[33:32]} + 3'd1;
+    assign fe_id_mask = {{(PACKET_W-8){1'b0}}, FE_ID[7:0]};
+    assign delay_mask = {{(PACKET_W-2){1'b0}}, delay_q};
 
-    always @(posedge clk) begin
+    always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            busy         <= 1'b0;
-            delay_cnt    <= 3'd0;
-            pkt_q        <= {PACKET_W{1'b0}};
+            busy <= 1'b0;
+            delay_count <= 3'd0;
+            dep_valid_q <= 1'b0;
+            delay_q <= 2'd0;
             fe_out_valid <= 1'b0;
-            fe_out_packet <= {PACKET_W{1'b0}};
-            fe_out_result <= {RESULT_W{1'b0}};
         end else begin
-            if (fe_out_valid && fe_out_ready) begin
-                fe_out_valid <= 1'b0;
-            end
+            fe_out_valid <= 1'b0;
 
-            if (fe_in_valid && fe_in_ready) begin
-                busy      <= 1'b1;
-                delay_cnt <= next_delay;
-                pkt_q     <= fe_in_packet;
+            if (fe_in_valid && !busy) begin
+                busy <= 1'b1;
+                delay_count <= {1'b0, fe_desc_delay} + 3'd1;
+                packet_q <= fe_in_data;
+                dep_valid_q <= fe_dep_valid;
+                dep_data_q <= fe_dep_data;
+                delay_q <= fe_desc_delay;
             end else if (busy) begin
-                if (delay_cnt != 3'd0) begin
-                    delay_cnt <= delay_cnt - 3'd1;
-                end else if (!fe_out_valid) begin
+                if (delay_count > 3'd1) begin
+                    delay_count <= delay_count - 3'd1;
+                end else begin
                     busy <= 1'b0;
-
-                    /* Keep packet[31:0] seq unchanged for ordering debug. */
-                    fe_out_packet[31:0]   <= pkt_q[31:0];
-                    fe_out_packet[127:32] <=
-                        {pkt_q[126:32], pkt_q[127]} ^ 96'h1357_9bdf_2468_ace0_55aa_0000;
-
-                    fe_out_result <= pkt_q ^ 128'h0f0f_f0f0_55aa_aa55_1234_5678_9abc_def0;
+                    delay_count <= 3'd0;
+                    fe_out_valid <= 1'b1;
+                    fe_out_data <= packet_q ^
+                                   (dep_valid_q ? dep_data_q : {PACKET_W{1'b0}}) ^
+                                   delay_mask ^ fe_id_mask;
                 end
             end
         end

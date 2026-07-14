@@ -1,0 +1,836 @@
+PPE Low-Level Design
+版本：Draft 0.3
+状态：首版 RTL 内部接口、状态转换和逐周期行为已收口
+
+本文档细化doc/hld.txt中确定的模块和流水边界，描述内部数据结构、逻辑接口、状态
+转换、索引计算、并发更新及实现注意事项。
+
+本文档不得改变doc/ppe_feature_description.txt中的功能语义，也不得改变doc/hld.txt
+中的模块职责和状态所有权。若需要改变上述内容，应先更新对应高层文档。
+
+================================================================================
+1. 参数与位宽
+================================================================================
+
+  N            = 4
+  FE_NUM       = 4
+  MAX_DEP      = 7
+  ISSUE_WIDTH  = 4
+  ROB_DEPTH    = 16
+  ROB_ID_W     = 4
+  SEQ_W        = 5
+
+  RESULT_BANKS = 7
+  PACKET_W     = 128
+  DESC_W       = 5
+
+所有RTL使用Verilog-2001。下文中的数组表示法仅用于描述逻辑关系，实际RTL端口必须
+展开为显式端口或Verilog-2001兼容的packed vector。
+
+================================================================================
+2. 内部架构图与典型数据流
+================================================================================
+
+2.1 ppe_dispatch内部架构图
+
+  Top Inputs
+  in_valid / in_packet / in_desc
+        |
+        | Flow D-A：输入接收
+        v
+  +--------------------------------------------------------------------------+
+  |                            ppe_dispatch                                  |
+  |                                                                          |
+  |  +---------------------------+                                           |
+  |  | D0 Input Admission        |<------------------------- bkps            |
+  |  | - valid rank              |                                           |
+  |  | - seq/tag/residue alloc   |---- alloc metadata -------------------+   |
+  |  | - dependency downgrade    |<--- allocated ROB ID -----------------+---|--+
+  |  | - target precompute       |                                           |  |
+  |  +-------------+-------------+                                           |  |
+  |                | registered dispatch entry                              |  |
+  |                v                                                         |  |
+  |  +---------------------------+       +-------------------------------+   |  |
+  |  | Dispatch Table [0..15]    |       | Sequence / Control State      |   |  |
+  |  | - packet                  |       | - next_seq_tag/residue        |   |  |
+  |  | - rob_id / seq tag       |       | - history_count              |   |  |
+  |  | - dependency target       |       | - packet_rr_ptr / fe_rr_ptr  |   |  |
+  |  | - dep_ready / state       |       +-------------------------------+   |  |
+  |  +------+--------------------+                                           |  |
+  |         |                                                                |  |
+  |         | Flow D-B：依赖初始化/等待                                     |  |
+  |         v                                                                |  |
+  |  +---------------------------+    dependency status query/response        |  |
+  |  | D1 Dependency Control     |<-------------------------------------------+  |
+  |  | - initial status lookup   |                                              |
+  |  | - writeback wakeup        |<--- wb rob_id / seq_tag events -------------+
+  |  | - DEP_INIT status lookup  |
+  |  | - WAIT_DEP -> READY       |
+  |  +-------------+-------------+
+  |                |
+  |                | eligible control bits
+  |                v
+  |  +---------------------------+       +-------------------------------+
+  |  | D2 Packet RR Selector     |------>| D2 Idle FE RR Selector        |
+  |  | - 16-entry eligible mask  |       | - busy/reserved mask          |
+  |  | - select up to 4 entries  |       | - assign up to 4 FEs          |
+  |  +-------------+-------------+       +---------------+---------------+
+  |                | selected entry indices / FE mapping  |
+  |                +----------------------+----------------+
+  |                                       v
+  |  +-------------------------------------------------------------------+
+  |  | D3 Operand Read / FE Issue                                      |
+  |  | - read selected packet                                          |
+  |  | - dependency data query ------------------------------+          |
+  |  | - packet/dependency to FE routing                      |          |
+  |  +-------------------------+-------------------------------|----------+
+  |                            |                               |
+  |                            | Flow D-C：FE派发              |
+  |                            v                               |
+  |  +-------------------------------------------------------------------+
+  |  | Per-FE State                                                    |
+  |  | busy / reserved / rob_id / seq_tag                              |
+  |  +-------------------------------------------------------------------+
+  +-----------------------------+--------------------------------------------+
+                                |
+                                v
+                         FE0 / FE1 / FE2 / FE3
+
+  Dispatch与reorder之间的跨模块路径：
+
+    a) D0向reorder申请ROB entry并发送seq metadata；
+    b) D1向reorder查询依赖是否已经有效；
+    c) D3仅为已选报文读取128 bit依赖数据；
+    d) FE返回事件同时写reorder，并以小位宽rob_id/seq_tag唤醒dispatch等待项。
+
+2.2 ppe_reorder内部架构图
+
+                       From ppe_dispatch D0
+                  alloc_valid / seq_tag / residue
+                                  |
+                                  | Flow R-A：ROB分配
+                                  v
+  +----------------------------------------------------------------------------+
+  |                              ppe_reorder                                   |
+  |                                                                            |
+  |  +--------------------------+                                              |
+  |  | A0 Allocation Manager    |---- tail / occupancy update                  |
+  |  +-------------+------------+                                              |
+  |                | metadata writes                                           |
+  |                v                                                           |
+  |  +-----------------------------------------------------------------------+ |
+  |  |                         ROB [0..15]                                  | |
+  |  | valid / seq_tag / seq_residue / result_valid / fe_out_data          | |
+  |  +-------+--------------------------+---------------------------+--------+ |
+  |          ^                          |                           |          |
+  |          |                          |                           |          |
+  |          | Flow R-B：FE写回         | Flow R-C：依赖查询        |          |
+  |  +-------+------------------+       v                           |          |
+  |  | W0 Writeback             |  +--------------------------+    |          |
+  |  | - 4-way ID/tag check     |  | L0 Dependency Lookup     |    |          |
+  |  | - 4-way result write     |  | - ROB tag/result check   |    |          |
+  |  +-------+------------------+  | - result-bank fallback   |    |          |
+  |          ^                     | - status/data response    |    |          |
+  |          |                     +-------------+------------+    |          |
+  |   FE0..3 result                             ^                  |          |
+  |   + rob_id / seq_tag                        |                  |          |
+  |                                             |                  |          |
+  |                          D1 status query ---+--- D3 data query |          |
+  |                                                                |          |
+  |                                                                v          |
+  |  +--------------------------+       +----------------------------------+   |
+  |  | 7-bank Retired Results   |<------| R0 In-order Retire              |   |
+  |  | valid / tag / 128b data  | write | - head+0..3 DONE scan           |   |
+  |  +-------------+------------+       | - retire count                  |   |
+  |                ^                    | - data select / lane rotation    |   |
+  |                | lookup fallback    +----------------+-----------------+   |
+  |                +-------------------------------------+                     |
+  |                                                      | Flow R-D：退休输出 |
+  |                                                      v                     |
+  |                                          +-----------------------------+   |
+  |                                          | Registered Output Lanes     |   |
+  |                                          | out_valid / out_packet      |   |
+  |                                          +-----------------------------+   |
+  |                                                                            |
+  |  +--------------------------+                                              |
+  |  | Backpressure Generator   |<--- occupancy / free_count / input_valid     |
+  |  +-------------+------------+                                              |
+  |                | bkps                                                       |
+  +----------------+-----------------------------------------------------------+
+
+  Reorder内部四条通路：
+
+    A0：输入分配ROB entry；
+    W0：接收最多4路FE乱序完成结果；
+    L0：为dispatch提供依赖状态和依赖数据；
+    R0：从ROB head保序退休、更新result bank并产生寄存器输出。
+
+2.3 典型无依赖报文数据流
+
+  1) D0捕获输入，分配seq和rob_id，同时A0建立ROB metadata；
+  2) D1将无依赖报文直接标记为READY；
+  3) D2选择报文和目标FE；
+  4) D3读取packet并向FE发出请求，dispatch entry释放；
+  5) FE返回，W0按rob_id写ROB并设置result_valid；
+  6) 报文到达ROB head且DONE后，R0将数据装入输出寄存器；
+  7) 同一退休沿更新对应result bank并释放ROB entry。
+
+2.4 典型依赖等待数据流
+
+  1) D0捕获依赖报文并预计算target rob_id/tag/residue；
+  2) entry以DEP_INIT状态进入D1，通过status query检查目标：
+       - 目标已完成：dep_ready置1；
+       - 目标未完成：entry进入WAIT_DEP；
+  3) 目标FE返回时，W0写ROB，同时writeback event唤醒匹配的WAIT_DEP entry；
+  4) 被唤醒报文进入READY并由D2选择；
+  5) D3通过data query读取目标结果：
+       - 目标仍在ROB：读取ROB fe_out_data；
+       - 目标已退休：读取7-bank result data；
+  6) D3将packet、dependency和delay一起送入选中的FE。
+
+2.5 典型保序阻塞数据流
+
+  1) 多个FE乱序返回，W0分别写入对应ROB entry；
+  2) 后序ROB entry可以先DONE，但R0只检查ROB head开始的连续DONE项；
+  3) head未DONE时retire_count=0，后序DONE结果继续保存在ROB；
+  4) head完成后的下一周期，R0一次退休最多4个连续DONE报文；
+  5) 输出顺序由ROB head确定，与FE完成顺序无关。
+
+================================================================================
+3. ppe_dispatch内部数据结构
+================================================================================
+
+3.1 Dispatch Entry
+
+Dispatch table深度为16，以ROB ID作为entry索引。每个entry至少包含：
+
+  valid
+  packet[127:0]
+  rob_id[3:0]
+  seq_tag[4:0]
+  seq_residue[2:0]
+  desc_delay[1:0]
+  effective_dep_offset[2:0]
+  target_rob_id[3:0]
+  target_seq_tag[4:0]
+  target_residue[2:0]
+  dep_ready
+  reserved
+  state
+
+状态编码逻辑语义：
+
+  DEP_INIT：valid=1，存在合法依赖，等待D1首次status query；
+  WAIT_DEP：valid=1，首次查询未命中，等待写回事件；
+  READY：valid=1，dep_ready=1且尚未被选择；
+  SELECTED：已经被D2选中并预留目标FE，等待D3派发。
+
+状态具体编码由RTL决定，但必须保证无非法多状态组合。
+
+3.1.1 D0-to-D1 Initialization Pipeline
+
+每个输入lane对应一个D1 initialization slot，保存：
+
+  d1_init_valid
+  d1_init_rob_id[3:0]
+
+D0仅对成功接收且effective_dep_offset不为0的报文置d1_init_valid。D1在下一周期
+使用d1_init_rob_id读取dispatch entry中的target信息并发起status query。每个slot
+消费当前内容的同一上升沿可由D0写入下一批内容，因此D1无需扫描16项table
+查找DEP_INIT entry。
+
+3.2 Sequence State
+
+Dispatch维护：
+
+  next_seq_tag[4:0]
+  next_seq_residue[2:0]
+  history_count[2:0]
+
+next_seq_tag按2^SEQ_W回绕。next_seq_residue独立按0..6循环，不得从已经回绕的
+next_seq_tag计算。history_count饱和到7。
+
+3.3 Packet Arbitration State
+
+  packet_rr_ptr[3:0]
+
+packet_rr_ptr指向下一次轮询扫描起点。D2成功选择至少一个报文后，指针推进到最后
+一个被选entry的下一位置。
+
+3.4 Per-FE State
+
+每个FE保存：
+
+  fe_busy
+  fe_reserved
+  fe_selected_rob_id[3:0]
+  fe_rob_id[3:0]
+  fe_seq_tag[4:0]
+
+fe_selected_rob_id只在fe_reserved=1时有效，用于将D2选择结果传递给下一周期D3。
+fe_rob_id和fe_seq_tag只在fe_busy=1时有效，用于FE返回关联。
+
+首版RTL不实现request register或per-FE pending request，因此不保存任何
+fe_pending_*状态。
+
+3.5 FE Arbitration State
+
+  fe_rr_ptr[1:0]
+
+fe_rr_ptr指向下一次FE轮询起点。成功分配后推进到最后一个被分配FE的下一位置。
+
+================================================================================
+4. ppe_reorder内部数据结构
+================================================================================
+
+4.1 ROB Entry
+
+ROB深度为16，每个entry至少包含：
+
+  valid
+  seq_tag[4:0]
+  seq_residue[2:0]
+  result_valid / done
+  fe_out_data[127:0]
+
+fe_out_data同时作为最终输出数据和依赖结果，不保存两份128 bit数据。
+
+4.2 ROB Global State
+
+  head_ptr[3:0]
+  tail_ptr[3:0]
+  occupancy[4:0]
+
+  free_count = ROB_DEPTH - occupancy
+
+head_ptr和tail_ptr按16自然回绕。occupancy范围为0..16。
+
+4.3 Retired Result Bank
+
+共7个bank。每个bank保存：
+
+  valid
+  seq_tag[4:0]
+  result_data[127:0]
+
+bank编号等于对应抽象seq对7取模的seq_residue。
+
+4.4 Output State
+
+  start_lane[1:0]
+  out_valid[3:0]
+  out_packet0[127:0]
+  out_packet1[127:0]
+  out_packet2[127:0]
+  out_packet3[127:0]
+
+所有out_valid/out_packet必须由寄存器驱动。
+
+================================================================================
+5. 模块间逻辑接口
+================================================================================
+
+5.0 Top -> Reorder：Backpressure Demand
+
+ppe_top将原始顶层in_valid0..3直接连接到reorder的同名容量查询输入。
+Reorder必须使用未经bkps门控的原始in_valid计算input_count，不得使用alloc_valid
+反推input_count，以避免形成bkps组合环。该路径只读取valid，不向reorder传递
+packet或descriptor。
+
+5.1 Dispatch -> Reorder：ROB Allocation
+
+每个输入lane一组：
+
+  alloc_valid
+  alloc_seq_tag[4:0]
+  alloc_seq_residue[2:0]
+
+5.2 Reorder -> Dispatch：Allocation Response
+
+每个输入lane一组：
+
+  alloc_rob_id[3:0]
+
+Allocation response为组合返回，不使用ready或多周期握手。Reorder仅使用当前
+tail_ptr和alloc_valid计算：
+
+  alloc_rank[i]   = lane编号小于i且alloc_valid=1的数量
+  alloc_rob_id[i] = tail_ptr + alloc_rank[i] mod 16
+
+alloc_rob_id只在对应alloc_valid=1时有效。Dispatch不接收、不复制tail_ptr；
+bkps已保证当前批次有足够空间，因此reorder不再返回allocation accept。
+在同一接收沿，dispatch使用alloc_rob_id写dispatch entry，reorder使用相同ID
+写ROB metadata并推进tail_ptr。
+
+5.3 Dependency Status Query
+
+供D1初始化新报文依赖状态。每个D1 initialization slot一组：
+
+  dep_status_valid
+  dep_status_rob_id[3:0]
+  dep_status_seq_tag[4:0]
+  dep_status_residue[2:0]
+
+Reorder返回：
+
+  dep_status_ready
+
+Status query只读取valid、tag和result_valid，不返回128 bit数据。
+
+5.4 Dependency Data Query
+
+供D3为已选报文读取依赖数据。每个issue slot一组：
+
+  dep_data_valid
+  dep_data_rob_id[3:0]
+  dep_data_seq_tag[4:0]
+  dep_data_residue[2:0]
+
+Reorder返回：
+
+  dep_data_ready
+  dep_data[127:0]
+
+Status query和data query逻辑独立，允许D1和D3同周期工作。实现可以共享小位宽decode，
+但不得因为新输入状态查询而阻塞正常FE issue。
+
+5.5 Dispatch -> FE
+
+每个FE一组：
+
+  fe_in_valid
+  fe_in_data[127:0]
+  fe_dep_valid
+  fe_dep_data[127:0]
+  fe_desc_delay[1:0]
+
+5.6 FE/Dispatch Tag -> Reorder Writeback
+
+每个FE一组：
+
+  wb_valid
+  wb_rob_id[3:0]
+  wb_seq_tag[4:0]
+  wb_data[127:0]
+
+wb_rob_id和wb_seq_tag来自dispatch保存的per-FE tag。
+
+5.7 Reorder -> Top
+
+  bkps
+  out_valid0..3
+  out_packet0..3[127:0]
+
+5.8 Top -> Dispatch/Reorder/FE：Internal Reset
+
+ppe_top使用外部rst_n实现唯一的两级复位同步器，生成internal_rst_n。
+internal_rst_n异步拉低、同步释放，并作为ppe_dispatch、ppe_reorder和四个FE
+的共享低有效复位。各子模块不得再次同步复位或产生独立释放时序。
+
+================================================================================
+6. Dispatch D0：输入接收与分配
+================================================================================
+
+6.1 Input Rank
+
+对于lane i：
+
+  lane_rank[i] = 当前周期lane编号小于i且valid=1的lane数量
+
+当bkps=0时：
+
+  seq_tag[i]     = next_seq_tag + lane_rank[i]
+  alloc_valid[i] = in_valid[i]
+  rob_id[i]      = alloc_rob_id[i]
+
+当bkps=1或internal_rst_n=0时，所有alloc_valid必须为0，dispatch不写新entry。
+
+seq_tag使用固定位宽自然回绕。alloc_rob_id由reorder按5.2节组合返回，
+dispatch不直接读取tail_ptr。
+
+seq_residue从next_seq_residue开始按有效lane顺序逐一推进，超过6后回到0。实现不得
+使用wrapped seq_tag % 7。
+
+6.2 Dependency Downgrade
+
+对于当前报文，preceding_count包括复位后此前接收的报文，以及同周期lane编号更小的
+有效报文：
+
+  preceding_count = min(history_count + lane_rank, 7)
+
+  if dep_offset > preceding_count:
+      effective_dep_offset = 0
+  else:
+      effective_dep_offset = dep_offset
+
+desc_delay始终保持输入desc[1:0]不变。
+
+6.3 Dependency Target Precompute
+
+若effective_dep_offset=K且K不为0：
+
+  target_rob_id  = rob_id - K mod 16
+  target_seq_tag = seq_tag - K mod 32
+  target_residue = seq_residue - K mod 7
+
+K=7时target_residue等于当前seq_residue。
+
+6.4 D0 Register Update
+
+接收沿同时完成：
+
+  - 使用reorder返回的alloc_rob_id写dispatch entry；
+  - 向reorder提交alloc metadata；
+  - 推进next_seq_tag和next_seq_residue；
+  - history_count饱和增加实际接收数。
+
+输入被捕获后最早下一周期进入D1，不允许组合直通FE。
+
+================================================================================
+7. Dispatch D1：依赖初始化与事件唤醒
+================================================================================
+
+7.1 New Entry Initialization
+
+  effective_dep_offset=0：
+      D0接收沿直接写dep_ready=1，state=READY
+
+  effective_dep_offset!=0：
+      D0接收沿写dep_ready=0，state=DEP_INIT
+
+每个有效d1_init slot在下一周期D1按d1_init_rob_id读取对应DEP_INIT entry，
+并发起dependency status query：
+
+  status ready时：dep_ready <- 1，state <- READY
+  status not ready时：dep_ready <- 0，state <- WAIT_DEP
+
+DEP_INIT不参与D2 eligible计算，也不依赖分配沿同周期的writeback event。
+D1每周期无条件消费所有d1_init_valid，status response为组合返回且无ready反压，
+因此不会积累超过4个DEP_INIT entry。
+
+7.2 Writeback Wakeup
+
+每个WAIT_DEP entry将自身target信息与最多4路writeback事件比较：
+
+  wake_hit = wb_valid
+          && target_rob_id == wb_rob_id
+          && target_seq_tag == wb_seq_tag
+
+任意wake_hit成立时：
+
+  dep_ready <- 1
+  state     <- READY
+
+比较顺序建议先rob_id后seq_tag，以减少完整tag比较的无效翻转。
+
+writeback唤醒只更新小位宽状态，不向dispatch table复制128 bit结果。
+
+7.3 Simultaneous Allocation and Wakeup
+
+新entry与目标FE在同一上升沿返回时，新entry不依赖同沿wakeup比较。它在下一周期D1
+通过status query看到已经写入ROB的result_valid。
+
+7.4 Simultaneous D1 Query and Writeback
+
+某DEP_INIT entry执行D1首查的周期，其目标可能恰好同周期writeback。由于L0
+查询使用上升沿之前的ROB状态，D1必须将status ready与4路writeback event的
+rob_id/full seq_tag匹配结果取或：
+
+  d1_resolved = dep_status_ready || matching_writeback_event
+
+d1_resolved成立时在该沿将entry转为READY。该路径只旁路小位宽写回标识，不旁路
+128 bit结果；报文最早下一周期进入D2，届时D3数据查询可从ROB读取已写入结果。
+
+================================================================================
+8. Dispatch D2：报文与FE仲裁
+================================================================================
+
+8.1 Eligible Mask
+
+每个dispatch entry：
+
+  eligible = valid && (state == READY) && dep_ready && !reserved
+
+8.2 Packet Round-Robin
+
+首版固定使用旋转mask加并行rank的multi-grant算法。先将eligible mask按
+packet_rr_ptr旋转，使指针对应entry成为rotated[0]。对每个位置j并行计算：
+
+  prefix_count[j] = rotated[0 .. j-1]中的1的数量
+  grant_rot[j]    = rotated[j] && (prefix_count[j] < issue_limit)
+
+  issue_limit = min(ISSUE_WIDTH, available_fe_count)
+
+再将grant_rot反向旋转回物理entry编号。该算法每周期产生最多4个互不重复grant，
+其语义等价于从packet_rr_ptr开始选择前issue_limit个eligible entry。
+物理实现应使用分组prefix/popcount逻辑，不得使用四级完全串行的16项priority
+encoder链。
+
+8.3 FE Selection
+
+  fe_available = !fe_busy && !fe_reserved
+
+从fe_rr_ptr开始为已选报文依次选择可用FE。选中后：
+
+  - 报文按packet_rr_ptr循环扫描顺序排列，FE按fe_rr_ptr循环扫描顺序排列；
+  - 第j个已选报文与第j个可用FE配对；
+  - 将该entry的rob_id写入目标FE的fe_selected_rob_id；
+  - dispatch entry进入SELECTED并设置reserved；
+  - 目标FE设置fe_reserved。
+
+8.4 RR Pointer Update
+
+至少一个packet grant成功时，packet_rr_ptr推进到最后一个grant的下一entry。
+至少一个FE分配成功时，fe_rr_ptr推进到最后一个被分配FE的下一位置。
+
+================================================================================
+9. Dispatch D3：Operand Read与FE Issue
+================================================================================
+
+对每个fe_reserved=1的FE：
+
+  - 通过fe_selected_rob_id读取packet和desc_delay；
+  - 无依赖时输出fe_dep_valid=0、fe_dep_data=0；
+  - 有依赖时使用与该FE ID对应的issue slot发起dependency data query；
+  - dep_data_ready后将packet、dependency和delay路由到目标FE；
+  - 拉高对应FE的fe_in_valid一个周期。
+
+FE接收沿：
+
+  - 清除dispatch entry valid/reserved；
+  - 清除目标FE fe_reserved；
+  - 设置目标FE fe_busy；
+  - 写入fe_rob_id和fe_seq_tag；
+  - 清除selected pipeline state。
+
+D3可能包含16:1 packet mux、ROB/result-bank dependency mux和FE数据路由，是首版重点
+关注的宽数据路径。
+
+若有依赖的selected entry在D3看到dep_data_ready=0，本周期不拉高对应
+fe_in_valid，并保持entry SELECTED、fe_reserved和fe_selected_rob_id不变，下一周期
+重试查询。在正常语义下，已置dep_ready的目标在该依赖报文派发前不会丢失，
+因此该重试分支不应造成正常气泡。
+
+================================================================================
+10. Reorder A0：ROB Allocation
+================================================================================
+
+对于本周期每个alloc_valid：
+
+  rob[alloc_rob_id].valid          <- 1
+  rob[alloc_rob_id].seq_tag        <- alloc_seq_tag
+  rob[alloc_rob_id].seq_residue    <- alloc_seq_residue
+  rob[alloc_rob_id].result_valid   <- 0
+
+tail_ptr推进实际allocation数量。
+
+A0不写fe_out_data。无效entry的数据内容不要求清零。
+
+================================================================================
+11. Reorder L0：依赖查询
+================================================================================
+
+11.1 Common Lookup Rule
+
+给定target_rob_id、target_seq_tag和target_residue：
+
+  if rob[target_rob_id].valid
+     && rob[target_rob_id].seq_tag == target_seq_tag:
+      if rob[target_rob_id].result_valid:
+          ready = 1
+          source = ROB
+      else:
+          ready = 0
+          禁止fallback到result bank
+  else:
+      if result_bank[target_residue].valid
+         && result_bank[target_residue].seq_tag == target_seq_tag:
+          ready = 1
+          source = RESULT_BANK
+      else:
+          ready = 0
+
+完整seq_tag匹配是必需条件，ROB ID或residue单独匹配不得视为命中。
+
+11.2 Status Query
+
+最多4路status query并行执行，只返回ready，不读取或切换128 bit data mux。
+
+11.3 Data Query
+
+最多4路data query并行执行。只有query valid且目标ready时才选择128 bit数据。
+
+首版在逻辑上将最多4路query实现为独立组合读取。多路query命中同一结果时，
+综合工具可自行共享公共比较或数据驱动，RTL不增加跨query的显式合并状态、仲裁
+或握手。
+
+11.4 Read During Retirement
+
+首版ROB和result bank均使用寄存器阵列、组合读取和时序写入，不增加
+retirement-to-lookup旁路。退休沿之前的L0查询使用当前寄存器状态，仍从有效
+ROB entry命中并读取结果；同一上升沿完成result bank写入和ROB entry释放。
+上升沿后的下一周期，查询看到ROB已无效，必须从result bank通过完整tag匹配
+命中。该语义不依赖未定义的存储器read-during-write行为。
+
+================================================================================
+12. Reorder W0：FE Writeback
+================================================================================
+
+每个wb_valid先计算轻量写保护：
+
+  wb_commit = wb_valid
+           && rob[wb_rob_id].valid
+           && rob[wb_rob_id].seq_tag == wb_seq_tag
+           && !rob[wb_rob_id].result_valid
+
+仅当wb_commit=1时执行：
+
+  rob[wb_rob_id].fe_out_data  <- wb_data
+  rob[wb_rob_id].result_valid <- 1
+
+同周期最多4个writeback ROB ID必须互不相同。验证侧必须用SystemVerilog assertion
+检查FE busy、ROB valid、完整tag、未重复完成和同周期ID互异。任何检查失败都是
+验证错误，不设置可综合sticky异常状态，不参与bkps、派发或退休控制。
+
+W0必须捕获全部符合协议的有效FE返回，不允许通过ready反压FE。首版物理实现必须支持
+4路任意地址并发写回，不能使用单写端口存储后串行处理。
+
+FE返回沿同时：
+
+  dispatch.fe_busy[fe_id] <- 0
+
+该FE最早下一周期重新参与调度。
+
+================================================================================
+13. Reorder R0：保序退休与输出
+================================================================================
+
+13.1 Consecutive DONE Scan
+
+从head_ptr开始检查最多4项：
+
+  done0 = rob[head+0].valid && rob[head+0].result_valid
+  done1 = done0 && rob[head+1].valid && rob[head+1].result_valid
+  done2 = done1 && rob[head+2].valid && rob[head+2].result_valid
+  done3 = done2 && rob[head+3].valid && rob[head+3].result_valid
+
+  retire_count = done0 + done1 + done2 + done3
+
+所有ROB索引按16自然回绕。
+
+13.2 Output Lane Mapping
+
+第j个退休报文映射到：
+
+  lane = start_lane + j mod 4
+
+使用退休沿之前的start_lane进行本周期映射。K个有效lane之间不得留洞。
+
+13.3 Retirement Register Update
+
+退休沿同时执行：
+
+  - 先将全4路out_valid的next value默认为0，再对本周期K个退休lane置1；
+  - 仅更新本周期out_valid=1的out_packet寄存器，其余out_packet保持；
+  - 对每个退休报文写result_bank[seq_residue]；
+  - 清除对应ROB valid/result_valid；
+  - head_ptr推进retire_count；
+  - start_lane推进retire_count；
+  - occupancy减retire_count并合并同周期allocation数量。
+
+当前N=4时，同周期退休的连续报文映射到不同result bank，不存在同bank多写。
+
+若未来N=8，同周期同bank冲突只保留seq较新的退休结果。
+
+13.4 Writeback Visibility
+
+W0在本周期刚写回的entry不参与同周期R0退休，最早下一周期被DONE scan看到。
+
+================================================================================
+14. 全局反压
+================================================================================
+
+  input_count = popcount(in_valid[3:0])
+  free_count  = ROB_DEPTH - occupancy
+
+  bkps = !internal_rst_n || (free_count < input_count)
+
+free_count使用本周期上升沿之前的状态，不加入本周期预计退休空间。因此满ROB时即使
+本周期将退休，仍允许产生一个保守停顿周期。
+复位期间bkps强制为1，不受occupancy和input_count影响。
+
+ROB_DEPTH=16且dispatch table以ROB ID索引。ROB entry能够退休意味着对应dispatch
+entry此前已经派发并释放，因此reorder有空闲ROB ID时，对应dispatch slot必然可用。
+
+================================================================================
+15. 同周期并发更新
+================================================================================
+
+A0、L0、W0和R0允许同周期作用于不同entry。
+
+必须满足：
+
+  - 新allocation entry与退休entry不重叠；
+  - 新writeback entry不在同周期退休；
+  - 已DONE退休entry不再次收到writeback；
+  - 同周期4路writeback ID互不相同；
+  - 同周期allocation和retirement数量统一合并更新occupancy；
+  - ROB valid、result_valid、head、tail和occupancy只有一个时序状态所有者。
+
+必须按统一next-state计算：
+
+  occupancy_next = occupancy + alloc_count - retire_count
+
+valid/result_valid数组在同一个时序always block中按allocation、writeback、retire
+事件更新，并明确互斥关系。禁止多个always block驱动同一状态。
+
+================================================================================
+16. 复位
+================================================================================
+
+ppe_top是复位同步器的唯一所有者。外部rst_n异步拉低同步器两级寄存器，外部
+rst_n拉高后经过两个clk上升沿释放internal_rst_n。PPE全部子模块和FE使用同一个
+internal_rst_n。
+
+复位清除：
+
+  - dispatch valid/state/dep_ready/reserved；
+  - packet_rr_ptr和fe_rr_ptr；
+  - d1_init_valid；
+  - per-FE busy/reserved/tag；
+  - ROB valid/result_valid/head/tail/occupancy；
+  - result bank valid；
+  - next_seq_tag、next_seq_residue和history_count；
+  - start_lane和out_valid。
+
+无效状态下不要求清零宽数据数组。复位期间bkps=1，所有fe_in_valid和out_valid=0。
+
+================================================================================
+17. 初始实现风险与后续观察项
+================================================================================
+
+以下项目不改变首版功能和流水边界，实现后根据编译、仿真和后续时序数据观察：
+
+  1) D2分组prefix/popcount multi-grant的组合深度；
+  2) D3 packet/dependency/FE routing的组合深度；
+  3) 4路status query和4路data query的扇出及宽数据mux；
+  4) 4路任意地址ROB writeback的decode和宽数据扇出；
+  5) R0连续DONE scan、数据mux和输出旋转的组合深度。
+
+若上述任一项需要改变流水级、pending storage、仲裁语义或查询端口，必须先更新
+HLD和LLD，不属于首版RTL编码时的自由选择。
+
+================================================================================
+18. LLD不变量
+================================================================================
+
+  1) 同一dispatch entry不得被重复选择或重复派发。
+  2) selected entry和fe_reserved必须成对建立和释放。
+  3) FE busy期间保存的rob_id/seq_tag不得被覆盖。
+  4) 依赖未ready时不得进入D3有效派发。
+  5) 依赖查询必须完整匹配seq_tag。
+  6) FE返回只设置ROB result，不直接写result bank。
+  7) 退休只从ROB head开始并且只退休连续DONE entry。
+  8) 输出寄存器装载、ROB释放和result-bank更新属于同一退休事件。
+  9) ROB occupancy必须等于有效ROB entry数量。
+  10) 无效宽数据内容不影响任何功能判断。
