@@ -27,7 +27,7 @@ class ppe_env extends uvm_env;
 
     function void connect_phase(uvm_phase phase);
         super.connect_phase(phase);
-        master_agent.drv.exp_ap.connect(scb.exp_imp);
+        master_agent.mon.ap.connect(scb.in_imp);
         slave_agent.mon.out_ap.connect(scb.out_imp);
     endfunction
 endclass

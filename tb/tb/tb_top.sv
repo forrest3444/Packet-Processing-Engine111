@@ -47,6 +47,30 @@ module tb_top;
         .out_packet3 (pif.out_packet3)
     );
 
+    assign pif.dbg_wb_valid          = dut.u_dispatch.wb_valid;
+    assign pif.dbg_wb_seq_tag        = dut.u_dispatch.wb_seq_tag;
+    assign pif.dbg_fallback_valid    = dut.u_dispatch.fallback_valid;
+    assign pif.dbg_fallback_ready    = dut.u_dispatch.fallback_ready;
+    assign pif.dbg_fallback_from_d3  = dut.u_dispatch.fallback_from_d3;
+    assign pif.dbg_fallback_seq_tag  = dut.u_dispatch.fallback_seq_tag;
+    assign pif.dbg_fallback_rob_id   = dut.u_dispatch.fallback_rob_id;
+    assign pif.dbg_fallback_residue  = dut.u_dispatch.fallback_residue;
+    assign pif.dbg_cache0_valid      = dut.u_dispatch.dep_cache_valid[0];
+    assign pif.dbg_cache0_seq_tag    = dut.u_dispatch.dep_cache_seq_tag[0];
+    assign pif.dbg_entry1_state      = dut.u_dispatch.entry_state[1];
+    assign pif.dbg_rob0_valid        = dut.u_reorder.rob_valid[0];
+    assign pif.dbg_rob0_seq_tag      = dut.u_reorder.rob_seq_tag[0];
+    assign pif.dbg_result0_valid     = dut.u_reorder.result_valid[0];
+    assign pif.dbg_result0_seq_tag   = dut.u_reorder.result_seq_tag[0];
+    assign pif.dbg_head_ptr          = dut.u_reorder.head_ptr;
+    assign pif.dbg_fallback_lookup_hit = dut.u_reorder.fallback_lookup[PACKET_W];
+    assign pif.dbg_fe_in_valid       = dut.fe_in_valid;
+    assign pif.dbg_fe_busy           = {dut.u_dispatch.fe_busy3,
+                                        dut.u_dispatch.fe_busy2,
+                                        dut.u_dispatch.fe_busy1,
+                                        dut.u_dispatch.fe_busy0};
+    assign pif.dbg_rob_occupancy     = dut.u_reorder.occupancy;
+
     initial begin
         clk = 1'b0;
         forever #5 clk = ~clk;
@@ -60,6 +84,7 @@ module tb_top;
     end
 
     initial begin
+        uvm_config_db #(ppe_vif_t)::set(null, "uvm_test_top", "vif", pif);
         uvm_config_db #(ppe_vif_t)::set(null, "uvm_test_top.env.master_agent.*", "vif", pif);
         uvm_config_db #(ppe_vif_t)::set(null, "uvm_test_top.env.slave_agent.*", "vif", pif);
         run_test("ppe_basic_test");

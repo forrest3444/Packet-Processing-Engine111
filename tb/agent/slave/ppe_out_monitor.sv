@@ -12,6 +12,7 @@ class ppe_out_monitor extends uvm_component;
 
     ppe_vif_t vif;
     uvm_analysis_port #(ppe_out_item) out_ap;
+    bit [1:0] start_lane;
 
     function new(string name, uvm_component parent);
         super.new(name, parent);
@@ -26,13 +27,26 @@ class ppe_out_monitor extends uvm_component;
     endfunction
 
     task run_phase(uvm_phase phase);
+        int unsigned valid_count;
+        int unsigned index;
+        bit [1:0] lane;
+
         @(posedge vif.rst_n);
+        start_lane = 2'd0;
         forever begin
             @(posedge vif.clk);
-            sample_lane(2'd0, vif.out_valid0, vif.out_packet0);
-            sample_lane(2'd1, vif.out_valid1, vif.out_packet1);
-            sample_lane(2'd2, vif.out_valid2, vif.out_packet2);
-            sample_lane(2'd3, vif.out_valid3, vif.out_packet3);
+            valid_count = vif.out_valid0 + vif.out_valid1 +
+                          vif.out_valid2 + vif.out_valid3;
+            for (index = 0; index < valid_count; index++) begin
+                lane = start_lane + index[1:0];
+                case (lane)
+                    2'd0: sample_lane(lane, vif.out_valid0, vif.out_packet0);
+                    2'd1: sample_lane(lane, vif.out_valid1, vif.out_packet1);
+                    2'd2: sample_lane(lane, vif.out_valid2, vif.out_packet2);
+                    default: sample_lane(lane, vif.out_valid3, vif.out_packet3);
+                endcase
+            end
+            start_lane += valid_count[1:0];
         end
     endtask
 
@@ -41,8 +55,10 @@ class ppe_out_monitor extends uvm_component;
         if (valid) begin
             item = ppe_out_item::type_id::create("item");
             item.lane = lane;
-            item.seq  = packet[31:0];
+            item.packet = packet;
             out_ap.write(item);
+        end else begin
+            `uvm_error("OUT_HOLE", $sformatf("missing output at logical lane %0d", lane))
         end
     endtask
 endclass

@@ -123,10 +123,11 @@ RTL seq 按 2^SEQ_W 回绕。严格输出顺序由 ROB 的 head/tail 指针维�
 ROB 在途报文，以及 ROB head 之前最多 MAX_DEP 个仍可能被引用的历史结果，从而
 保证有限位宽 seq 在整个相关窗口内不会产生身份混淆。
 
-为支持 7-bank 依赖结果缓存，RTL 还必须独立维护 3 bit seq_residue，表示抽象
-全局报文序对 7 取模的结果，并按 0→1→...→6→0 循环。seq_residue 不得通过
-已经按 2^SEQ_W 回绕的有限位宽 seq_tag 直接计算。每个 ROB entry 同时保存
-seq_tag 和 seq_residue。同周期接收多个报文时，二者均按 lane 递增顺序逐一推进。
+为支持 8-bank 依赖结果缓存，RTL 还必须维护 3 bit seq_residue，表示抽象全局
+报文序对 8 取模的结果，并按 0→1→...→7→0 循环。当前 SEQ_W 大于 3 且有限
+seq_tag 的回绕模数是 8 的整数倍，因此 seq_residue 可直接取 seq_tag[2:0]；实现
+仍可将其作为显式字段保存在 ROB entry 中。 同周期接收多个报文时，seq_tag 和
+seq_residue 均按 lane 递增顺序逐一推进。
 
 ================================================================================
 4. 输入接收与全局反压
@@ -196,33 +197,45 @@ rob_free_count 使用本周期上升沿之前已经空闲的 ROB 条目数，不
 
 6.2 依赖结果缓存
 
-  PPE 维护 7 个依赖结果 bank，bank 编号为 0..6。每个 bank 固定保存
+  Reorder 维护 8 个权威已退休结果 bank，bank 编号为 0..7。每个 bank 固定保存
   seq_residue 等于该 bank 编号的已退休报文结果。每个 bank entry 至少包含：
     - valid；
     - 完整 SEQ_W 位 seq_tag；
     - 128 bit result_data。
 
   FE 返回时，fe_out_data 先写入对应 ROB entry，并设置该 entry 的 result_valid；
-  FE 乱序完成不得直接覆盖 result bank。
+  FE 乱序完成不得直接覆盖 reorder 的已退休 result bank。
 
-  报文查找依赖目标时：
+  Dispatch 另维护 8 个非权威依赖 fast-cache bank，每项保存 valid、完整 SEQ_W 位
+  seq_tag 和 128 bit result_data。FE writeback 可以按 seq_residue 直接更新该 fast
+  cache；乱序返回导致的同 bank 覆盖只允许造成 cache miss，不得造成依赖丢失。
+  Fast cache 不拥有结果生命周期，不能替代 ROB 和已退休 result bank。
+
+  报文查找依赖目标时优先以 target_residue 直接索引 dispatch fast cache，并要求
+  valid 和完整 seq_tag 同时匹配。Fast-cache miss 必须通过单路 fallback lookup
+  查询 reorder 的权威结果：
     a) 若目标 seq_tag 对应的 entry 仍在 ROB 中，则从该 ROB entry 读取结果；若其
-       result_valid 尚未置位，当前报文继续等待，不得转而使用 result bank 中的
-       同 residue 历史结果。
-    b) 若目标报文已经从 ROB 退休，则以 target_residue 选择 result bank，并要求
-       bank.valid = 1 且 bank.seq_tag 与 target_seq_tag 完整匹配后方可使用。
+       result_valid 尚未置位，当前报文继续等待，不得转而使用已退休 result bank
+       中同 residue 的历史结果。
+    b) 若目标报文已经从 ROB 退休，则以 target_residue 选择已退休 result bank，
+       并要求 bank.valid = 1 且 bank.seq_tag 与 target_seq_tag 完整匹配后方可使用。
+
+  每周期最多执行一路 fallback lookup。多个 fast-cache miss 可以增加等待延迟，
+  但必须公平地得到查询机会。Fallback 命中数据可直接用于当前 FE 请求或回填 fast
+  cache；无论采用哪种方式，都不得因另一路 writeback 覆盖 fast cache 而丢失结果。
 
   target_seq_tag 由当前 seq_tag 减 effective_dep_offset 得到；target_residue
-  由当前 seq_residue 减 effective_dep_offset 并按模 7 回绕得到。当
-  effective_dep_offset = 7 时，target_residue 与当前 seq_residue 相同。
+  由当前 seq_residue 减 effective_dep_offset 并按模 8 回绕得到，也可直接使用
+  target_seq_tag[2:0]。effective_dep_offset = 7 时，target_residue 是当前
+  seq_residue 加 1 后的模 8 结果。
 
   报文装入顶层输出寄存器时视为从 ROB 退休。退休沿同时将该报文的 fe_out_data
   写入 result_bank[seq_residue]，随后释放 ROB entry。由于退休严格按 seq 顺序，
-  当 R+7 退休并覆盖 R 所在 bank 时，所有可能依赖 R 的报文 R+1..R+7 均已退休，
+  当 R+8 退休并覆盖 R 所在 bank 时，所有可能依赖 R 的报文 R+1..R+7 均已退休，
   因此覆盖是安全的。
 
   当前设计 N = 4，同周期退休的连续报文不会写入同一 bank。未来 N 扩展至 8 时，
-  若同周期多个退休报文映射到同一 bank，仅执行其中 seq 较新的写入。
+  同周期退休的最多 8 个连续报文也分别写入不同 bank。
 
   读取为非破坏性。同一结果可被多个后续报文引用；同周期多个 FE 请求相同依赖
   结果时允许读取一次并广播给多个 FE。
@@ -283,7 +296,7 @@ out_packet_i 的值不作要求。out_valid_i 和 out_packet_i 必须来自同�
 
 将前 K 个报文装入顶层输出寄存器的时钟沿即为这些报文的退休沿。由于顶层输出
 没有 ready，装入输出寄存器即视为架构上提交，不需要等待额外确认。该退休沿同时
-推进 ROB head、释放对应 ROB entries，并将其结果写入 7-bank 依赖结果缓存。
+推进 ROB head、释放对应 ROB entries，并将其结果写入 8-bank 权威已退休结果缓存。
 
 PPE 维护输出起始 lane 指针 start_lane。第 j 个输出报文映射到：
 
@@ -375,7 +388,8 @@ FE 接口协议；ROB/tag/writeback 等内部一致性错误由验证侧 asserti
      恰好输出一次。
   9) bkps 拉高时所有输入 lane 统一停止。
   10) 单个 FE 不支持多 inflight。
-  11) fe_out_data 返回时先写 ROB；报文退休时再写入对应的 7-bank 依赖结果缓存。
+  11) fe_out_data 返回时先写 ROB，并可同时更新 dispatch fast cache；报文退休时再
+      写入对应的 8-bank 权威已退休结果缓存。
   12) 复位异步生效、同步释放，并同时取消 PPE 与全部 FE 的在途事务。
   13) 顶层输入必须先寄存再参与内部处理，不允许从顶层输入组合直通 FE 或输出。
   14) 所有顶层输出 data/valid 必须由寄存器驱动，不允许内部状态组合直通端口。

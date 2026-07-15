@@ -19,7 +19,19 @@ Directory layout:
 - `tb/tb`: interface, package, and top-level testbench
 - `tb/agent`: shared agent transactions
 - `tb/agent/master`: active master agent, sequencer, and input driver
+- `tb/agent/master`: active driver plus accepted-input monitor
 - `tb/agent/slave`: passive slave agent and output monitor
-- `tb/env`: environment assembly and scoreboard
+- `tb/env`: environment, FE reference VIP, and full-width end-to-end scoreboard
 - `tb/seq_lib`: smoke sequences
 - `tb/tests`: UVM tests
+
+P0 peak-throughput baseline:
+
+```sh
+make run BUILD_NAME=<build> TESTNAME=ppe_p0_perf_test SEED=1
+```
+
+P1-P6 characterization uses `ppe_perf_test` with `USER_SIM_OPTS=+PERF_CASE=<case>`.
+Supported cases are `P1_DELAY1`, `P1_DELAY2`, `P1_DELAY3`, `P2_MIXED_DELAY`,
+`P3_LANES1`, `P3_LANES2`, `P3_LANES3`, `P4_DEP1_D0`, `P4_DEP1_D3`,
+`P5_DEP2`, `P5_DEP4`, `P5_DEP7`, `P6_DEP25`, `P6_DEP50`, and `P6_DEP75`.

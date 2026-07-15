@@ -1,8 +1,7 @@
 `timescale 1ns/1ps
 
 module fe_mock #(
-    parameter integer PACKET_W = 128,
-    parameter integer FE_ID = 0
+    parameter integer PACKET_W = 128
 ) (
     input                       clk,
     input                       rst_n,
@@ -22,10 +21,8 @@ module fe_mock #(
     reg [PACKET_W-1:0]        dep_data_q;
     reg [1:0]                 delay_q;
 
-    wire [PACKET_W-1:0] fe_id_mask;
     wire [PACKET_W-1:0] delay_mask;
 
-    assign fe_id_mask = {{(PACKET_W-8){1'b0}}, FE_ID[7:0]};
     assign delay_mask = {{(PACKET_W-2){1'b0}}, delay_q};
 
     always @(posedge clk or negedge rst_n) begin
@@ -54,7 +51,7 @@ module fe_mock #(
                     fe_out_valid <= 1'b1;
                     fe_out_data <= packet_q ^
                                    (dep_valid_q ? dep_data_q : {PACKET_W{1'b0}}) ^
-                                   delay_mask ^ fe_id_mask;
+                                   delay_mask;
                 end
             end
         end

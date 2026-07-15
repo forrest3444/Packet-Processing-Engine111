@@ -16,28 +16,41 @@ class ppe_basic_seq extends uvm_sequence #(ppe_item);
 
     task body();
         ppe_item tr;
-        int unsigned base_seq;
 
-        base_seq = 0;
-        repeat (3) begin
-            tr = ppe_item::type_id::create("tr");
-            start_item(tr);
+        tr = ppe_item::type_id::create("full_batch");
+        start_item(tr);
+        tr.valid = '{1'b1, 1'b1, 1'b1, 1'b1};
+        tr.seq = '{0, 1, 2, 3};
+        tr.packet = '{make_packet(0), make_packet(1),
+                      make_packet(2), make_packet(3)};
+        tr.desc = '{5'b000_11, 5'b001_00, 5'b000_01, 5'b010_00};
+        finish_item(tr);
 
-            foreach (tr.valid[i]) begin
-                tr.valid[i] = 1'b1;
-                tr.desc[i]  = 5'd0;
-            end
+        tr = ppe_item::type_id::create("sparse_batch");
+        start_item(tr);
+        tr.valid = '{1'b1, 1'b1, 1'b0, 1'b1};
+        tr.seq = '{4, 5, 32'hdead, 6};
+        tr.packet = '{make_packet(4), make_packet(5),
+                      make_packet(32'hdead), make_packet(6)};
+        tr.desc = '{5'b001_10, 5'b000_00, 5'b000_00, 5'b010_01};
+        finish_item(tr);
 
-            /* Shuffle seq across physical lanes. */
-            tr.seq[0] = base_seq + 2;
-            tr.seq[1] = base_seq + 0;
-            tr.seq[2] = base_seq + 3;
-            tr.seq[3] = base_seq + 1;
-
-            finish_item(tr);
-            base_seq += 4;
-        end
+        tr = ppe_item::type_id::create("wrap_bank_batch");
+        start_item(tr);
+        tr.valid = '{1'b1, 1'b0, 1'b1, 1'b0};
+        tr.seq = '{7, 32'hbeef, 8, 32'hfeed};
+        tr.packet = '{make_packet(7), make_packet(32'hbeef),
+                      make_packet(8), make_packet(32'hfeed)};
+        tr.desc = '{5'b001_00, 5'b000_00, 5'b000_11, 5'b000_00};
+        finish_item(tr);
     endtask
+
+    function bit [127:0] make_packet(bit [31:0] seq);
+        make_packet = {32'hcafe_0000 ^ seq,
+                       32'h1234_0000 + seq,
+                       32'h55aa_0000 ^ (seq << 1),
+                       seq};
+    endfunction
 endclass
 
 `endif

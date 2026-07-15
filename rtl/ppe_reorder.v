@@ -5,102 +5,76 @@ module ppe_reorder #(
 ) (
     input                       clk,
     input                       rst_n,
-
-    input                       in_valid0,
-    input                       in_valid1,
-    input                       in_valid2,
-    input                       in_valid3,
+    input      [3:0]            in_valid,
     output                      bkps,
 
-    input                       alloc_valid0,
-    input      [4:0]            alloc_seq_tag0,
-    input      [2:0]            alloc_seq_residue0,
-    output     [3:0]            alloc_rob_id0,
-    input                       alloc_valid1,
-    input      [4:0]            alloc_seq_tag1,
-    input      [2:0]            alloc_seq_residue1,
-    output     [3:0]            alloc_rob_id1,
-    input                       alloc_valid2,
-    input      [4:0]            alloc_seq_tag2,
-    input      [2:0]            alloc_seq_residue2,
-    output     [3:0]            alloc_rob_id2,
-    input                       alloc_valid3,
-    input      [4:0]            alloc_seq_tag3,
-    input      [2:0]            alloc_seq_residue3,
-    output     [3:0]            alloc_rob_id3,
+    input      [3:0]            alloc_valid,
+    input      [19:0]           alloc_seq_tag,
+    input      [11:0]           alloc_seq_residue,
+    output     [15:0]           alloc_rob_id,
 
-    input                       dep_status_valid0,
-    input      [3:0]            dep_status_rob_id0,
-    input      [4:0]            dep_status_seq_tag0,
-    input      [2:0]            dep_status_residue0,
-    output                      dep_status_ready0,
-    input                       dep_status_valid1,
-    input      [3:0]            dep_status_rob_id1,
-    input      [4:0]            dep_status_seq_tag1,
-    input      [2:0]            dep_status_residue1,
-    output                      dep_status_ready1,
-    input                       dep_status_valid2,
-    input      [3:0]            dep_status_rob_id2,
-    input      [4:0]            dep_status_seq_tag2,
-    input      [2:0]            dep_status_residue2,
-    output                      dep_status_ready2,
-    input                       dep_status_valid3,
-    input      [3:0]            dep_status_rob_id3,
-    input      [4:0]            dep_status_seq_tag3,
-    input      [2:0]            dep_status_residue3,
-    output                      dep_status_ready3,
+    input                       fallback_valid,
+    input      [3:0]            fallback_rob_id,
+    input      [4:0]            fallback_seq_tag,
+    input      [2:0]            fallback_residue,
+    output                      fallback_ready,
+    output     [PACKET_W-1:0]   fallback_data,
 
-    input                       dep_data_valid0,
-    input      [3:0]            dep_data_rob_id0,
-    input      [4:0]            dep_data_seq_tag0,
-    input      [2:0]            dep_data_residue0,
-    output                      dep_data_ready0,
-    output     [PACKET_W-1:0]   dep_data0,
-    input                       dep_data_valid1,
-    input      [3:0]            dep_data_rob_id1,
-    input      [4:0]            dep_data_seq_tag1,
-    input      [2:0]            dep_data_residue1,
-    output                      dep_data_ready1,
-    output     [PACKET_W-1:0]   dep_data1,
-    input                       dep_data_valid2,
-    input      [3:0]            dep_data_rob_id2,
-    input      [4:0]            dep_data_seq_tag2,
-    input      [2:0]            dep_data_residue2,
-    output                      dep_data_ready2,
-    output     [PACKET_W-1:0]   dep_data2,
-    input                       dep_data_valid3,
-    input      [3:0]            dep_data_rob_id3,
-    input      [4:0]            dep_data_seq_tag3,
-    input      [2:0]            dep_data_residue3,
-    output                      dep_data_ready3,
-    output     [PACKET_W-1:0]   dep_data3,
+    input      [3:0]            wb_valid,
+    input      [15:0]           wb_rob_id,
+    input      [19:0]           wb_seq_tag,
+    input      [4*PACKET_W-1:0] wb_data,
 
-    input                       wb_valid0,
-    input      [3:0]            wb_rob_id0,
-    input      [4:0]            wb_seq_tag0,
-    input      [PACKET_W-1:0]   wb_data0,
-    input                       wb_valid1,
-    input      [3:0]            wb_rob_id1,
-    input      [4:0]            wb_seq_tag1,
-    input      [PACKET_W-1:0]   wb_data1,
-    input                       wb_valid2,
-    input      [3:0]            wb_rob_id2,
-    input      [4:0]            wb_seq_tag2,
-    input      [PACKET_W-1:0]   wb_data2,
-    input                       wb_valid3,
-    input      [3:0]            wb_rob_id3,
-    input      [4:0]            wb_seq_tag3,
-    input      [PACKET_W-1:0]   wb_data3,
-
-    output reg                  out_valid0,
-    output reg [PACKET_W-1:0]  out_packet0,
-    output reg                  out_valid1,
-    output reg [PACKET_W-1:0]  out_packet1,
-    output reg                  out_valid2,
-    output reg [PACKET_W-1:0]  out_packet2,
-    output reg                  out_valid3,
-    output reg [PACKET_W-1:0]  out_packet3
+    output     [3:0]            out_valid,
+    output     [4*PACKET_W-1:0] out_packet
 );
+
+    wire       in_valid0 = in_valid[0];
+    wire       in_valid1 = in_valid[1];
+    wire       in_valid2 = in_valid[2];
+    wire       in_valid3 = in_valid[3];
+    wire       alloc_valid0 = alloc_valid[0];
+    wire [4:0] alloc_seq_tag0 = alloc_seq_tag[0*5 +: 5];
+    wire [2:0] alloc_seq_residue0 = alloc_seq_residue[0*3 +: 3];
+    wire       alloc_valid1 = alloc_valid[1];
+    wire [4:0] alloc_seq_tag1 = alloc_seq_tag[1*5 +: 5];
+    wire [2:0] alloc_seq_residue1 = alloc_seq_residue[1*3 +: 3];
+    wire       alloc_valid2 = alloc_valid[2];
+    wire [4:0] alloc_seq_tag2 = alloc_seq_tag[2*5 +: 5];
+    wire [2:0] alloc_seq_residue2 = alloc_seq_residue[2*3 +: 3];
+    wire       alloc_valid3 = alloc_valid[3];
+    wire [4:0] alloc_seq_tag3 = alloc_seq_tag[3*5 +: 5];
+    wire [2:0] alloc_seq_residue3 = alloc_seq_residue[3*3 +: 3];
+    wire [3:0] alloc_rob_id0;
+    wire [3:0] alloc_rob_id1;
+    wire [3:0] alloc_rob_id2;
+    wire [3:0] alloc_rob_id3;
+
+    wire       wb_valid0 = wb_valid[0];
+    wire [3:0] wb_rob_id0 = wb_rob_id[0*4 +: 4];
+    wire [4:0] wb_seq_tag0 = wb_seq_tag[0*5 +: 5];
+    wire [PACKET_W-1:0] wb_data0 = wb_data[0*PACKET_W +: PACKET_W];
+    wire       wb_valid1 = wb_valid[1];
+    wire [3:0] wb_rob_id1 = wb_rob_id[1*4 +: 4];
+    wire [4:0] wb_seq_tag1 = wb_seq_tag[1*5 +: 5];
+    wire [PACKET_W-1:0] wb_data1 = wb_data[1*PACKET_W +: PACKET_W];
+    wire       wb_valid2 = wb_valid[2];
+    wire [3:0] wb_rob_id2 = wb_rob_id[2*4 +: 4];
+    wire [4:0] wb_seq_tag2 = wb_seq_tag[2*5 +: 5];
+    wire [PACKET_W-1:0] wb_data2 = wb_data[2*PACKET_W +: PACKET_W];
+    wire       wb_valid3 = wb_valid[3];
+    wire [3:0] wb_rob_id3 = wb_rob_id[3*4 +: 4];
+    wire [4:0] wb_seq_tag3 = wb_seq_tag[3*5 +: 5];
+    wire [PACKET_W-1:0] wb_data3 = wb_data[3*PACKET_W +: PACKET_W];
+
+    reg        out_valid0;
+    reg [PACKET_W-1:0] out_packet0;
+    reg        out_valid1;
+    reg [PACKET_W-1:0] out_packet1;
+    reg        out_valid2;
+    reg [PACKET_W-1:0] out_packet2;
+    reg        out_valid3;
+    reg [PACKET_W-1:0] out_packet3;
 
     reg                       rob_valid [0:15];
     reg [4:0]                 rob_seq_tag [0:15];
@@ -108,9 +82,9 @@ module ppe_reorder #(
     reg                       rob_result_valid [0:15];
     reg [PACKET_W-1:0]        rob_data [0:15];
 
-    reg                       result_valid [0:6];
-    reg [4:0]                 result_seq_tag [0:6];
-    reg [PACKET_W-1:0]        result_data [0:6];
+    reg                       result_valid [0:7];
+    reg [4:0]                 result_seq_tag [0:7];
+    reg [PACKET_W-1:0]        result_data [0:7];
 
     reg [3:0]                 head_ptr;
     reg [3:0]                 tail_ptr;
@@ -130,34 +104,9 @@ module ppe_reorder #(
     wire       done3;
     wire [2:0] retire_count;
 
-    wire [PACKET_W:0] status_lookup0;
-    wire [PACKET_W:0] status_lookup1;
-    wire [PACKET_W:0] status_lookup2;
-    wire [PACKET_W:0] status_lookup3;
-    wire [PACKET_W:0] data_lookup0;
-    wire [PACKET_W:0] data_lookup1;
-    wire [PACKET_W:0] data_lookup2;
-    wire [PACKET_W:0] data_lookup3;
+    reg [PACKET_W:0] fallback_lookup;
 
     integer i;
-    function [PACKET_W:0] lookup_result;
-        input [3:0] lookup_rob_id;
-        input [4:0] lookup_seq_tag;
-        input [2:0] lookup_residue;
-        begin
-            lookup_result = {(PACKET_W+1){1'b0}};
-            if (rob_valid[lookup_rob_id] &&
-                (rob_seq_tag[lookup_rob_id] == lookup_seq_tag)) begin
-                if (rob_result_valid[lookup_rob_id]) begin
-                    lookup_result = {1'b1, rob_data[lookup_rob_id]};
-                end
-            end else if ((lookup_residue < 3'd7) &&
-                         result_valid[lookup_residue] &&
-                         (result_seq_tag[lookup_residue] == lookup_seq_tag)) begin
-                lookup_result = {1'b1, result_data[lookup_residue]};
-            end
-        end
-    endfunction
 
     assign input_count = {2'b00, in_valid0} + {2'b00, in_valid1} +
                          {2'b00, in_valid2} + {2'b00, in_valid3};
@@ -185,43 +134,25 @@ module ppe_reorder #(
     assign retire_count = {2'b00, done0} + {2'b00, done1} +
                           {2'b00, done2} + {2'b00, done3};
 
-    assign status_lookup0 = lookup_result(dep_status_rob_id0,
-                                           dep_status_seq_tag0,
-                                           dep_status_residue0);
-    assign status_lookup1 = lookup_result(dep_status_rob_id1,
-                                           dep_status_seq_tag1,
-                                           dep_status_residue1);
-    assign status_lookup2 = lookup_result(dep_status_rob_id2,
-                                           dep_status_seq_tag2,
-                                           dep_status_residue2);
-    assign status_lookup3 = lookup_result(dep_status_rob_id3,
-                                           dep_status_seq_tag3,
-                                           dep_status_residue3);
-    assign dep_status_ready0 = dep_status_valid0 && status_lookup0[PACKET_W];
-    assign dep_status_ready1 = dep_status_valid1 && status_lookup1[PACKET_W];
-    assign dep_status_ready2 = dep_status_valid2 && status_lookup2[PACKET_W];
-    assign dep_status_ready3 = dep_status_valid3 && status_lookup3[PACKET_W];
+    assign fallback_ready = fallback_valid && fallback_lookup[PACKET_W];
+    assign fallback_data = fallback_lookup[PACKET_W-1:0];
+    assign alloc_rob_id = {alloc_rob_id3, alloc_rob_id2,
+                           alloc_rob_id1, alloc_rob_id0};
+    assign out_valid = {out_valid3, out_valid2, out_valid1, out_valid0};
+    assign out_packet = {out_packet3, out_packet2, out_packet1, out_packet0};
 
-    assign data_lookup0 = lookup_result(dep_data_rob_id0,
-                                         dep_data_seq_tag0,
-                                         dep_data_residue0);
-    assign data_lookup1 = lookup_result(dep_data_rob_id1,
-                                         dep_data_seq_tag1,
-                                         dep_data_residue1);
-    assign data_lookup2 = lookup_result(dep_data_rob_id2,
-                                         dep_data_seq_tag2,
-                                         dep_data_residue2);
-    assign data_lookup3 = lookup_result(dep_data_rob_id3,
-                                         dep_data_seq_tag3,
-                                         dep_data_residue3);
-    assign dep_data_ready0 = dep_data_valid0 && data_lookup0[PACKET_W];
-    assign dep_data_ready1 = dep_data_valid1 && data_lookup1[PACKET_W];
-    assign dep_data_ready2 = dep_data_valid2 && data_lookup2[PACKET_W];
-    assign dep_data_ready3 = dep_data_valid3 && data_lookup3[PACKET_W];
-    assign dep_data0 = data_lookup0[PACKET_W-1:0];
-    assign dep_data1 = data_lookup1[PACKET_W-1:0];
-    assign dep_data2 = data_lookup2[PACKET_W-1:0];
-    assign dep_data3 = data_lookup3[PACKET_W-1:0];
+    always @(*) begin
+        fallback_lookup = {(PACKET_W+1){1'b0}};
+        if (rob_valid[fallback_rob_id] &&
+            (rob_seq_tag[fallback_rob_id] == fallback_seq_tag)) begin
+            if (rob_result_valid[fallback_rob_id]) begin
+                fallback_lookup = {1'b1, rob_data[fallback_rob_id]};
+            end
+        end else if (result_valid[fallback_residue] &&
+                     (result_seq_tag[fallback_residue] == fallback_seq_tag)) begin
+            fallback_lookup = {1'b1, result_data[fallback_residue]};
+        end
+    end
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -237,7 +168,7 @@ module ppe_reorder #(
                 rob_valid[i] <= 1'b0;
                 rob_result_valid[i] <= 1'b0;
             end
-            for (i = 0; i < 7; i = i + 1) begin
+            for (i = 0; i < 8; i = i + 1) begin
                 result_valid[i] <= 1'b0;
             end
         end else begin

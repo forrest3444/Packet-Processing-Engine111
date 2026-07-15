@@ -37,6 +37,28 @@ interface ppe_if #(
     logic                 out_valid3;
     logic [PACKET_W-1:0] out_packet3;
 
+    // Verification-only visibility for directed and performance checks.
+    logic [3:0]           dbg_wb_valid;
+    logic [19:0]          dbg_wb_seq_tag;
+    logic                 dbg_fallback_valid;
+    logic                 dbg_fallback_ready;
+    logic                 dbg_fallback_from_d3;
+    logic [4:0]           dbg_fallback_seq_tag;
+    logic [3:0]           dbg_fallback_rob_id;
+    logic [2:0]           dbg_fallback_residue;
+    logic                 dbg_cache0_valid;
+    logic [4:0]           dbg_cache0_seq_tag;
+    logic [2:0]           dbg_entry1_state;
+    logic                 dbg_rob0_valid;
+    logic [4:0]           dbg_rob0_seq_tag;
+    logic                 dbg_result0_valid;
+    logic [4:0]           dbg_result0_seq_tag;
+    logic [3:0]           dbg_head_ptr;
+    logic                 dbg_fallback_lookup_hit;
+    logic [3:0]           dbg_fe_in_valid;
+    logic [3:0]           dbg_fe_busy;
+    logic [4:0]           dbg_rob_occupancy;
+
     task clear_inputs();
         in_valid0  <= 1'b0;
         in_packet0 <= '0;
