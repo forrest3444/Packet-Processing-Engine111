@@ -1,6 +1,7 @@
 # VCS / Simulation build artifacts
 sim/build/
 sim/run/
+sim/regression/
 csrc/
 *.daidir
 vc_hdrs.h
@@ -9,3 +10,4 @@ DVEfiles/
 AN.DB/
 inter.vpd
 vcs.log
+tr_db.log

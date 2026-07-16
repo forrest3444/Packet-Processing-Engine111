@@ -30,20 +30,22 @@ class ppe_scoreboard extends uvm_component;
     function void write_in(ppe_item tr);
         int unsigned dep_offset;
         bit [127:0] dep_data;
+        bit [127:0] vip_data_in;
         bit [127:0] expected;
 
         foreach (tr.valid[i]) begin
             if (tr.valid[i]) begin
                 dep_offset = tr.desc[i][4:2];
-                if (dep_offset > result_history.size()) begin
-                    dep_offset = 0;
-                end
                 dep_data = 128'b0;
-                if (dep_offset != 0) begin
+                if (dep_offset > result_history.size()) begin
+                    `uvm_error("INVALID_DEP", $sformatf(
+                        "dep_offset=%0d exceeds established history=%0d",
+                        dep_offset, result_history.size()))
+                end else if (dep_offset != 0) begin
                     dep_data = result_history[result_history.size()-dep_offset];
                 end
-                expected = ppe_fe_vip::predict(tr.packet[i], dep_offset != 0,
-                                               dep_data, tr.desc[i][1:0]);
+                vip_data_in = tr.packet[i] ^ dep_data;
+                expected = ppe_fe_vip::predict(vip_data_in, tr.desc[i][1:0]);
                 result_history.push_back(expected);
                 expected_q.push_back(expected);
                 exp_total++;

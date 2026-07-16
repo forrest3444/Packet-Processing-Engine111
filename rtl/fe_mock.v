@@ -1,5 +1,10 @@
 `timescale 1ns/1ps
 
+// Synthesizable stand-in for the external Forward Engine (FE).
+//
+// The real FE algorithm is a black box.  This model only preserves the PPE
+// contract: one request may be accepted each cycle, delay d returns after
+// d+1 cycles, and different delay values produce different result data.
 module fe_mock #(
     parameter integer PACKET_W = 128
 ) (
@@ -10,49 +15,66 @@ module fe_mock #(
     input                       fe_dep_valid,
     input      [PACKET_W-1:0]   fe_dep_data,
     input      [1:0]            fe_desc_delay,
-    output reg                  fe_out_valid,
-    output reg [PACKET_W-1:0]  fe_out_data
+    output                      fe_out_valid,
+    output     [PACKET_W-1:0]  fe_out_data
 );
 
-    reg                       busy;
-    reg [2:0]                 delay_count;
-    reg [PACKET_W-1:0]        packet_q;
-    reg                       dep_valid_q;
-    reg [PACKET_W-1:0]        dep_data_q;
-    reg [1:0]                 delay_q;
+    // slot 0 returns next; slot 3 is the farthest future return.  Dispatch
+    // guarantees that a new request never overwrites an occupied target slot.
+    reg [3:0]                 slot_valid;
+    reg [PACKET_W-1:0]        slot_data [0:3];
 
-    wire [PACKET_W-1:0] delay_mask;
+    wire [PACKET_W-1:0]       input_data;
+    wire [PACKET_W-1:0]       delay_mask;
+    wire [PACKET_W-1:0]       result_data;
 
-    assign delay_mask = {{(PACKET_W-2){1'b0}}, delay_q};
+    // The verification VIP applies the same simple observable transformation.
+    assign input_data = fe_in_data ^
+                        (fe_dep_valid ? fe_dep_data : {PACKET_W{1'b0}});
+    assign delay_mask = {{(PACKET_W-2){1'b0}}, fe_desc_delay};
+    assign result_data = input_data ^ delay_mask;
+    assign fe_out_valid = slot_valid[0];
+    assign fe_out_data = slot_data[0];
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            busy <= 1'b0;
-            delay_count <= 3'd0;
-            dep_valid_q <= 1'b0;
-            delay_q <= 2'd0;
-            fe_out_valid <= 1'b0;
+            slot_valid[0] <= 1'b0;
+            slot_valid[1] <= 1'b0;
+            slot_valid[2] <= 1'b0;
+            slot_valid[3] <= 1'b0;
         end else begin
-            fe_out_valid <= 1'b0;
+            // Time advances by shifting every pending result toward slot 0.
+            slot_valid[0] <= slot_valid[1];
+            slot_valid[1] <= slot_valid[2];
+            slot_valid[2] <= slot_valid[3];
+            slot_valid[3] <= 1'b0;
 
-            if (fe_in_valid && !busy) begin
-                busy <= 1'b1;
-                delay_count <= {1'b0, fe_desc_delay} + 3'd1;
-                packet_q <= fe_in_data;
-                dep_valid_q <= fe_dep_valid;
-                dep_data_q <= fe_dep_data;
-                delay_q <= fe_desc_delay;
-            end else if (busy) begin
-                if (delay_count > 3'd1) begin
-                    delay_count <= delay_count - 3'd1;
-                end else begin
-                    busy <= 1'b0;
-                    delay_count <= 3'd0;
-                    fe_out_valid <= 1'b1;
-                    fe_out_data <= packet_q ^
-                                   (dep_valid_q ? dep_data_q : {PACKET_W{1'b0}}) ^
-                                   delay_mask;
-                end
+            if (slot_valid[1]) slot_data[0] <= slot_data[1];
+            if (slot_valid[2]) slot_data[1] <= slot_data[2];
+            if (slot_valid[3]) slot_data[2] <= slot_data[3];
+
+            // A new result is written after the shift assignments.  With
+            // nonblocking assignments this write wins if both address a slot;
+            // such a collision is nevertheless forbidden by the PPE protocol.
+            if (fe_in_valid) begin
+                case (fe_desc_delay)
+                    2'd0: begin
+                        slot_valid[0] <= 1'b1;
+                        slot_data[0] <= result_data;
+                    end
+                    2'd1: begin
+                        slot_valid[1] <= 1'b1;
+                        slot_data[1] <= result_data;
+                    end
+                    2'd2: begin
+                        slot_valid[2] <= 1'b1;
+                        slot_data[2] <= result_data;
+                    end
+                    default: begin
+                        slot_valid[3] <= 1'b1;
+                        slot_data[3] <= result_data;
+                    end
+                endcase
             end
         end
     end

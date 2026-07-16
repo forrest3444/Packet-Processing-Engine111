@@ -56,8 +56,15 @@ interface ppe_if #(
     logic [3:0]           dbg_head_ptr;
     logic                 dbg_fallback_lookup_hit;
     logic [3:0]           dbg_fe_in_valid;
-    logic [3:0]           dbg_fe_busy;
     logic [4:0]           dbg_rob_occupancy;
+
+    logic                 fe_probe_in_valid;
+    logic [PACKET_W-1:0]  fe_probe_in_data;
+    logic                 fe_probe_dep_valid;
+    logic [PACKET_W-1:0]  fe_probe_dep_data;
+    logic [1:0]           fe_probe_delay;
+    logic                 fe_probe_out_valid;
+    logic [PACKET_W-1:0]  fe_probe_out_data;
 
     task clear_inputs();
         in_valid0  <= 1'b0;
@@ -72,6 +79,11 @@ interface ppe_if #(
         in_valid3  <= 1'b0;
         in_packet3 <= '0;
         in_desc3   <= '0;
+        fe_probe_in_valid <= 1'b0;
+        fe_probe_in_data <= '0;
+        fe_probe_dep_valid <= 1'b0;
+        fe_probe_dep_data <= '0;
+        fe_probe_delay <= '0;
     endtask
 
 endinterface

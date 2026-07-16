@@ -24,7 +24,7 @@ class ppe_perf_test extends uvm_test;
     int unsigned bkps_cycles;
     int unsigned occupancy_sum;
     int unsigned occupancy_peak;
-    int unsigned busy_lane_cycles[4];
+    int unsigned issue_lane_cycles[4];
     int unsigned first_accept_cycle;
     int unsigned last_accept_cycle;
     int unsigned latency_sum;
@@ -161,7 +161,7 @@ class ppe_perf_test extends uvm_test;
                     occupancy_peak = vif.dbg_rob_occupancy;
                 end
                 for (lane = 0; lane < 4; lane++) begin
-                    if (vif.dbg_fe_busy[lane]) busy_lane_cycles[lane]++;
+                    if (vif.dbg_fe_in_valid[lane]) issue_lane_cycles[lane]++;
                 end
 
                 if (accepted_now != 0) begin
@@ -234,7 +234,7 @@ class ppe_perf_test extends uvm_test;
         bkps_ratio = $itor(bkps_cycles) / $itor(measurement_cycles);
         avg_occupancy = $itor(occupancy_sum) / $itor(measurement_cycles);
         for (lane = 0; lane < 4; lane++) begin
-            fe_util[lane] = $itor(busy_lane_cycles[lane]) /
+            fe_util[lane] = $itor(issue_lane_cycles[lane]) /
                             $itor(measurement_cycles);
         end
 

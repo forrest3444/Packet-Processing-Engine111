@@ -33,6 +33,7 @@ package ppe_tb_pkg;
     `include "ppe_dep_loss_test.sv"
     `include "ppe_p0_perf_test.sv"
     `include "ppe_perf_test.sv"
+    `include "ppe_fe_pipeline_test.sv"
 
 endpackage
 

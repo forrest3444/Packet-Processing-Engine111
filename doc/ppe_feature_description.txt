@@ -56,17 +56,18 @@ FE 为黑盒处理单元，其内部算法不属于本规格范围。
   两种用途的数据内容一致，不区分端口；FE 返回时先统一写入对应 ROB entry。
 
   约束：
-  - 每个 FE 同时最多处理一个报文（single-inflight）。
-  - FE 接口不使用 ready 信号。PPE 仅在目标 FE 处于 idle 状态时发送请求，
-    fe_in_valid 为单周期脉冲，请求在该周期的时钟上升沿被 FE 接收。
+  - 每个 FE 为无阻塞流水线，同一周期最多接收一个报文，但允许多个报文同时在途。
+  - FE 接口不使用 ready 信号。fe_in_valid 为单周期脉冲，请求在该周期的时钟
+    上升沿被 FE 接收。PPE 只能发送不会造成该 FE 未来输出端口冲突的请求。
   - FE 完成处理时将 fe_out_valid 拉高一个周期，PPE 保证无条件接收该返回。
-    FE 从接收请求起保持 busy，直至产生 fe_out_valid；该 busy 状态由 PPE 根据
-    请求和返回进行跟踪。
-  - FE 请求在周期 T 的上升沿被接收后，fe_out_valid 最早在后续周期的上升沿
-    有效，不允许零周期组合返回。FE 返回当周期不接收新请求，最早从下一周期
-    重新参与派发。
-  - FE 处理延迟不固定，输入到输出的延迟受 fe_desc_delay 影响，但非精确周期
-    对应关系，具体特性需通过性能验证摸底。
+  - FE 请求在cycle n的上升沿被接收且fe_desc_delay=d时，结果固定在cycle
+    n+d+1的上升沿以fe_out_valid返回。delay=0/1/2/3分别对应1/2/3/4周期延迟，
+    不允许零周期组合返回。
+  - FE 允许在产生fe_out_valid的同一周期继续接收一个新请求。新请求的目标输出
+    周期仍按n+d+1计算，并且必须与所有尚未返回请求的目标输出周期不同。
+  - 同一 FE 的多个在途请求如果目标输出周期相同，将竞争唯一的fe_out_data/
+    fe_out_valid端口。FE不提供ready、拒绝或重放能力；这种输入属于PPE协议违规，
+    必须由调度逻辑避免并由验证环境检查。
 
   FE_NUM 表示 FE 阵列包含的 FE 数量，合法选择范围为 1~32。FE_NUM 是设计人员
   根据吞吐、面积和时序目标选择的微架构参数，不要求等于 N，也不固定为 4。
@@ -139,8 +140,9 @@ PPE 以全局反压信号 bkps 统一控制所有输入 lane。
   bkps = 1：所有 lane 同时停止接收。上游必须保持各 lane 的 in_valid_i、
             in_packet_i 和 in_desc_i 稳定，直至 bkps 拉低且报文被接收。
 
-bkps 不支持 per-lane 独立反压。bkps 仅由 ROB 容量不足产生：ROB 空闲条目数
-小于当前 valid 输入数时拉高。首版 RTL 不定义内部异常锁死状态。
+bkps 不支持 per-lane 独立反压。bkps 仅由 ROB 容量不足产生：ROB 沿前空闲条目数
+与本周期可退休条目数之和小于当前 valid 输入数时拉高。首版 RTL 不定义内部异常
+锁死状态。
 
 ROB_DEPTH 必须满足 ROB_DEPTH >= N，保证任意一个 N 路全 valid 的输入批次最终
 能够被整体接收。输入接收沿可直接将 packet、descriptor、seq_tag 和 seq_residue
@@ -150,11 +152,14 @@ ROB_DEPTH 必须满足 ROB_DEPTH >= N，保证任意一个 N 路全 valid 的输
 当前首版基线中 bkps 为组合输出：
 
   input_count = popcount(in_valid[0:N-1])
-  bkps = !internal_rst_n || (rob_free_count < input_count)
+  retire_count = 从 ROB head 开始、本周期沿前已经 DONE 的连续报文数
+  rob_available_count = rob_free_count + retire_count
+  bkps = !internal_rst_n || (rob_available_count < input_count)
 
-rob_free_count 使用本周期上升沿之前已经空闲的 ROB 条目数，不计入本周期将要退休
-释放的条目。该定义允许牺牲满 ROB 边界处的一个周期吞吐，以缩短退休路径到 bkps
-的组合时序。
+允许输入批次在同一上升沿复用本周期退休释放的 ROB 条目。若 allocation ROB ID 与
+退休 ROB ID 相同，退休输出、依赖结果缓存更新必须读取该沿之前的旧 entry 内容，
+该沿之后 entry 保存新 allocation 的 metadata 且 result 尚未有效。该定义消除 ROB
+满载边界的保守反压气泡，但形成从 ROB DONE 前缀检查到 bkps 的组合控制路径。
 
 ================================================================================
 5. 描述符
@@ -184,16 +189,9 @@ rob_free_count 使用本周期上升沿之前已经空闲的 ROB 条目数，不
   正常输入应满足：对于报文序为 S 的报文，dep_offset <= S。若 dep_offset > S，
   则其依赖目标位于本次复位建立的报文序起点之前，属于非法依赖。
 
-  RTL 可使用一个饱和到 7 的 history_count 实现上述启动阶段检查。
-  history_count 表示本次复位后排在当前报文之前的报文数量，并包含同周期内 lane
-  编号更小且同时被接收的报文。正常依赖条件为 dep_offset <= history_count。
-  计数器达到 7 后保持为 7，不受内部 seq 回绕影响。
-
-  验证环境应保证不产生非法依赖。作为防御性处理，若检测到
-  dep_offset > history_count，PPE 将该报文的内部 effective_dep_offset 置为 0；
-  否则 effective_dep_offset = dep_offset。降级后的报文按
-  无依赖报文继续接收、调度和输出；desc[1:0] 保持不变。降级后派发至 FE 时
-  fe_dep_valid = 0、fe_dep_data = 0。
+  验证环境必须保证不产生非法依赖。PPE不检测或修正超出本次复位后已建立历史范围
+  的dep_offset，也不为非法输入定义完成、输出或错误恢复行为。合法输入的依赖目标
+  始终直接使用desc[4:2]计算，不存在内部依赖降级。
 
 6.2 依赖结果缓存
 
@@ -224,9 +222,9 @@ rob_free_count 使用本周期上升沿之前已经空闲的 ROB 条目数，不
   但必须公平地得到查询机会。Fallback 命中数据可直接用于当前 FE 请求或回填 fast
   cache；无论采用哪种方式，都不得因另一路 writeback 覆盖 fast cache 而丢失结果。
 
-  target_seq_tag 由当前 seq_tag 减 effective_dep_offset 得到；target_residue
-  由当前 seq_residue 减 effective_dep_offset 并按模 8 回绕得到，也可直接使用
-  target_seq_tag[2:0]。effective_dep_offset = 7 时，target_residue 是当前
+  target_seq_tag 由当前 seq_tag 减 dep_offset 得到；target_residue
+  由当前 seq_residue 减 dep_offset 并按模 8 回绕得到，也可直接使用
+  target_seq_tag[2:0]。dep_offset = 7 时，target_residue 是当前
   seq_residue 加 1 后的模 8 结果。
 
   报文装入顶层输出寄存器时视为从 ROB 退休。退休沿同时将该报文的 fe_out_data
@@ -245,12 +243,17 @@ rob_free_count 使用本周期上升沿之前已经空闲的 ROB 条目数，不
 ================================================================================
 
 PPE 在满足以下全部条件时将报文派发至 FE：
-  1) effective_dep_offset = 0，或其依赖结果已在 ROB/result bank 中有效；
-  2) 存在空闲 FE。
+  1) dep_offset = 0，或其依赖结果已在 ROB/result bank 中有效；
+  2) 至少一个 FE 在该请求的目标返回周期没有已经预约的返回。
 
 每周期最大派发数 ISSUE_WIDTH 的合法范围为 1..FE_NUM，由微架构选择。调度策略
-不要求每周期占满全部空闲 FE，但必须保证持续处于可派发状态的报文最终能够进入
-FE，不得产生永久饥饿。
+不要求每周期占满全部无冲突 FE，但必须保证持续处于可派发状态的报文最终能够进入
+FE，不得产生永久饥饿。FE 可用性只由本周期输入端口是否已经使用以及目标返回周期
+是否已经预约决定，不得因该 FE 存在其他在途请求而将其整体标记为不可用。
+
+调度器必须在请求进入 FE 前为其返回事件保存完整的报文关联信息。请求在 cycle n
+进入 FE 且 delay=d 时，其关联信息必须唯一对应 cycle n+d+1 的该 FE 返回端口。
+同一 FE 可以连续多个周期接收请求，只要这些请求的目标返回周期互不冲突。
 
 派发时 PPE 向 FE 提供：
   - fe_in_data：当前 128 bit 报文
@@ -328,7 +331,7 @@ FE 在某个上升沿以 fe_out_valid 返回的数据先写入 ROB，该报文�
 复位状态下：
   - 清空所有 ROB 条目及关联状态；
   - 清空依赖结果缓存；
-  - 清空 FE 调度状态（busy flag、tag）；
+  - 清空 FE 返回周期预约及关联 tag；
   - 输出起始 lane 复位为 lane0；
   - 全局报文序计数器归零；
   - bkps 强制为 1；
@@ -351,13 +354,14 @@ FE 在某个上升沿以 fe_out_valid 返回的数据先写入 ROB，该报文�
   b) FE 处理延迟较长；
   c) ROB 暂时耗尽并通过 bkps 对输入实施反压。
 
-若报文的 dep_offset 超出本次复位后已经建立的历史范围，按第 6.1 节将其依赖降级
-为无依赖并继续处理，不视为内部一致性错误。验证环境仍应避免产生此类输入。
+dep_offset超出本次复位后已经建立的历史范围属于输入协议违规。RTL不检测、不降级，
+验证环境必须在输入侧报告该错误。
 
 以下情况属于内部一致性错误：
   a) ROB entry 的 valid、tag 或 seq 发生冲突；
   b) 合法依赖结果被过早覆盖，导致等待方无法取得结果；
-  c) FE 返回与当前记录的 busy/tag 状态不一致。
+  c) FE 返回与当前返回周期预约或关联 tag 不一致；
+  d) 调度器向同一 FE 派发目标返回周期冲突的请求。
 
 当前规格不定义 FE timeout，因此不得仅因 FE 长时间未返回而触发异常；若后续需要
 超时机制，须另行定义可验证的 timeout 周期或参数。
@@ -377,8 +381,8 @@ FE 接口协议；ROB/tag/writeback 等内部一致性错误由验证侧 asserti
   1) 报文序由 PPE 内部按周期优先、lane 编号次优先分配。
   2) 输入数据中的任意字段不得作为报文序的设计语义依据。
      RTL seq 可按规定的 SEQ_W 回绕，但相关窗口内的 tag 匹配不得产生混淆。
-  3) dep_offset = 0 表示无依赖，1~7 表示依赖前第 K 个报文；超出已建立历史范围
-     的依赖降级为无依赖。
+  3) dep_offset = 0 表示无依赖，1~7 表示依赖前第 K 个报文；非零dep_offset必须
+     不大于本次复位后排在当前报文之前的报文数量，RTL不实现非法依赖降级。
   4) 依赖未满足时，报文不得进入 FE。
   5) desc[1:0] 传入 FE，同时影响数据处理延迟和输出数据内容，PPE 不干预。
   6) FE 可乱序完成，最终输出必须严格按报文序。
@@ -387,7 +391,8 @@ FE 接口协议；ROB/tag/writeback 等内部一致性错误由验证侧 asserti
   8) 在未发生复位且 FE 最终返回的前提下，每个成功接收的报文
      恰好输出一次。
   9) bkps 拉高时所有输入 lane 统一停止。
-  10) 单个 FE 不支持多 inflight。
+  10) 单个 FE 支持多 inflight；每周期最多接收一个请求，且所有在途请求的目标
+      返回周期必须互不冲突。
   11) fe_out_data 返回时先写 ROB，并可同时更新 dispatch fast cache；报文退休时再
       写入对应的 8-bank 权威已退休结果缓存。
   12) 复位异步生效、同步释放，并同时取消 PPE 与全部 FE 的在途事务。

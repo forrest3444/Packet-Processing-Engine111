@@ -8,12 +8,17 @@ TB_TOP     ?= tb_top
 TESTNAME   ?= ppe_basic_test
 SEED       ?= 1
 VERB       ?= UVM_MEDIUM
-RUN_TIME   ?= 1ms
+RUN_TIME   ?= 60s
 BUILD_NAME ?= default
+RUN_TAG    ?= $(TESTNAME)_seed_$(SEED)
+
+REGRESS_BUILD_NAME ?= regression
+REGRESS_FUNC_SEEDS ?= 1 23
+REGRESS_PERF_SEEDS ?= 1
 
 SIM       ?= sim
 BUILD_DIR := $(SIM)/build/$(BUILD_NAME)
-RUN_DIR   := $(SIM)/run/$(TESTNAME)_seed_$(SEED)
+RUN_DIR   := $(SIM)/run/$(RUN_TAG)
 BUILD_LOG_DIR := $(BUILD_DIR)/log
 RUN_LOG_DIR   := $(RUN_DIR)/log
 SIMV_DIR      := $(BUILD_DIR)/simv
@@ -50,7 +55,8 @@ VERILATOR_LINT_OPTS = --lint-only       \
 ###############################################################################
 # Targets
 ###############################################################################
-.PHONY: all prepare_build prepare_run check_elab lint elab run sim clean clean_all help
+.PHONY: all prepare_build prepare_run check_elab lint elab run sim \
+	regress regress-functional regress-performance clean clean_all help
 
 all: sim
 
@@ -84,6 +90,25 @@ run: check_elab prepare_run
 
 sim: elab run
 
+regress:
+	BUILD_NAME="$(REGRESS_BUILD_NAME)" \
+	FUNC_SEEDS="$(REGRESS_FUNC_SEEDS)" \
+	PERF_SEEDS="$(REGRESS_PERF_SEEDS)" \
+	RUN_TIME="$(RUN_TIME)" VERB="$(VERB)" \
+	./script/run_regression.sh all
+
+regress-functional:
+	BUILD_NAME="$(REGRESS_BUILD_NAME)" \
+	FUNC_SEEDS="$(REGRESS_FUNC_SEEDS)" \
+	RUN_TIME="$(RUN_TIME)" VERB="$(VERB)" \
+	./script/run_regression.sh functional
+
+regress-performance:
+	BUILD_NAME="$(REGRESS_BUILD_NAME)" \
+	PERF_SEEDS="$(REGRESS_PERF_SEEDS)" \
+	RUN_TIME="$(RUN_TIME)" VERB="$(VERB)" \
+	./script/run_regression.sh performance
+
 clean:
 	rm -rf $(SIM)/run
 
@@ -96,6 +121,10 @@ help:
 	@echo "  make elab    Compile/elaborate UVM testbench"
 	@echo "  make run     Run existing elaboration"
 	@echo "  make sim     Compile and run"
+	@echo "  make regress-functional  Run multi-seed functional regression"
+	@echo "  make regress-performance Run P0-P6 performance characterization"
+	@echo "  make regress             Run functional and performance regressions"
 	@echo "Variables:"
 	@echo "  VERILATOR=$(VERILATOR) RTL_FILELIST=$(RTL_FILELIST)"
-	@echo "  TESTNAME=$(TESTNAME) SEED=$(SEED) VERB=$(VERB) BUILD_NAME=$(BUILD_NAME)"
+	@echo "  TESTNAME=$(TESTNAME) SEED=$(SEED) VERB=$(VERB) BUILD_NAME=$(BUILD_NAME) RUN_TAG=$(RUN_TAG)"
+	@echo "  REGRESS_BUILD_NAME=$(REGRESS_BUILD_NAME) REGRESS_FUNC_SEEDS='$(REGRESS_FUNC_SEEDS)' REGRESS_PERF_SEEDS='$(REGRESS_PERF_SEEDS)'"

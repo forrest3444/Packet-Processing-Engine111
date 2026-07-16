@@ -23,7 +23,7 @@ class ppe_p0_perf_test extends uvm_test;
     int unsigned bkps_cycles;
     int unsigned occupancy_sum;
     int unsigned occupancy_peak;
-    int unsigned busy_lane_cycles[4];
+    int unsigned issue_lane_cycles[4];
     int unsigned first_accept_cycle;
     int unsigned last_accept_cycle;
     int unsigned latency_sum;
@@ -97,8 +97,8 @@ class ppe_p0_perf_test extends uvm_test;
                     occupancy_peak = vif.dbg_rob_occupancy;
                 end
                 for (lane = 0; lane < 4; lane++) begin
-                    if (vif.dbg_fe_busy[lane]) begin
-                        busy_lane_cycles[lane]++;
+                    if (vif.dbg_fe_in_valid[lane]) begin
+                        issue_lane_cycles[lane]++;
                     end
                 end
 
@@ -148,6 +148,11 @@ class ppe_p0_perf_test extends uvm_test;
             `uvm_error("P0_FALLBACK", $sformatf(
                 "no-dependency baseline observed %0d fallback cycles", fallback_cycles))
         end
+        if (bkps_cycles != 0) begin
+            `uvm_error("P0_BKPS", $sformatf(
+                "full-width zero-delay baseline observed %0d backpressure cycles",
+                bkps_cycles))
+        end
         if (accept_cycle_q.size() != 0) begin
             `uvm_error("P0_PENDING", $sformatf(
                 "%0d accepted timestamps remain", accept_cycle_q.size()))
@@ -179,7 +184,7 @@ class ppe_p0_perf_test extends uvm_test;
         bkps_ratio = $itor(bkps_cycles) / $itor(measurement_cycles);
         avg_occupancy = $itor(occupancy_sum) / $itor(measurement_cycles);
         for (lane = 0; lane < 4; lane++) begin
-            fe_util[lane] = $itor(busy_lane_cycles[lane]) /
+            fe_util[lane] = $itor(issue_lane_cycles[lane]) /
                             $itor(measurement_cycles);
         end
 

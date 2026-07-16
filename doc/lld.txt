@@ -24,9 +24,10 @@ PPE Low-Level Design
   PACKET_W     = 128
   DESC_W       = 5
 
-所有RTL使用Verilog-2001。重复lane/FE接口统一使用一维packed vector，不使用
-SystemVerilog unpacked array port。lane/FE 0占最低切片，元素i使用
-bus[i*WIDTH +: WIDTH]；单bit集合使用bus[i]。模块内部允许使用Verilog memory。
+所有RTL使用Verilog-2001。重复lane/FE模块端口使用带0..3后缀的独立命名信号，
+不使用SystemVerilog unpacked array port，也不把多个lane/FE字段聚合为宽位packed
+vector后在接收模块内拆包。模块内部允许使用Verilog memory；仅用于局部计算的bit
+mask仍可使用普通packed vector。
 
 ================================================================================
 2. 内部架构图与典型数据流
@@ -46,24 +47,22 @@ bus[i*WIDTH +: WIDTH]；单bit集合使用bus[i]。模块内部允许使用Veril
   |  | D0 Input Admission        |<------------------------- bkps            |
   |  | - valid rank              |                                           |
   |  | - seq/tag/residue alloc   |---- alloc metadata -------------------+   |
-  |  | - dependency downgrade    |<--- allocated ROB ID -----------------+---|--+
-  |  | - target precompute       |                                           |  |
+  |  | - target tag/state init   |<--- allocated ROB ID -----------------+---|--+
   |  +-------------+-------------+                                           |  |
   |                | registered dispatch entry                              |  |
   |                v                                                         |  |
   |  +---------------------------+       +-------------------------------+   |  |
   |  | Dispatch Table [0..15]    |       | Sequence / Control State      |   |  |
-  |  | - packet                  |       | - next_seq_tag/residue        |   |  |
-  |  | - rob_id / seq tag       |       | - history_count              |   |  |
-  |  | - dependency target       |       | - packet_rr_ptr / fe_rr_ptr  |   |  |
-  |  | - dep_ready / state       |       +-------------------------------+   |  |
+  |  | - packet / seq tag        |       | - next_seq_tag                |   |  |
+  |  | - target seq tag          |       | - packet_rr_ptr / fe_rr_ptr  |   |  |
+  |  | - unified state           |       +-------------------------------+   |  |
   |  +------+--------------------+                                           |  |
   |         |                                                                |  |
   |         | Flow D-B：依赖初始化/等待                                     |  |
   |         v                                                                |  |
   |  +---------------------------+       +-------------------------------+      |
-  |  | D1 Dependency Control     |<----->| 8-bank Fast Cache             |      |
-  |  | - initial cache lookup    |       | valid / full tag / 128b data  |      |
+  |  | Dependency Event Control  |<----->| 8-bank Fast Cache             |      |
+  |  | - D0 cache/WB init        |       | valid / full tag / 128b data  |      |
   |  | - writeback wakeup        |<--- wb rob_id / seq_tag events -------------+
   |  | - FALLBACK / WAIT_DEP     |       +-------------------------------+      |
   |  +-------------+-------------+
@@ -71,8 +70,8 @@ bus[i*WIDTH +: WIDTH]；单bit集合使用bus[i]。模块内部允许使用Veril
   |                | eligible control bits
   |                v
   |  +---------------------------+       +-------------------------------+
-  |  | D2 Packet RR Selector     |------>| D2 Idle FE RR Selector        |
-  |  | - 16-entry eligible mask  |       | - busy/reserved mask          |
+  |  | D2 Packet RR Selector     |------>| D2 Return-Slot FE Selector    |
+  |  | - 16-entry eligible mask  |       | - calendar conflict check     |
   |  | - select up to 4 entries  |       | - assign up to 4 FEs          |
   |  +-------------+-------------+       +---------------+---------------+
   |                | selected entry indices / FE mapping  |
@@ -89,7 +88,7 @@ bus[i*WIDTH +: WIDTH]；单bit集合使用bus[i]。模块内部允许使用Veril
   |                            v                               |
   |  +-------------------------------------------------------------------+
   |  | Per-FE State                                                    |
-  |  | busy / reserved / rob_id / seq_tag                              |
+  |  | launch register / 8-slot return calendar and tags               |
   |  +-------------------------------------------------------------------+
   +-----------------------------+--------------------------------------------+
                                 |
@@ -167,8 +166,8 @@ bus[i*WIDTH +: WIDTH]；单bit集合使用bus[i]。模块内部允许使用Veril
 
 2.3 典型无依赖报文数据流
 
-  1) D0捕获输入，分配seq和rob_id，同时A0建立ROB metadata；
-  2) D1将无依赖报文直接标记为READY；
+  1) D0捕获输入，分配seq和rob_id，同时A0建立ROB metadata并将无依赖报文标记为
+     READY_NODEP；
   3) D2选择报文和目标FE；
   4) D3读取packet并向FE发出请求，dispatch entry释放；
   5) FE返回，W0按rob_id写ROB并设置result_valid；
@@ -177,13 +176,14 @@ bus[i*WIDTH +: WIDTH]；单bit集合使用bus[i]。模块内部允许使用Veril
 
 2.4 典型依赖等待数据流
 
-  1) D0捕获依赖报文并预计算target rob_id/tag/residue；
-  2) entry以DEP_INIT状态进入D1，命中本地fast cache则READY，否则进入FALLBACK；
+  1) D0捕获依赖报文并预计算完整target seq tag；target rob_id和residue由tag低位导出；
+  2) D0以本地fast cache和同周期writeback旁路初始化状态，命中则READY_DEP，否则
+     进入FALLBACK；
   3) 单路fallback命中则回填fast cache并READY，未命中则进入WAIT_DEP；
   4) 目标FE返回时，W0写ROB，dispatch更新fast cache并唤醒WAIT_DEP/FALLBACK entry；
   5) 被唤醒报文进入READY并由D2选择；
-  6) D3命中fast cache时直接派发；若cache被覆盖则保持reservation并走单路fallback；
-  7) fallback返回的数据直接用于该次FE请求，不要求写入dispatch entry。
+  6) D3命中fast cache时直接派发；若cache被覆盖则取消返回预约并走单路fallback；
+  7) fallback命中数据进入全局replay寄存器，重新预约FE后直接用于D3派发。
 
 2.5 典型保序阻塞数据流
 
@@ -193,6 +193,24 @@ bus[i*WIDTH +: WIDTH]；单bit集合使用bus[i]。模块内部允许使用Veril
   4) head完成后的下一周期，R0一次退休最多4个连续DONE报文；
   5) 输出顺序由ROB head确定，与FE完成顺序无关。
 
+2.6 FE固定延迟流水行为
+
+每个FE每周期最多接收一路请求，允许多个请求同时在途，并允许输入和输出在同一周期
+发生。请求在cycle n接收且desc_delay=d时，固定在cycle n+d+1返回。行为模型可用
+四个未来输出槽表达：
+
+  slot0：下一周期输出
+  slot1：下两周期输出
+  slot2：下三周期输出
+  slot3：下四周期输出
+
+接收请求时将结果预约到slot[d]，每周期输出当前slot0并将slot1..3向低位推进。
+同一FE每个未来周期只有一个输出槽；新请求如果与已有在途请求预约同一输出周期，
+属于PPE协议违规。FE无ready或重放能力，正常RTL不得产生这种输入。
+
+FE内部数据算法对PPE保持黑盒。仓库行为模型只需与验证VIP保持一致；PPE功能正确性
+依赖的是输入数据、依赖数据和delay被正确送达，以及返回周期和请求关联正确。
+
 ================================================================================
 3. ppe_dispatch内部数据结构
 ================================================================================
@@ -201,51 +219,35 @@ bus[i*WIDTH +: WIDTH]；单bit集合使用bus[i]。模块内部允许使用Veril
 
 Dispatch table深度为16，以ROB ID作为entry索引。每个entry至少包含：
 
-  valid
   packet[127:0]
-  rob_id[3:0]
   seq_tag[4:0]
   desc_delay[1:0]
-  effective_dep_offset[2:0]
-  target_rob_id[3:0]
   target_seq_tag[4:0]
-  target_residue[2:0]
-  dep_ready
-  reserved
   state
 
 状态编码逻辑语义：
 
-  DEP_INIT：valid=1，存在合法依赖，等待D1首次fast-cache lookup；
-  FALLBACK：valid=1，本地首次查询miss，等待单路权威lookup；
-  WAIT_DEP：valid=1，权威lookup确认结果未完成，等待写回事件；
-  READY：valid=1，dep_ready=1且尚未被选择；
-  SELECTED：已经被D2选中并预留目标FE，等待D3派发。
+  FREE：entry无效；
+  FALLBACK：本地查询miss，等待单路权威lookup；
+  WAIT_DEP：权威lookup确认结果未完成，等待写回事件；
+  READY_NODEP：无依赖且尚未被选择；
+  READY_DEP：依赖已满足且尚未被选择；
+  SELECTED_NODEP：无依赖entry已被D2选中，等待D3派发；
+  SELECTED_DEP：依赖entry已被D2选中，等待D3派发；
+  REPLAY：权威fallback数据已经保存在全局replay寄存器，等待D2优先重新选择。
 
-状态具体编码由RTL决定，但必须保证无非法多状态组合。
-
-3.1.1 D0-to-D1 Initialization Pipeline
-
-每个输入lane对应一个D1 initialization slot，保存：
-
-  d1_init_valid
-  d1_init_rob_id[3:0]
-
-D0仅对成功接收且effective_dep_offset不为0的报文置d1_init_valid。D1在下一周期
-使用d1_init_rob_id读取dispatch entry中的target信息并查询本地fast cache。每个slot
-消费当前内容的同一上升沿可由D0写入下一批内容，因此D1无需扫描16项table
-查找DEP_INIT entry。
+状态是entry有效性、依赖是否存在/满足以及是否已被选择的唯一编码，不另存valid、
+dep_ready或reserved。target_rob_id固定等于target_seq_tag[3:0]，target_residue固定等于
+target_seq_tag[2:0]，不得重复保存。
 
 3.2 Sequence State
 
 Dispatch维护：
 
   next_seq_tag[4:0]
-  next_seq_residue[2:0]
-  history_count[2:0]
 
-next_seq_tag按2^SEQ_W回绕。next_seq_residue按3 bit自然回绕，可直接等于
-next_seq_tag[2:0]。history_count饱和到7。
+next_seq_tag按2^SEQ_W回绕。当前next residue直接使用next_seq_tag[2:0]，不保存独立
+计数器。
 
 3.3 Packet Arbitration State
 
@@ -256,25 +258,41 @@ packet_rr_ptr指向下一次轮询扫描起点。D2成功选择至少一个报�
 
 3.4 Per-FE State
 
-每个FE保存：
+四个FE的返回日历在模块内部扁平为32项，索引为{fe_id[1:0], slot[2:0]}。每个FE仍
+保存一组独立launch寄存器：
 
-  fe_busy
-  fe_reserved
-  fe_selected_rob_id[3:0]
-  fe_rob_id[3:0]
-  fe_seq_tag[4:0]
+  fe_launch_valid
+  fe_launch_rob_id[3:0]
+  fe_launch_return_slot[2:0]
+  fe_launch_replay
+共享日历保存：
 
-fe_selected_rob_id只在fe_reserved=1时有效，用于将D2选择结果传递给下一周期D3。
-fe_rob_id和fe_seq_tag只在fe_busy=1时有效，用于FE返回关联。
+  return_valid[0:31]
+  return_rob_id[0:31][3:0]
+  return_seq_tag[0:31][4:0]
 
-首版RTL不实现request register或per-FE pending request，因此不保存任何
-fe_pending_*状态。
+launch寄存器是D2到D3的单级控制流水。D3在每个周期消费当前valid launch：正常命中
+则向FE发射，cache miss则取消该launch的return_slot预约并将entry转入fallback。
+因此D2允许在同一上升沿为该FE写入下一launch，不因当前launch存在而产生隔周期气泡。
+
+return calendar以共享schedule_phase索引。只有valid位参与空闲判断；rob_id和seq_tag
+在valid=0时不要求清零。日历保存已经预约但尚未返回的全部FE请求关联信息。
 
 3.5 FE Arbitration State
 
   fe_rr_ptr[1:0]
+  schedule_phase[2:0]
 
 fe_rr_ptr指向下一次FE轮询起点。成功分配后推进到最后一个被分配FE的下一位置。
+schedule_phase表示本周期上升沿对应的返回日历槽，每个非复位上升沿加1自然回绕。
+
+若D2选择发生在cycle n上升沿，所选请求将在cycle n+1上升沿由D3送入FE。delay=d
+的目标返回沿为cycle n+d+2，因此D2目标槽计算为：
+
+  target_slot = schedule_phase + zero_extend(d) + 3'd2
+
+以上加法按3 bit自然回绕。最长预约距离为5周期，小于8槽深度，不会与未到期预约
+发生模回绕混淆。
 
 3.6 Dependency Fast Cache and Fallback State
 
@@ -292,9 +310,14 @@ Fallback仲裁状态：
   fallback_class_rr
   fallback_fe_rr_ptr[1:0]
   fallback_entry_rr_ptr[3:0]
+  replay_valid
+  replay_rob_id[3:0]
+  replay_data[127:0]
 
 D3 cache miss和FALLBACK entry分属两类。两类同时非空时按fallback_class_rr轮换；
-类内分别按对应RR指针选择，保证持续请求最终得到服务。
+类内分别按对应RR指针选择，保证持续请求最终得到服务。replay_valid=1时暂停新的
+fallback请求。权威查询命中时保存entry ID和128 bit数据，并将entry转为REPLAY；
+D2优先于普通READY entry选择replay报文，D3使用replay_data且不复查fast cache。
 
 ================================================================================
 4. ppe_reorder内部数据结构
@@ -319,6 +342,7 @@ fe_out_data同时作为最终输出数据和依赖结果，不保存两份128 bi
   occupancy[4:0]
 
   free_count = ROB_DEPTH - occupancy
+  available_count = free_count + retire_count
 
 head_ptr和tail_ptr按16自然回绕。occupancy范围为0..16。
 
@@ -335,7 +359,7 @@ bank编号等于对应抽象seq对8取模的seq_residue，也等于seq_tag[2:0]�
 4.4 Output State
 
   start_lane[1:0]
-  out_valid[3:0]
+  out_valid0..3
   out_packet0[127:0]
   out_packet1[127:0]
   out_packet2[127:0]
@@ -349,28 +373,28 @@ bank编号等于对应抽象seq对8取模的seq_residue，也等于seq_tag[2:0]�
 
 5.0 Top -> Reorder：Backpressure Demand
 
-ppe_top将原始顶层in_valid0..3打包为in_valid[3:0]并直接连接到reorder容量查询输入。
-Reorder必须使用未经bkps门控的原始in_valid计算input_count，不得使用alloc_valid
+ppe_top将原始顶层in_valid0..3分别直接连接到reorder容量查询输入。
+Reorder必须使用未经bkps门控的原始in_valid0..3计算input_count，不得使用alloc_valid
 反推input_count，以避免形成bkps组合环。该路径只读取valid，不向reorder传递
 packet或descriptor。
 
-Top向dispatch同样使用lane0位于最低切片的packed vector：
+Top向dispatch同样使用独立命名端口：
 
-  in_valid[3:0]
-  in_packet[4*128-1:0]
-  in_desc[4*5-1:0]
+  in_valid0..3
+  in_packet0..3[127:0]
+  in_desc0..3[4:0]
 
 5.1 Dispatch -> Reorder：ROB Allocation
 
-使用lane0位于最低切片的packed vector：
+每个输入lane使用一组独立命名端口：
 
-  alloc_valid[3:0]
-  alloc_seq_tag[4*5-1:0]
-  alloc_seq_residue[4*3-1:0]
+  alloc_valid0..3
+  alloc_seq_tag0..3[4:0]
+  alloc_seq_residue0..3[2:0]
 
 5.2 Reorder -> Dispatch：Allocation Response
 
-  alloc_rob_id[4*4-1:0]
+  alloc_rob_id0..3[3:0]
 
 Allocation response为组合返回，不使用ready或多周期握手。Reorder仅使用当前
 tail_ptr和alloc_valid计算：
@@ -397,35 +421,40 @@ Reorder组合返回：
   fallback_ready
   fallback_data[127:0]
 
-接口无反压。请求来自FALLBACK entry或D3 selected cache miss。前者查询未完成时转为
-WAIT_DEP，等待writeback事件；后者保持SELECTED和FE reservation并在后续周期重试。
+接口无反压。请求来自FALLBACK entry或D3 launch cache miss。查询未完成时entry转为
+WAIT_DEP并等待writeback事件；查询命中时数据进入dispatch replay寄存器。D3 miss无论
+是否取得本周期fallback grant，均取消原返回预约并离开launch。
 
 5.5 Dispatch -> FE
 
-使用FE0位于最低切片的packed vector：
+每个FE使用一组独立命名端口：
 
-  fe_in_valid[3:0]
-  fe_in_data[4*128-1:0]
-  fe_dep_valid[3:0]
-  fe_dep_data[4*128-1:0]
-  fe_desc_delay[4*2-1:0]
+  fe_in_valid0..3
+  fe_in_data0..3[127:0]
+  fe_dep_valid0..3
+  fe_dep_data0..3[127:0]
+  fe_desc_delay0..3[1:0]
+
+每个FE每周期最多接受一路fe_in_valid。delay=d的请求固定在接收后的第d+1周期返回。
+接口没有ready；dispatch必须通过8槽返回日历保证同一FE的所有在途请求目标输出周期
+互不冲突。FE返回同周期允许接收新的无冲突请求。
 
 5.6 FE/Dispatch Tag -> Reorder Writeback
 
-使用FE0位于最低切片的packed vector：
+每个FE返回使用一组独立命名端口：
 
-  wb_valid[3:0]
-  wb_rob_id[4*4-1:0]
-  wb_seq_tag[4*5-1:0]
-  wb_data[4*128-1:0]
+  wb_valid0..3
+  wb_rob_id0..3[3:0]
+  wb_seq_tag0..3[4:0]
+  wb_data0..3[127:0]
 
-wb_rob_id和wb_seq_tag来自dispatch保存的per-FE tag。
+wb_rob_id和wb_seq_tag来自该FE的return calendar[schedule_phase]。
 
 5.7 Reorder -> Top
 
   bkps
-  out_valid[3:0]
-  out_packet[4*128-1:0]
+  out_valid0..3
+  out_packet0..3[127:0]
 
 5.8 Top -> Dispatch/Reorder/FE：Internal Reset
 
@@ -454,30 +483,26 @@ internal_rst_n异步拉低、同步释放，并作为ppe_dispatch、ppe_reorder�
 seq_tag使用固定位宽自然回绕。alloc_rob_id由reorder按5.2节组合返回，
 dispatch不直接读取tail_ptr。
 
-seq_residue从next_seq_residue开始按有效lane顺序以3 bit自然推进，超过7后回到0。
-由于SEQ_W=5，可直接使用seq_tag[2:0]。
+seq_residue直接使用对应seq_tag[2:0]。
 
-6.2 Dependency Downgrade
+6.2 Dependency Input Contract
 
-对于当前报文，preceding_count包括复位后此前接收的报文，以及同周期lane编号更小的
-有效报文：
-
-  preceding_count = min(history_count + lane_rank, 7)
-
-  if dep_offset > preceding_count:
-      effective_dep_offset = 0
-  else:
-      effective_dep_offset = dep_offset
-
-desc_delay始终保持输入desc[1:0]不变。
+输入协议保证非零dep_offset不大于本次复位后排在当前报文之前的报文数量，其中包括
+同周期lane编号更小且同时被接收的报文。Dispatch不保存历史计数器，不检测或修改
+非法dep_offset。desc_delay始终保持输入desc[1:0]不变。
 
 6.3 Dependency Target Precompute
 
-若effective_dep_offset=K且K不为0：
+若dep_offset=K且K不为0：
 
-  target_rob_id  = rob_id - K mod 16
   target_seq_tag = seq_tag - K mod 32
-  target_residue = seq_residue - K mod 8
+
+连续ROB分配建立并必须保持以下不变量：
+
+  rob_id         = seq_tag[3:0]
+  seq_residue    = seq_tag[2:0]
+  target_rob_id  = target_seq_tag[3:0]
+  target_residue = target_seq_tag[2:0]
 
 K=7时target_residue等于当前seq_residue加1的模8结果。
 
@@ -487,32 +512,21 @@ K=7时target_residue等于当前seq_residue加1的模8结果。
 
   - 使用reorder返回的alloc_rob_id写dispatch entry；
   - 向reorder提交alloc metadata；
-  - 推进next_seq_tag和next_seq_residue；
-  - history_count饱和增加实际接收数。
+  - 推进next_seq_tag。
 
-输入被捕获后最早下一周期进入D1，不允许组合直通FE。
+输入被捕获后最早下一周期进入D2，不允许组合直通FE。
 
 ================================================================================
-7. Dispatch D1：依赖初始化与事件唤醒
+7. Dispatch依赖初始化与事件唤醒
 ================================================================================
 
-7.1 New Entry Initialization
+7.1 D0 New Entry Initialization
 
-  effective_dep_offset=0：
-      D0接收沿直接写dep_ready=1，state=READY
+  dep_offset=0：state <- READY_NODEP
 
-  effective_dep_offset!=0：
-      D0接收沿写dep_ready=0，state=DEP_INIT
-
-每个有效d1_init slot在下一周期D1按d1_init_rob_id读取对应DEP_INIT entry，并查询
-target_residue直接索引的本地fast cache：
-
-  cache valid且完整tag匹配：dep_ready <- 1，state <- READY
-  cache miss：dep_ready <- 0，state <- FALLBACK
-
-DEP_INIT不参与D2 eligible计算，也不依赖分配沿同周期的writeback event。D1每周期
-无条件消费所有d1_init_valid，因此不会积累超过4个DEP_INIT entry。FALLBACK是持久
-table状态，由第7.3节单路仲裁逐项处理。
+  dep_offset!=0：以target_seq_tag[2:0]直接索引fast cache，同时将target_seq_tag与最多
+  4路同周期writeback完整tag比较。任一命中时state <- READY_DEP，否则state <-
+  FALLBACK。该旁路只进入D0 entry状态写入，不进入bkps路径。
 
 7.2 Writeback Wakeup
 
@@ -524,8 +538,7 @@ table状态，由第7.3节单路仲裁逐项处理。
 
 任意wake_hit成立时：
 
-  dep_ready <- 1
-  state     <- READY
+  state <- READY_DEP
 
 比较顺序建议先rob_id后seq_tag，以减少完整tag比较的无效翻转。
 
@@ -536,18 +549,13 @@ table复制128 bit结果。
 
 所有state=FALLBACK且本地cache仍miss的entry形成initialization miss集合。仲裁器与
 D3 miss共享单路fallback接口，并按第3.6节轮询。查询ready时回填fast cache并将该
-entry置READY；查询not ready时置WAIT_DEP。若查询同周期有匹配writeback，则按ready
+entry置REPLAY；查询not ready时置WAIT_DEP。若查询同周期有匹配writeback，则按ready
 处理，writeback数据在该沿写入fast cache。
 
-7.4 Simultaneous D1 Lookup and Writeback
+7.4 Simultaneous Initialization and Writeback
 
-某DEP_INIT entry执行本地首查时，目标可能恰好同周期writeback。D1必须将cache hit
-与4路writeback event的rob_id/full seq_tag匹配结果取或：
-
-  d1_resolved = cache_hit || matching_writeback_event
-
-d1_resolved成立时在该沿将entry转为READY。writeback数据同时写fast cache；若随后被
-其他writeback覆盖，D3完整tag复查会转入fallback，不会错误派发。
+D0初始化使用第7.1节writeback旁路。writeback数据同时写fast cache；若随后被其他
+writeback覆盖，D3完整tag复查会转入fallback，不会错误派发。
 
 ================================================================================
 8. Dispatch D2：报文与FE仲裁
@@ -557,34 +565,35 @@ d1_resolved成立时在该沿将entry转为READY。writeback数据同时写fast 
 
 每个dispatch entry：
 
-  eligible = valid && (state == READY) && dep_ready && !reserved
+  eligible = (state == READY_NODEP) || (state == READY_DEP)
+
+replay_valid对应的REPLAY entry不进入普通eligible mask，由D2在普通RR选择前优先处理。
 
 8.2 Packet Round-Robin
 
-首版固定使用旋转mask加并行rank的multi-grant算法。先将eligible mask按
-packet_rr_ptr旋转，使指针对应entry成为rotated[0]。对每个位置j并行计算：
+从packet_rr_ptr开始按轮转顺序扫描entry，并为每个eligible entry立即执行第8.3节FE
+匹配。只有成功匹配FE和return slot的entry才计入最多4个grant；候选因目标槽冲突
+失败时继续扫描后续entry，避免前部冲突候选阻塞后续可发报文。实现允许使用固定上界
+循环描述联合选择，综合后需重点检查该路径时序。
 
-  prefix_count[j] = rotated[0 .. j-1]中的1的数量
-  grant_rot[j]    = rotated[j] && (prefix_count[j] < issue_limit)
+8.3 FE Selection and Return Reservation
 
-  issue_limit = min(ISSUE_WIDTH, available_fe_count)
+对候选报文计算：
 
-再将grant_rot反向旋转回物理entry编号。该算法每周期产生最多4个互不重复grant，
-其语义等价于从packet_rr_ptr开始选择前issue_limit个eligible entry。
-物理实现应使用分组prefix/popcount逻辑，不得使用四级完全串行的16项priority
-encoder链。
+  target_slot = schedule_phase + zero_extend(desc_delay) + 3'd2
+  fe_available = !return_valid[fe_id][target_slot]
 
-8.3 FE Selection
+从fe_rr_ptr开始为候选报文寻找第一个目标槽可用且本周期尚未分配的FE。一个FE每周期
+最多接收一个D2分配。普通报文按packet_rr_ptr顺序处理；replay_valid时先为replay
+报文分配，再处理普通候选。分配成功后：
 
-  fe_available = !fe_busy && !fe_reserved
+  - FE launch写入valid、rob_id、target_slot和replay标志；
+  - return calendar[target_slot]写入valid、rob_id和完整seq_tag；
+  - dispatch entry按依赖类型进入SELECTED_NODEP或SELECTED_DEP。
 
-从fe_rr_ptr开始为已选报文依次选择可用FE。选中后：
-
-  - 报文按packet_rr_ptr循环扫描顺序排列，FE按fe_rr_ptr循环扫描顺序排列；
-  - 第j个已选报文与第j个可用FE配对；
-  - 将该entry的rob_id写入目标FE的fe_selected_rob_id；
-  - dispatch entry进入SELECTED并设置reserved；
-  - 目标FE设置fe_reserved。
+若某候选无法匹配任何FE，则保持READY并等待后续周期，不得因其他候选成功而丢失。
+D2实现可以使用受约束优先的4x4匹配或等价无重复分配逻辑；不得将FE存在其他在途请求
+作为不可用条件。
 
 8.4 RR Pointer Update
 
@@ -595,30 +604,30 @@ encoder链。
 9. Dispatch D3：Operand Read与FE Issue
 ================================================================================
 
-对每个fe_reserved=1的FE：
+对每个fe_launch_valid=1的FE：
 
-  - 通过fe_selected_rob_id读取packet和desc_delay；
-  - 无依赖时输出fe_dep_valid=0、fe_dep_data=0；
+  - 通过fe_launch_rob_id读取packet和desc_delay；
+  - SELECTED_NODEP输出fe_dep_valid=0、fe_dep_data=0；
   - 有依赖时以target_residue直接读取本地fast cache并检查完整tag；
   - cache hit时将packet、dependency和delay路由到目标FE；
-  - cache miss时保持SELECTED/reservation并形成D3 fallback候选；
-  - 获得fallback grant且fallback_ready时直接使用fallback_data派发；
+  - replay launch直接使用replay_data，不读取或复查fast cache；
+  - 普通cache miss不向FE发射，取消fe_launch_return_slot预约并形成D3 fallback候选；
   - 拉高对应FE的fe_in_valid一个周期。
 
-FE接收沿：
+正常或replay请求在FE接收沿：
 
-  - 清除dispatch entry valid/reserved；
-  - 清除目标FE fe_reserved；
-  - 设置目标FE fe_busy；
-  - 写入fe_rob_id和fe_seq_tag；
-  - 清除selected pipeline state。
+  - dispatch entry转为FREE；
+  - 保留D2已经写入的return calendar预约；
+  - replay请求同时清除replay_valid；
+  - 当前launch被同周期D2结果替换，若无新分配则清除launch_valid。
 
 D3正常路径包含16:1 packet mux、8:1 fast-cache dependency mux和FE数据路由，是
 首版重点关注的宽数据路径。跨模块权威读取只有单路fallback。
 
-若有依赖的selected entry在D3看到cache miss且尚未获得有效fallback response，本周期
-不拉高对应fe_in_valid，并保持entry SELECTED、fe_reserved和fe_selected_rob_id。
-该entry持续参与fallback仲裁，直到取得权威数据。不同FE的cache hit请求不受其阻塞。
+若普通launch在D3看到cache miss，本周期不拉高对应fe_in_valid，
+取消保存的返回槽预约，并将entry转为FALLBACK。若该miss同周期获得fallback grant且
+fallback_ready，则直接捕获到replay寄存器并转为REPLAY。其他FE的cache hit和D2下一批
+launch分配不受其阻塞。为降低控制复杂度，D2不要求同周期复用刚被miss取消的返回槽。
 
 ================================================================================
 10. Reorder A0：ROB Allocation
@@ -691,17 +700,23 @@ ROB entry命中并读取结果；同一上升沿完成result bank写入和ROB en
   rob[wb_rob_id].result_valid <- 1
 
 同周期最多4个writeback ROB ID必须互不相同。验证侧必须用SystemVerilog assertion
-检查FE busy、ROB valid、完整tag、未重复完成和同周期ID互异。任何检查失败都是
+检查FE返回与当前日历槽valid一致、ROB valid、完整tag、未重复完成和同周期ID互异。
+任何检查失败都是
 验证错误，不设置可综合sticky异常状态，不参与bkps、派发或退休控制。
 
 W0必须捕获全部符合协议的有效FE返回，不允许通过ready反压FE。首版物理实现必须支持
 4路任意地址并发写回，不能使用单写端口存储后串行处理。
 
-FE返回沿同时：
+在cycle n上升沿，wb关联信息读取：
 
-  dispatch.fe_busy[fe_id] <- 0
+  slot = schedule_phase
+  wb_valid   = fe_out_valid && return_valid[fe_id][slot]
+  wb_rob_id  = return_rob_id[fe_id][slot]
+  wb_seq_tag = return_seq_tag[fe_id][slot]
 
-该FE最早下一周期重新参与调度。
+该沿无条件清除return_valid[fe_id][slot]，并将schedule_phase加1。合法协议下
+fe_out_valid必须与对应return_valid相等。FE返回、D3发射和D2预约允许同沿发生；D2
+目标槽至少在两周期以后，因此不会与本周期清除槽冲突。
 
 ================================================================================
 13. Reorder R0：保序退休与输出
@@ -753,11 +768,13 @@ W0在本周期刚写回的entry不参与同周期R0退休，最早下一周期�
 
   input_count = popcount(in_valid[3:0])
   free_count  = ROB_DEPTH - occupancy
+  available_count = free_count + retire_count
 
-  bkps = !internal_rst_n || (free_count < input_count)
+  bkps = !internal_rst_n || (available_count < input_count)
 
-free_count使用本周期上升沿之前的状态，不加入本周期预计退休空间。因此满ROB时即使
-本周期将退休，仍允许产生一个保守停顿周期。
+free_count使用本周期上升沿之前的状态。retire_count使用第13.1节由沿前ROB状态形成的
+连续DONE前缀，因此available_count包含本周期上升沿将释放的空间。该控制路径允许满
+ROB时在有足够退休数量的周期继续接收，但不允许使用W0同周期刚写回形成的退休空间。
 复位期间bkps强制为1，不受occupancy和input_count影响。
 
 ROB_DEPTH=16且dispatch table以ROB ID索引。ROB entry能够退休意味着对应dispatch
@@ -772,7 +789,9 @@ writeback同周期写同bank时，FE writeback优先；被覆盖的回填只能�
 
 必须满足：
 
-  - 新allocation entry与退休entry不重叠；
+  - 新allocation entry允许与本周期退休entry重叠，且仅能复用退休前缀释放的entry；
+  - 重叠entry的退休输出和result bank写入读取沿前旧内容，allocation对沿后ROB
+    valid、seq_tag、seq_residue和result_valid具有最终优先权；
   - 新writeback entry不在同周期退休；
   - 已DONE退休entry不再次收到writeback；
   - 同周期4路writeback ID互不相同；
@@ -783,8 +802,9 @@ writeback同周期写同bank时，FE writeback优先；被覆盖的回填只能�
 
   occupancy_next = occupancy + alloc_count - retire_count
 
-valid/result_valid数组在同一个时序always block中按allocation、writeback、retire
-事件更新，并明确互斥关系。禁止多个always block驱动同一状态。
+valid/result_valid数组在同一个时序always block中按writeback、retire、allocation
+顺序更新，使同址allocation最后赋值。退休数据选择仍由沿前数组组合产生，不受同沿
+allocation非阻塞赋值影响。禁止多个always block驱动同一状态。
 
 ================================================================================
 16. 复位
@@ -796,15 +816,15 @@ internal_rst_n。
 
 复位清除：
 
-  - dispatch valid/state/dep_ready/reserved；
+  - dispatch unified state；
   - packet_rr_ptr和fe_rr_ptr；
   - fallback class/entry/FE RR pointers；
-  - d1_init_valid；
   - dispatch fast-cache valid；
-  - per-FE busy/reserved/tag；
+  - per-FE launch valid和return calendar valid；
+  - schedule_phase和fallback replay valid；
   - ROB valid/result_valid/head/tail/occupancy；
   - reorder result-bank valid；
-  - next_seq_tag、next_seq_residue和history_count；
+  - next_seq_tag；
   - start_lane和out_valid。
 
 无效状态下不要求清零宽数据数组。复位期间bkps=1，所有fe_in_valid和out_valid=0。
@@ -815,7 +835,7 @@ internal_rst_n。
 
 以下项目不改变首版功能和流水边界，实现后根据编译、仿真和后续时序数据观察：
 
-  1) D2分组prefix/popcount multi-grant的组合深度；
+  1) D2联合扫描、delay相关FE匹配和动态日历索引的组合深度；
   2) D3 packet/fast-cache dependency/FE routing的组合深度；
   3) 单路fallback仲裁、权威读取mux和冲突发生率；
   4) 4路任意地址ROB writeback的decode和宽数据扇出；
@@ -829,9 +849,11 @@ HLD和LLD，不属于首版RTL编码时的自由选择。
 ================================================================================
 
   1) 同一dispatch entry不得被重复选择或重复派发。
-  2) selected entry和fe_reserved必须成对建立和释放。
-  3) FE busy期间保存的rob_id/seq_tag不得被覆盖。
-  4) 依赖未ready时不得进入D3有效派发；SELECTED cache miss只有fallback_ready时派发。
+  2) selected entry、FE launch和return calendar预约必须成对建立；D3 miss必须同时释放
+     selected状态和对应预约。
+  3) 有效return calendar槽的rob_id/seq_tag在返回或取消前不得被覆盖。
+  4) 依赖未ready时不得进入D3有效派发；普通SELECTED cache miss不得进入FE，replay
+     请求只能使用已捕获的权威数据派发。
   5) 依赖查询必须完整匹配seq_tag。
   6) FE返回设置ROB result和dispatch fast cache，不直接写retired result bank。
   7) Fast-cache miss不得被解释为结果永久缺失，必须公平获得fallback服务。
@@ -839,3 +861,6 @@ HLD和LLD，不属于首版RTL编码时的自由选择。
   9) 输出寄存器装载、ROB释放和result-bank更新属于同一退休事件。
   10) ROB occupancy必须等于有效ROB entry数量。
   11) 无效宽数据内容不影响任何功能判断。
+  12) 同一FE的有效return calendar槽唯一对应一个目标返回周期，D2不得覆盖有效槽。
+  13) 连续分配期间rob_id必须等于seq_tag[3:0]，所有target ROB/bank索引只能由完整
+      target_seq_tag低位导出，不允许引入独立推进的副本。

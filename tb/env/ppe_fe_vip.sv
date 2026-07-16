@@ -13,13 +13,10 @@ class ppe_fe_vip extends uvm_object;
     endfunction
 
     static function bit [127:0] predict(
-        bit [127:0] packet,
-        bit         dep_valid,
-        bit [127:0] dep_data,
-        bit [1:0]   delay
+        bit [127:0] data_in,
+        bit [1:0]   lat
     );
-        predict = packet ^ (dep_valid ? dep_data : 128'b0) ^
-                  {{126{1'b0}}, delay};
+        predict = data_in ^ {{126{1'b0}}, lat};
     endfunction
 endclass
 

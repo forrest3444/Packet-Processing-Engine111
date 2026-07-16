@@ -47,8 +47,28 @@ module tb_top;
         .out_packet3 (pif.out_packet3)
     );
 
-    assign pif.dbg_wb_valid          = dut.u_dispatch.wb_valid;
-    assign pif.dbg_wb_seq_tag        = dut.u_dispatch.wb_seq_tag;
+    fe_mock #(
+        .PACKET_W (PACKET_W)
+    ) u_fe_probe (
+        .clk           (clk),
+        .rst_n         (rst_n),
+        .fe_in_valid   (pif.fe_probe_in_valid),
+        .fe_in_data    (pif.fe_probe_in_data),
+        .fe_dep_valid  (pif.fe_probe_dep_valid),
+        .fe_dep_data   (pif.fe_probe_dep_data),
+        .fe_desc_delay (pif.fe_probe_delay),
+        .fe_out_valid  (pif.fe_probe_out_valid),
+        .fe_out_data   (pif.fe_probe_out_data)
+    );
+
+    assign pif.dbg_wb_valid          = {dut.u_dispatch.wb_valid3,
+                                        dut.u_dispatch.wb_valid2,
+                                        dut.u_dispatch.wb_valid1,
+                                        dut.u_dispatch.wb_valid0};
+    assign pif.dbg_wb_seq_tag        = {dut.u_dispatch.wb_seq_tag3,
+                                        dut.u_dispatch.wb_seq_tag2,
+                                        dut.u_dispatch.wb_seq_tag1,
+                                        dut.u_dispatch.wb_seq_tag0};
     assign pif.dbg_fallback_valid    = dut.u_dispatch.fallback_valid;
     assign pif.dbg_fallback_ready    = dut.u_dispatch.fallback_ready;
     assign pif.dbg_fallback_from_d3  = dut.u_dispatch.fallback_from_d3;
@@ -64,12 +84,58 @@ module tb_top;
     assign pif.dbg_result0_seq_tag   = dut.u_reorder.result_seq_tag[0];
     assign pif.dbg_head_ptr          = dut.u_reorder.head_ptr;
     assign pif.dbg_fallback_lookup_hit = dut.u_reorder.fallback_lookup[PACKET_W];
-    assign pif.dbg_fe_in_valid       = dut.fe_in_valid;
-    assign pif.dbg_fe_busy           = {dut.u_dispatch.fe_busy3,
-                                        dut.u_dispatch.fe_busy2,
-                                        dut.u_dispatch.fe_busy1,
-                                        dut.u_dispatch.fe_busy0};
+    assign pif.dbg_fe_in_valid       = {dut.fe_in_valid3, dut.fe_in_valid2,
+                                        dut.fe_in_valid1, dut.fe_in_valid0};
     assign pif.dbg_rob_occupancy     = dut.u_reorder.occupancy;
+
+    always @(posedge clk) begin
+        if (dut.internal_rst_n) begin
+            if (dut.fe_out_valid0 !==
+                dut.u_dispatch.return_valid[{2'd0, dut.u_dispatch.schedule_phase}]) begin
+                `uvm_error("FE_CALENDAR", "FE0 return valid does not match calendar")
+            end
+            if (dut.fe_out_valid1 !==
+                dut.u_dispatch.return_valid[{2'd1, dut.u_dispatch.schedule_phase}]) begin
+                `uvm_error("FE_CALENDAR", "FE1 return valid does not match calendar")
+            end
+            if (dut.fe_out_valid2 !==
+                dut.u_dispatch.return_valid[{2'd2, dut.u_dispatch.schedule_phase}]) begin
+                `uvm_error("FE_CALENDAR", "FE2 return valid does not match calendar")
+            end
+            if (dut.fe_out_valid3 !==
+                dut.u_dispatch.return_valid[{2'd3, dut.u_dispatch.schedule_phase}]) begin
+                `uvm_error("FE_CALENDAR", $sformatf(
+                    "FE3 mismatch phase=%0d out=%0b cal=%0b launch=%0b rob=%0d slot=%0d replay=%0b fe_in=%0b delay=%0d",
+                    dut.u_dispatch.schedule_phase, dut.fe_out_valid3,
+                    dut.u_dispatch.return_valid[{2'd3, dut.u_dispatch.schedule_phase}],
+                    dut.u_dispatch.fe_launch_valid3,
+                    dut.u_dispatch.fe_launch_rob_id3,
+                    dut.u_dispatch.fe_launch_return_slot3,
+                    dut.u_dispatch.fe_launch_replay3, dut.fe_in_valid3,
+                    dut.fe_desc_delay3))
+            end
+            if (dut.u_dispatch.d2_select_valid0 &&
+                dut.u_dispatch.return_valid[{2'd0,
+                    dut.u_dispatch.d2_select_return_slot0}]) begin
+                `uvm_error("FE_COLLISION", "D2 overwrote an occupied FE0 return slot")
+            end
+            if (dut.u_dispatch.d2_select_valid1 &&
+                dut.u_dispatch.return_valid[{2'd1,
+                    dut.u_dispatch.d2_select_return_slot1}]) begin
+                `uvm_error("FE_COLLISION", "D2 overwrote an occupied FE1 return slot")
+            end
+            if (dut.u_dispatch.d2_select_valid2 &&
+                dut.u_dispatch.return_valid[{2'd2,
+                    dut.u_dispatch.d2_select_return_slot2}]) begin
+                `uvm_error("FE_COLLISION", "D2 overwrote an occupied FE2 return slot")
+            end
+            if (dut.u_dispatch.d2_select_valid3 &&
+                dut.u_dispatch.return_valid[{2'd3,
+                    dut.u_dispatch.d2_select_return_slot3}]) begin
+                `uvm_error("FE_COLLISION", "D2 overwrote an occupied FE3 return slot")
+            end
+        end
+    end
 
     initial begin
         clk = 1'b0;

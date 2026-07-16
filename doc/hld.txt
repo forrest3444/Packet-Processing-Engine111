@@ -66,7 +66,7 @@ PPE 采用三个主要 RTL 设计文件：
   |  |  Waiting Table            |                             |          |
   |  |  8-bank Dependency Cache  |---- fallback query -------->|          |
   |  |  Packet/FE Arbitration    |<--- fallback response ------|          |
-  |  |  FE Busy/Tag Tracking     |                             v          |
+  |  |  FE Return Calendar/Tags  |                             v          |
   |  +-------------+-------------+                  +------------------+ |
   |                |                                |   ppe_reorder    | |
   |           FE requests                           |                  | |
@@ -106,7 +106,8 @@ PPE 采用三个主要 RTL 设计文件：
 ppe_top 保持轻量，负责：
 
   - 例化 ppe_dispatch、ppe_reorder 和 4 个 FE；
-  - 连接 FE 请求、返回和 ROB 关联信息；
+  - 使用逐lane、逐FE的独立命名端口连接输入、FE请求/返回和ROB关联信息，不在
+    模块边界引入仅用于连线的宽位聚合总线；
   - 实现唯一的两级复位同步器，将异步拉低、同步释放的内部复位同时分发给
     ppe_dispatch、ppe_reorder 和全部 FE；
   - 将 reorder 的寄存器输出连接到顶层端口。
@@ -120,12 +121,12 @@ ppe_dispatch 管理尚未进入 FE 的报文，负责：
   - 顶层输入寄存器打拍；
   - 分配 seq tag 和 modulo-8 residue；
   - 绑定 reorder 分配的 ROB ID；
-  - 非法依赖降级；
   - 等待依赖和等待 FE 的报文管理；
   - 8-bank 非权威依赖 fast cache；
-  - 依赖状态初始化、FE 写回事件唤醒和 fallback miss 管理；
-  - 公平的报文选择与 FE 选择；
-  - per-FE busy/tag 状态管理。
+  - 接收沿依赖状态初始化、FE 写回事件唤醒和 fallback miss 管理；
+  - 公平的联合报文/FE/返回槽选择；
+  - per-FE 8槽返回周期预约及返回tag关联；
+  - 单路fallback replay数据保存和重新派发。
 
 Dispatch 只拥有报文进入 FE 之前的调度状态。报文成功进入 FE 后，长期顺序和输出
 状态继续由 reorder ROB 保存。
@@ -154,24 +155,39 @@ reorder 在同一接收事件中建立对应 ROB entry。一次输入周期必�
 
 4.2 依赖处理
 
-无依赖和已经降级的报文可以直接进入 READY 状态。有合法依赖的报文先查询 dispatch
-本地 8-bank fast cache。完整 tag 命中时进入 READY；miss 时进入持久 fallback 状态，
+无依赖报文可以直接进入READY状态。有依赖的报文先查询dispatch本地8-bank fast
+cache。完整tag命中时进入READY；miss时进入持久fallback状态，
 由单路公平仲裁查询 reorder 权威结果。目标仍在 ROB 时 fallback 从 ROB 获取结果；
 目标已经退休时从 8-bank result buffer 获取结果。
 
+输入协议保证dep_offset不超出本次复位后已经建立的历史范围。Dispatch直接使用原始
+dep_offset预计算依赖目标，不保存历史计数器，也不检测或降级非法依赖。
+
 Dispatch 维护小位宽 dependency-ready 状态，FE 写回事件用于唤醒等待报文并更新
 fast cache。128 bit 依赖数据不在所有等待 entry 中复制。D3 对已选报文再次检查 fast
-cache；若发生覆盖 miss，则保持现有 FE reservation，并通过同一单路 fallback 直接
-取得该次 FE 请求的数据。
+cache；若发生覆盖 miss，则取消已经建立的返回周期预约并将报文转入单路fallback。
+权威查询命中数据保存在一份全局replay寄存器中，replay报文重新参与FE选择但D3不再
+复查fast cache。该寄存器释放前暂停新的权威查询，避免数据覆盖和重复cache miss。
 
 4.3 FE 调度
 
 调度分为报文选择和 FE 选择两部分。报文侧使用公平轮询策略，FE侧从可用 FE 中进行
 轮询分配。调度应保持无饥饿，并在 READY 报文和 FE 资源允许时尽量维持多发射。
 
+FE本身是固定1~4周期延迟的无阻塞流水线，每周期最多接收一个请求，并允许输入和
+输出同周期发生。Dispatch维护per-FE 8槽环形返回日历。D2按请求delay计算D3发射后
+的目标返回周期，只能选择对应日历槽未占用的FE，并在选择沿写入rob_id和seq_tag。
+每个FE设置一份D2到D3 launch寄存器；D3消费当前launch的同一周期，D2允许写入该FE
+的下一请求，因此无冲突流量下每个FE可以逐周期接收请求。
+
+返回日历使用共享modulo-8周期索引，不移动宽tag字段。8槽覆盖D2提前一周期预约和
+FE最长4周期返回的完整窗口。D3 cache miss取消对应预约；普通cache hit和replay请求
+在D3实际进入FE后保留预约，直到目标周期用于返回关联并被清除。
+
 4.4 FE 写回
 
-每个 FE 通过 dispatch 保存的 ROB tag 将结果写回对应 ROB entry。FE 可以乱序完成，
+每个 FE 通过 dispatch 返回日历当前周期槽保存的 ROB tag 将结果写回对应 ROB entry。
+FE 可以乱序完成，
 并同时更新 dispatch 非权威 fast cache，但结果不得直接进入 reorder 已退休结果缓存，
 也不得绕过 ROB 直接输出。
 
@@ -189,10 +205,16 @@ reorder 从 ROB head 开始退休最多 4 个连续 DONE 报文。退休事件�
 
 4.6 全局反压
 
-ppe_reorder 根据 ROB 空闲容量生成 bkps。第一版采用保守容量计算，不使用同周期即将
-退休的空间，以避免建立 retire-to-bkps 的长组合路径。
+ppe_reorder 根据 ROB 沿前空闲容量与本周期连续 DONE 退休数量生成 bkps，允许新输入
+在同一上升沿复用退休释放的空间。这样可消除满 ROB 边界的保守停顿，并保持满载基线
+连续接收。代价是 done-prefix 检查进入 bkps 控制路径；该路径只包含有效位、结果有效
+位、计数和比较，不引入 packet 宽数据路径。
 ppe_top将原始in_valid直接连接到reorder的容量查询输入；reorder不使用已经bkps
 门控的allocation valid反推当前输入需求。
+
+同址 retirement 与 allocation 可以在同一上升沿发生。retirement 使用沿前 ROB
+内容产生输出并更新已退休 result buffer，allocation 对沿后 ROB entry 状态具有优先权，
+从而使该 entry 立即代表新报文且 result 尚未有效。
 
 ================================================================================
 5. 初步流水线划分
@@ -200,19 +222,22 @@ ppe_top将原始in_valid直接连接到reorder的容量查询输入；reorder不
 
 5.1 Dispatch 主流水
 
-Dispatch 初步划分为四个逻辑阶段：
+Dispatch 输入到FE发射划分为三个寄存边界阶段，并包含一条并行依赖事件通路：
 
   D0：Input Admission / Allocation
       输入捕获、顺序分配、依赖目标预计算和 ROB allocation。
 
-  D1：Dependency Initialize / Wakeup / Fallback
-      查询本地 fast cache，用 FE 写回事件唤醒等待报文，并串行处理初始化 miss。
-
   D2：Packet Select / FE Select
-      仅使用小位宽状态完成最多 4 个报文选择和 FE 选择，并锁存选择结果。
+      从packet RR起点联合完成最多4个报文、目标返回周期和FE选择，写入返回日历
+      预约并锁存launch信息。槽冲突候选不消耗grant；replay报文具有最高优先级。
 
   D3：Operand Read / FE Issue
-      读取选中报文和本地依赖数据；本地覆盖 miss 使用单路 fallback，完成 FE 路由。
+      读取launch报文和本地依赖数据并完成FE路由；本地覆盖miss取消预约并进入
+      单路fallback，replay请求直接使用已保存的权威依赖数据。
+
+  Dependency Event Path：
+      D0以fast cache和同周期writeback旁路直接初始化entry状态；后续writeback唤醒
+      WAIT_DEP/FALLBACK entry，单路fallback处理权威查询。该通路不增加输入流水级。
 
 D2 和 D3 必须保持逻辑分离，避免形成“全表依赖检查、16选4、宽数据读取、FE路由”
 的单周期长路径。
@@ -231,14 +256,14 @@ A0、L0、W0 和 R0 可以在同周期处理不同 ROB entry。它们共享的 R
 
 5.3 高层流水关系
 
-  Input D0 -> D1 -> D2 -> D3 -> FE(variable latency)
-                                      |
-                                      v
-                              Reorder W0 -> R0 -> Output Registers
+  Input D0 -> D2 -> D3 -> FE(fixed delay + 1 cycles)
+                              |
+                              v
+                      Reorder W0 -> R0 -> Output Registers
 
   Reorder A0 与 Input D0 并行工作。
-  Reorder L0 每周期服务一路由 dispatch 仲裁后的 D1 或 D3 fallback 查询。D3 miss
-  优先于尚未占用 FE 的 D1 miss，且 D1 miss 必须保持公平、不得永久饥饿。
+  Reorder L0 每周期服务一路由dispatch仲裁后的fallback查询。replay寄存器占用时暂停
+  新查询；寄存器释放后按entry轮询继续服务，持续请求不得永久饥饿。
 
 ================================================================================
 6. 高风险路径与可优化点
@@ -246,26 +271,27 @@ A0、L0、W0 和 R0 可以在同周期处理不同 ROB entry。它们共享的 R
 
 6.1 FE 服务能力
 
-4 个 single-inflight FE 可能成为系统稳态吞吐上限。ROB只能吸收短期拥塞，不能提高
-FE阵列的长期处理能力。正式性能探索时应优先观察 FE 延迟和利用率。
+4个FE均支持无阻塞流水，每个FE理论上可逐周期接收请求，但同一FE的目标输出周期
+不得冲突。8槽返回日历和可同周期消费/重填的launch寄存器释放FE流水吞吐；实现后
+重点检查混合delay造成的槽碎片、D2匹配效率以及长流下是否接近4路持续issue。
 
 6.2 D2 多发射仲裁
 
-16选4轮询仲裁是高风险控制路径。首版按LLD使用旋转mask和并行rank的
-multi-grant结构，避免四级完全串行priority encoder。实现后重点观察分组
-prefix/popcount逻辑的组合深度。
+16项联合报文/FE/return-slot轮询是高风险控制路径。首版按LLD使用固定上界扫描，
+跳过槽冲突候选并在成功匹配后屏蔽已用FE。实现后重点观察串行found/used依赖、
+动态日历索引和4路匹配的组合深度；不得仅为缩短代码牺牲可发候选吞吐。
 
 6.3 D3 宽数据路径
 
 D3正常路径包含dispatch packet选择、8-bank fast-cache依赖读取以及4路FE数据路由，
-不再包含四路跨模块 ROB/result-bank 读取。Fast-cache覆盖 miss 保持已有 FE reservation
-并进入单路慢路径，不得阻塞其他本地命中的 FE issue。
+不再包含四路跨模块 ROB/result-bank 读取。Fast-cache覆盖miss取消返回预约并进入单路
+replay慢路径，不得阻塞其他本地命中的FE issue。
 
 6.4 L0 Fallback 依赖读取
 
-L0 只保留一路权威 fallback lookup。正常 cache hit 不切换该宽数据路径。D3 miss
-优先服务以缩短已占用 FE reservation 的时间；D1 miss 通过轮询保证最终得到查询。
-Fallback 串行化只能降低冲突场景吞吐，不得影响无冲突四路 issue。
+L0只保留一路权威fallback lookup。正常cache hit不切换该宽数据路径。查询命中数据
+进入一份128 bit replay寄存器并优先重新派发；寄存器占用期间停止新lookup。
+Fallback串行化只能降低冲突场景吞吐，不得影响无冲突四路issue。
 
 6.5 W0 多路写回
 
@@ -282,7 +308,7 @@ R0需要完成连续DONE检查、最多4路数据选择、输出旋转和result-
 首版结构按第7节固定。实现完成后可根据时序与性能数据观察：
 
   1) D2并行multi-grant仲裁的组合深度；
-  2) D3宽数据路由是否需要新的流水或pending storage；
+  2) D3宽数据路由和单份fallback replay寄存器的等待时间；
   3) dispatch fast-cache读取和单路 L0 fallback 的mux代价；
   4) W0四路任意地址写回的decode和数据扇出；
   5) R0单级退休和输出旋转的组合深度；
@@ -296,10 +322,11 @@ R0需要完成连续DONE检查、最多4路数据选择、输出旋转和result-
 
   1) FE_NUM=4、ISSUE_WIDTH=4；
   2) D2和D3之间保持一个流水边界，不再额外拆分；
-  3) 不实现request register或per-FE pending request；
+  3) dispatch为每个FE实现一份可同周期消费/重填的launch寄存器，以及8槽返回日历；
   4) dispatch使用8-bank非权威fast cache，reorder只保留单路fallback lookup；
-  5) R0使用单级退休并直接更新顶层输出寄存器；
-  6) 不定义可综合的异常上报、恢复或全局锁死状态，内部一致性由验证侧检查。
+  5) dispatch只保存一份128 bit fallback replay数据，不在所有entry中复制宽依赖；
+  6) R0使用单级退休并直接更新顶层输出寄存器；
+  7) 不定义可综合的异常上报、恢复或全局锁死状态，内部一致性由验证侧检查。
 
 上述项目只有在后续时序或性能数据证明有必要时才重新评估。变更任一项都必须先同步
 HLD和LLD，不得在RTL中自行启用。
