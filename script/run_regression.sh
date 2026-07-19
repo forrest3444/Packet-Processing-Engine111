@@ -106,7 +106,7 @@ run_uvm() {
 
     record_result "${label}" "${run_log}" "${status}"
     if [[ "${category}" == "performance" && -f "${run_log}" ]]; then
-        grep -E '^UVM_INFO .*\[(P0_PERF|PERF_METRIC)\]' "${run_log}" \
+        grep -E '^UVM_INFO .*\[(P0_PERF|PERF_METRIC|LOAD_PERF)\]' "${run_log}" \
             >> "${METRICS_LOG}" || true
     fi
 }
@@ -131,6 +131,7 @@ run_performance() {
         for case_name in "${PERFORMANCE_CASES[@]}"; do
             run_uvm performance ppe_perf_test "${seed}" "${case_name}"
         done
+        run_uvm performance ppe_load_mix_perf_test "${seed}"
     done
 }
 

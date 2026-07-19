@@ -17,11 +17,15 @@ PPE High-Level Design
 1. 设计目标与基线配置
 ================================================================================
 
-PPE 采用三个主要 RTL 设计文件：
+PPE按状态所有权划分为以下主要逻辑模块：
 
-  1) ppe_top：顶层集成及 FE 阵列例化；
-  2) ppe_dispatch：输入捕获、报文序分配、依赖处理和 FE 调度；
-  3) ppe_reorder：ROB、FE 写回、保序退休、结果生命周期和全局反压。
+  1) ppe_top：顶层集成及FE阵列例化；
+  2) ppe_ingress：输入接收、报文序分配、依赖目标预计算和allocation bundle生成；
+  3) scheduler：issue table、依赖等待、候选选择、FE匹配、operand gather和返回日历；
+  4) backend：ROB、FE写回、依赖结果解析、保序退休、history和全局反压。
+
+SystemVerilog实现可将scheduler和backend中的状态所有者、纯组合选择器进一步拆为独立
+文件，但不得因此形成多模块共同写同一状态数组。具体文件和接口在LLD中定义。
 
 第一版基线配置：
 
@@ -32,10 +36,10 @@ PPE 采用三个主要 RTL 设计文件：
   ROB_DEPTH    = 16
   ROB_ID_W     = 4
   SEQ_W        = 5
-  RTL_LANGUAGE = Verilog-2001
+  RTL_LANGUAGE = SystemVerilog
 
-所有可综合 RTL 使用 .v 文件和 Verilog-2001 语法。UVM testbench 和其他纯验证文件
-可以使用 SystemVerilog。
+新架构可综合RTL位于rtl-sv目录，使用.sv文件和可综合SystemVerilog语法。现有rtl目录
+中的Verilog-2001实现保留为旧基线参考，不作为新架构内部接口和模块所有权的来源。
 
 1.1 设计优化优先级
 
@@ -53,49 +57,40 @@ PPE 采用三个主要 RTL 设计文件：
 ================================================================================
 
                                ppe_top
-  +-----------------------------------------------------------------------+
-  |                                                                       |
-  |  Top Inputs                                                           |
-  |        |                                                              |
-  |        v                                                              |
-  |  +---------------------------+                                        |
-  |  |       ppe_dispatch        |                                        |
-  |  |                           |                                        |
-  |  |  Input Capture            |---- allocation metadata ----+          |
-  |  |  Sequence Allocation      |<--- allocated ROB IDs -------|          |
-  |  |  Waiting Table            |                             |          |
-  |  |  8-bank Dependency Cache  |---- fallback query -------->|          |
-  |  |  Packet/FE Arbitration    |<--- fallback response ------|          |
-  |  |  FE Return Calendar/Tags  |                             v          |
-  |  +-------------+-------------+                  +------------------+ |
-  |                |                                |   ppe_reorder    | |
-  |           FE requests                           |                  | |
-  |                |                                | ROB Allocation   | |
-  |       +--------v--+  +-----------+               | FE Writeback     | |
-  |       |   FE 0    |  |   FE 1    |               | Result Lookup    | |
-  |       +--------+--+  +-----+-----+               | In-order Retire  | |
-  |                |           |                     | 8-bank Results   | |
-  |       +--------v--+  +-----v-----+               | Output Registers | |
-  |       |   FE 2    |  |   FE 3    |               | Backpressure     | |
-  |       +--------+--+  +-----+-----+               +---------+--------+ |
-  |                |           |                               |          |
-  |                +-----+-----+                               +--> bkps  |
-  |                      |                                     +--> output|
-  |               FE result + ROB ID                                      |
-  |                      +---------------------------> ppe_reorder          |
-  |                                                                       |
-  +-----------------------------------------------------------------------+
+  +------------------------------------------------------------------------+
+  |                                                                        |
+  |  Top Inputs                                                            |
+  |       |                                                                |
+  |       v                                                                |
+  |  +-------------+      +---------------------------+                    |
+  |  | ppe_ingress |----->|         scheduler         |                    |
+  |  | rank / seq  |      | issue / wakeup / matching |                    |
+  |  +------+------+      | gather / return calendar  |                    |
+  |         |             +-------------+-------------+                    |
+  |         | allocation metadata       | FE requests                      |
+  |         |                           v                                  |
+  |         |                FE0 / FE1 / FE2 / FE3                         |
+  |         |                           | completion + tag                  |
+  |         v                           v                                  |
+  |  +------------------------------------------------------------------+  |
+  |  |                           backend                                |  |
+  |  |  ROB: allocation / writeback / dependency resolve / retire      |  |
+  |  |       active results / bypasses / 8-bank retired history        |  |
+  |  |  retire_output: lane mapping / registers / start-lane rotation  |  |
+  |  +---------------------------+--------------------------------------+  |
+  |                              +--> bkps / output                        |
+  +------------------------------------------------------------------------+
 
 主数据流：
 
-  Top Input -> Dispatch -> FE Array -> Reorder ROB -> Registered Output
+  Top Input -> Ingress -> Scheduler -> FE Array -> Backend ROB -> Registered Output
 
 主要控制回馈：
 
-  Reorder -> Dispatch：ROB 分配信息、单路 fallback 查询结果
-  Reorder -> Top/Input：全局 bkps
-  Top -> Reorder：未经bkps门控的原始in_valid，仅用于容量查询
-  Dispatch -> Reorder：分配元数据、FE writeback 关联信息
+  Backend -> Scheduler：ROB分配ID、依赖满足状态、依赖结果数据和retirement事件
+  Backend -> Top/Input：全局bkps
+  Top -> Backend：未经bkps门控的原始in_valid，仅用于容量查询
+  Scheduler -> Backend：分配metadata、依赖目标请求和FE writeback关联信息
 
 ================================================================================
 3. 模块职责与状态所有权
@@ -105,43 +100,83 @@ PPE 采用三个主要 RTL 设计文件：
 
 ppe_top 保持轻量，负责：
 
-  - 例化 ppe_dispatch、ppe_reorder 和 4 个 FE；
-  - 使用逐lane、逐FE的独立命名端口连接输入、FE请求/返回和ROB关联信息，不在
-    模块边界引入仅用于连线的宽位聚合总线；
+  - 例化ingress、scheduler、ppe_rob、ppe_retire_output和4个FE；
+  - 在顶层外部使用独立lane端口，在SystemVerilog内部使用有明确字段含义的packed
+    array、struct或interface连接重复lane/FE通路；
   - 实现唯一的两级复位同步器，将异步拉低、同步释放的内部复位同时分发给
-    ppe_dispatch、ppe_reorder 和全部 FE；
-  - 将 reorder 的寄存器输出连接到顶层端口。
+    全部PPE子模块和FE；
+  - 将ppe_retire_output的寄存器输出连接到顶层端口。
 
 ppe_top 不保存报文级状态，不参与报文序、依赖或保序决策。
 
-3.2 ppe_dispatch
+3.2 ppe_ingress
 
-ppe_dispatch 管理尚未进入 FE 的报文，负责：
+ppe_ingress负责：
 
-  - 顶层输入寄存器打拍；
-  - 分配 seq tag 和 modulo-8 residue；
-  - 绑定 reorder 分配的 ROB ID；
+  - 顶层输入批次准入和输入寄存器边界；
+  - 有效lane rank计算和密集seq tag分配；
+  - 从完整seq tag预计算target seq tag；
+  - 将输入descriptor解码为delay和dep_required语义字段；
+  - 向issue table和ROB形成同一allocation事件的valid和seq metadata。
+
+ppe_ingress只拥有next_seq_tag。它不拥有ROB容量、等待状态、依赖结果或FE调度状态。
+完整seq tag是allocation的唯一跨模块身份；issue table和backend分别从其低位派生本地
+物理索引。History bank索引直接从完整seq tag低3位派生，ingress不产生、不输出独立
+ROB ID或residue字段。
+
+3.3 scheduler
+
+scheduler管理尚未进入FE的报文，负责：
+
   - 等待依赖和等待 FE 的报文管理；
-  - 8-bank 非权威依赖 fast cache；
-  - 接收沿依赖状态初始化、FE 写回事件唤醒和 fallback miss 管理；
-  - 公平的联合报文/FE/返回槽选择；
+  - 接收沿依赖状态初始化和FE completion tag唤醒；
+  - 4个delay分类READY ID队列和公平的多路FE/返回槽选择；
   - per-FE 8槽返回周期预约及返回tag关联；
-  - 单路fallback replay数据保存和重新派发。
+  - payload读取和最多4路权威依赖结果gather；
+  - 将FE completion关联为带完整seq tag的writeback事件。
 
-Dispatch 只拥有报文进入 FE 之前的调度状态。报文成功进入 FE 后，长期顺序和输出
-状态继续由 reorder ROB 保存。
+Scheduler只拥有报文进入FE之前的调度状态。报文成功进入FE后，长期顺序和输出
+状态继续由backend ROB保存。
 
-3.3 ppe_reorder
+其中ppe_issue_table同时拥有16项issue entry、4个delay-class ID FIFO、独立queued
+标志和READY发现轮询指针。它向ppe_fe_scheduler提供每类最多4项的寄存器化队首窗口；
+packet宽数据不进入候选接口，仅在D3按已选seq tag低位从ppe_issue_table读取。
 
-ppe_reorder 是全局顺序和容量状态的唯一所有者，负责：
+ppe_fe_scheduler拥有candidate-to-FE匹配、per-FE 8槽return calendar、schedule_phase以及
+class/FE公平轮询指针。它在同一选择沿同时输出Issue Table不可撤销select并建立返回槽
+预约；FE返回时以当前calendar槽保存的完整tag形成completion事件。FE的128 bit结果数据
+不经过该控制模块，直接连接backend ROB。
 
-  - ROB allocation、head/tail/occupancy 和 retirement；
+ppe_fe_scheduler按FE编号向ppe_issue_table返回一次不可撤销的完整seq tag。ppe_issue_table内部
+保存每个FE的selected seq tag，下一周期从其低位索引entry并形成D3 issue bundle，随后
+在FE接收沿释放旧entry。D0 status query、completion完整tag唤醒比较和D3 dependency
+gather均归ppe_issue_table管理；所有本地ROB ID从完整tag低位临时派生，这些组合通路
+首版不增加寄存级。
+
+3.4 ppe_rob
+
+ppe_rob是全局顺序、结果和容量状态的唯一所有者，负责：
+
+  - ROB allocation、head/occupancy和严格按序的逻辑retirement prefix；
   - FE completion 写回；
-  - 单路 ROB/result-bank 权威 fallback 查询；
-  - 严格按序退休；
-  - 顶层寄存器输出和输出 lane 轮转；
-  - 8-bank 已退休结果生命周期管理；
+  - completion bypass、retirement bypass、active ROB和retired history四级依赖解析；
+  - 8-bank已退休history生命周期管理；
   - ROB 容量相关的全局 bkps。
+
+ppe_rob不保存物理输出lane状态，也不直接驱动顶层输出寄存器。它向ppe_retire_output输出
+按报文序排列、从slot 0开始无空洞的逻辑retirement bundle。
+
+3.5 ppe_retire_output
+
+ppe_retire_output是backend功能域内独立的最终输出子模块，负责退休结果的外部呈现：
+
+  - 将逻辑retirement bundle按当前start_lane映射到物理输出lane；
+  - 保存并更新start_lane；
+  - 驱动同一级顶层out_valid/out_packet寄存器。
+
+ppe_retire_output不封装ppe_rob，也不转发allocation、依赖查询或writeback接口。
+ppe_top分别例化并连接两者。该拆分不增加ready或额外流水级；ROB状态释放、history
+写入、输出寄存器装载和start_lane更新仍发生在同一个退休上升沿。
 
 ================================================================================
 4. 高层数据流
@@ -149,109 +184,115 @@ ppe_reorder 是全局顺序和容量状态的唯一所有者，负责：
 
 4.1 输入接收
 
-当 bkps 允许接收时，dispatch 对当前所有有效 lane 进行寄存器捕获并分配全局顺序。
-reorder 在同一接收事件中建立对应 ROB entry。一次输入周期必须整体接收或整体停止，
-禁止部分 lane 接收。
+当bkps允许接收时，ingress对当前所有有效lane分配全局顺序并形成allocation metadata；
+Issue table和backend在同一接收沿捕获该metadata，并分别使用alloc_seq_tag低位索引
+本地entry。完整descriptor不离开ingress；scheduler只接收delay和dep_required。一次输入周期必须整体
+接收或整体停止，禁止部分lane接收。
 
 4.2 依赖处理
 
-无依赖报文可以直接进入READY状态。有依赖的报文先查询dispatch本地8-bank fast
-cache。完整tag命中时进入READY；miss时进入持久fallback状态，
-由单路公平仲裁查询 reorder 权威结果。目标仍在 ROB 时 fallback 从 ROB 获取结果；
-目标已经退休时从 8-bank result buffer 获取结果。
+无依赖报文可以直接进入READY状态。有依赖的报文以完整target seq tag查询backend
+提供的依赖满足状态；目标结果尚未完成时进入ISSUE_WAIT_DEP，已经完成时进入ISSUE_READY。
+初始化查询只读取小位宽valid/tag/result_valid状态，不复制128 bit依赖数据。
 
-输入协议保证dep_offset不超出本次复位后已经建立的历史范围。Dispatch直接使用原始
+输入协议保证dep_offset不超出本次复位后已经建立的历史范围。Ingress直接使用原始
 dep_offset预计算依赖目标，不保存历史计数器，也不检测或降级非法依赖。
 
-Dispatch 维护小位宽 dependency-ready 状态，FE 写回事件用于唤醒等待报文并更新
-fast cache。128 bit 依赖数据不在所有等待 entry 中复制。D3 对已选报文再次检查 fast
-cache；若发生覆盖 miss，则取消已经建立的返回周期预约并将报文转入单路fallback。
-权威查询命中数据保存在一份全局replay寄存器中，replay报文重新参与FE选择但D3不再
-复查fast cache。该寄存器释放前暂停新的权威查询，避免数据覆盖和重复cache miss。
+Scheduler维护小位宽dependency状态，FE completion tag用于唤醒ISSUE_WAIT_DEP报文。
+Completion bypass允许同一接收沿的新entry或等待entry识别该completion，但被唤醒报文
+只能从下一周期开始参与D2。D3对最多4个ISSUE_SELECTED依赖报文从backend执行权威数据gather，
+依次检查completion bypass、retirement bypass、active ROB和8-bank retired history。
+依赖宽数据不复制到所有issue entry中，也不存在fast-cache、fallback或replay状态。
 
 4.3 FE 调度
 
-调度分为报文选择和 FE 选择两部分。报文侧使用公平轮询策略，FE侧从可用 FE 中进行
-轮询分配。调度应保持无饥饿，并在 READY 报文和 FE 资源允许时尽量维持多发射。
+ISSUE_READY报文按delay进入4个分类ID队列，报文宽数据仍只保存在issue table。每个分类
+队列提供最多4个队首ID作为候选，同一分类允许获得多个FE。ISSUE_WAIT_DEP报文不占
+READY队列位置，避免未满足依赖的报文形成队头阻塞。
+
+调度器在4个分类队首窗口与4个FE之间建立legal matrix。普通候选先保证全局最老队首
+报文，再按delay分类轮转补齐其余grant，并优先保护可选FE较少
+的分类。FE选择按轮转次序打破同等约束。调度应保持无饥饿，并在 READY 报文和 FE
+资源允许时尽量维持多发射。
 
 FE本身是固定1~4周期延迟的无阻塞流水线，每周期最多接收一个请求，并允许输入和
-输出同周期发生。Dispatch维护per-FE 8槽环形返回日历。D2按请求delay计算D3发射后
-的目标返回周期，只能选择对应日历槽未占用的FE，并在选择沿写入rob_id和seq_tag。
-每个FE设置一份D2到D3 launch寄存器；D3消费当前launch的同一周期，D2允许写入该FE
+输出同周期发生。Scheduler维护per-FE 8槽环形返回日历。D2按请求delay计算D3发射后
+的目标返回周期，只能选择对应日历槽未占用的FE，并在选择沿写入完整seq_tag。
+Issue table为每个FE设置一份D2到D3 selected-tag寄存器；D3消费当前issue bundle的同一周期，D2允许写入该FE
 的下一请求，因此无冲突流量下每个FE可以逐周期接收请求。
 
 返回日历使用共享modulo-8周期索引，不移动宽tag字段。8槽覆盖D2提前一周期预约和
-FE最长4周期返回的完整窗口。D3 cache miss取消对应预约；普通cache hit和replay请求
-在D3实际进入FE后保留预约，直到目标周期用于返回关联并被清除。
+FE最长4周期返回的完整窗口。合法选择保证D3权威依赖gather必定available；D3不以
+gather响应设置ready、取消或重放通路。依赖未available属于内部状态不一致，验证侧
+必须报错。
 
 4.4 FE 写回
 
-每个 FE 通过 dispatch 返回日历当前周期槽保存的 ROB tag 将结果写回对应 ROB entry。
-FE 可以乱序完成，
-并同时更新 dispatch 非权威 fast cache，但结果不得直接进入 reorder 已退休结果缓存，
-也不得绕过 ROB 直接输出。
+每个FE通过scheduler返回日历当前周期槽保存的ROB tag将结果写回对应ROB entry。
+FE可以乱序完成，但completion只写active ROB并形成tag wakeup/bypass事件，不写retired
+history，也不得绕过ROB直接输出。
 
 4.5 保序退休
 
-reorder 从 ROB head 开始退休最多 4 个连续 DONE 报文。退休事件同时完成：
+ppe_rob从ROB head开始退休最多4个连续DONE报文，并向ppe_retire_output提供无空洞的逻辑
+退休前缀。退休事件同时完成：
 
-  - 装入顶层输出寄存器；
-  - 更新 8-bank result buffer；
+  - ppe_retire_output将结果映射并装入顶层输出寄存器；
+  - 更新8-bank retired history；
   - 释放 ROB entry；
-  - 推进 ROB head 和输出 lane 指针。
+  - 推进ROB head，并由ppe_retire_output推进输出lane指针。
 
 严格保序可能产生 head-of-line blocking，这是功能要求。调度策略应避免无必要地延迟
 接近 ROB head 的可派发报文。
 
 4.6 全局反压
 
-ppe_reorder 根据 ROB 沿前空闲容量与本周期连续 DONE 退休数量生成 bkps，允许新输入
+backend根据ROB沿前空闲容量与本周期连续DONE退休数量生成bkps，允许新输入
 在同一上升沿复用退休释放的空间。这样可消除满 ROB 边界的保守停顿，并保持满载基线
 连续接收。代价是 done-prefix 检查进入 bkps 控制路径；该路径只包含有效位、结果有效
 位、计数和比较，不引入 packet 宽数据路径。
-ppe_top将原始in_valid直接连接到reorder的容量查询输入；reorder不使用已经bkps
+ppe_top将原始in_valid直接连接到backend的容量查询输入；backend不使用已经bkps
 门控的allocation valid反推当前输入需求。
 
 同址 retirement 与 allocation 可以在同一上升沿发生。retirement 使用沿前 ROB
-内容产生输出并更新已退休 result buffer，allocation 对沿后 ROB entry 状态具有优先权，
+内容产生输出并更新retired history，allocation对沿后ROB entry状态具有优先权，
 从而使该 entry 立即代表新报文且 result 尚未有效。
 
 ================================================================================
 5. 初步流水线划分
 ================================================================================
 
-5.1 Dispatch 主流水
+5.1 Ingress与Scheduler主流水
 
-Dispatch 输入到FE发射划分为三个寄存边界阶段，并包含一条并行依赖事件通路：
+输入到FE发射划分为三个寄存边界阶段，并包含一条并行依赖事件通路：
 
   D0：Input Admission / Allocation
       输入捕获、顺序分配、依赖目标预计算和 ROB allocation。
 
   D2：Packet Select / FE Select
-      从packet RR起点联合完成最多4个报文、目标返回周期和FE选择，写入返回日历
-      预约并锁存launch信息。槽冲突候选不消耗grant；replay报文具有最高优先级。
+      从4个delay分类队列的队首窗口完成最多4个报文、目标返回周期和FE选择，写入
+      返回日历预约并锁存launch信息。每类可多grant。
 
   D3：Operand Read / FE Issue
-      读取launch报文和本地依赖数据并完成FE路由；本地覆盖miss取消预约并进入
-      单路fallback，replay请求直接使用已保存的权威依赖数据。
+      读取launch报文，通过backend四级权威解析读取最多4路依赖数据，并完成FE路由。
 
   Dependency Event Path：
-      D0以fast cache和同周期writeback旁路直接初始化entry状态；后续writeback唤醒
-      WAIT_DEP/FALLBACK entry，单路fallback处理权威查询。该通路不增加输入流水级。
+      D0以active ROB/history状态及completion/retirement bypass初始化entry；后续
+      completion tag唤醒ISSUE_WAIT_DEP entry。该通路不增加输入流水级，也不允许同沿直通FE。
 
-D2 和 D3 必须保持逻辑分离，避免形成“全表依赖检查、16选4、宽数据读取、FE路由”
-的单周期长路径。
+D2 和 D3 必须保持逻辑分离。READY发现和分类入队不进入D2匹配关键路径；D2只处理
+小位宽队首ID、4x4合法矩阵和返回槽控制，D3再读取宽报文与依赖数据。
 
-5.2 Reorder 并行通路
+5.2 Backend并行通路
 
-Reorder 不采用单一线性流水，而是包含四条并行通路：
+Backend不采用单一线性流水，而是包含四条并行通路：
 
   A0：ROB Allocation
-  L0：Single Fallback Dependency Lookup
+  G0：Dependency Status / Data Gather
   W0：FE Writeback
   R0：In-order Retire / Registered Output
 
-A0、L0、W0 和 R0 可以在同周期处理不同 ROB entry。它们共享的 ROB 状态必须由统一
+A0、G0、W0和R0可以在同周期处理不同ROB entry。它们共享的ROB状态必须由统一
 状态所有权和 next-state 逻辑协调。
 
 5.3 高层流水关系
@@ -259,11 +300,11 @@ A0、L0、W0 和 R0 可以在同周期处理不同 ROB entry。它们共享的 R
   Input D0 -> D2 -> D3 -> FE(fixed delay + 1 cycles)
                               |
                               v
-                      Reorder W0 -> R0 -> Output Registers
+                      Backend W0 -> R0 -> Output Registers
 
-  Reorder A0 与 Input D0 并行工作。
-  Reorder L0 每周期服务一路由dispatch仲裁后的fallback查询。replay寄存器占用时暂停
-  新查询；寄存器释放后按entry轮询继续服务，持续请求不得永久饥饿。
+  Backend A0与Input D0并行工作。
+  Backend G0为D0提供最多4路小位宽available状态，并为D3提供最多4路128 bit依赖数据。
+  G0按completion bypass、retirement bypass、active ROB、retired history优先级解析。
 
 ================================================================================
 6. 高风险路径与可优化点
@@ -272,44 +313,45 @@ A0、L0、W0 和 R0 可以在同周期处理不同 ROB entry。它们共享的 R
 6.1 FE 服务能力
 
 4个FE均支持无阻塞流水，每个FE理论上可逐周期接收请求，但同一FE的目标输出周期
-不得冲突。8槽返回日历和可同周期消费/重填的launch寄存器释放FE流水吞吐；实现后
+不得冲突。8槽返回日历和可同周期消费/重填的selected-tag寄存器释放FE流水吞吐；实现后
 重点检查混合delay造成的槽碎片、D2匹配效率以及长流下是否接近4路持续issue。
 
 6.2 D2 多发射仲裁
 
-16项联合报文/FE/return-slot轮询是高风险控制路径。首版按LLD使用固定上界扫描，
-跳过槽冲突候选并在成功匹配后屏蔽已用FE。实现后重点观察串行found/used依赖、
-动态日历索引和4路匹配的组合深度；不得仅为缩短代码牺牲可发候选吞吐。
+4个分类队首窗口与4个FE形成小位宽legal matrix。首版按LLD采用forced-first加分类
+轮转，并在FE选择时优先保护受约束分类。同一分类必须允许多grant。实现后重点观察
+多轮grant依赖、动态日历索引和匹配组合深度；不得退化为每类每周期最多一发。
 
 6.3 D3 宽数据路径
 
-D3正常路径包含dispatch packet选择、8-bank fast-cache依赖读取以及4路FE数据路由，
-不再包含四路跨模块 ROB/result-bank 读取。Fast-cache覆盖miss取消返回预约并进入单路
-replay慢路径，不得阻塞其他本地命中的FE issue。
+D3正常路径包含issue-table packet选择、最多4路active ROB/history权威依赖读取以及
+4路FE数据路由。每路active ROB读取由target seq tag低ROB_ID_W位直接索引并比较完整
+tag；history由target seq tag低3位索引并比较完整tag。该宽mux可能成为关键路径。
 
-6.4 L0 Fallback 依赖读取
+6.4 G0多路依赖读取
 
-L0只保留一路权威fallback lookup。正常cache hit不切换该宽数据路径。查询命中数据
-进入一份128 bit replay寄存器并优先重新派发；寄存器占用期间停止新lookup。
-Fallback串行化只能降低冲突场景吞吐，不得影响无冲突四路issue。
+G0需要在同周期支持最多4个已选依赖报文的数据解析，并允许同一结果向多个FE广播。
+Completion和retirement bypass均先做小位宽ID/tag比较，再选择128 bit数据。若综合结果
+表明4路ROB/history读取限制频率，可以在保持每周期4路吞吐的前提下增加gather流水级，
+但必须同步更新返回日历预约距离和LLD周期定义。
 
 6.5 W0 多路写回
 
-W0必须无条件接收最多4路任意ROB ID写回。不得依赖单写端口存储或通过反压FE解决。
+W0必须无条件接收最多4路任意seq tag写回，并从tag低位派生本地ROB写地址。不得依赖单写端口存储或通过反压FE解决。
 多路地址decode和宽数据扇出是主要实现风险。
 
 6.6 R0 多路退休
 
-R0需要完成连续DONE检查、最多4路数据选择、输出旋转和result-bank更新。第一版保持
+R0需要完成连续DONE检查、最多4路数据选择、输出旋转和history更新。第一版保持
 单级退休；若后续拆分流水，必须继续支持连续每周期最多4个报文退休。
 
 6.7 实现后的优化观察方向
 
 首版结构按第7节固定。实现完成后可根据时序与性能数据观察：
 
-  1) D2并行multi-grant仲裁的组合深度；
-  2) D3宽数据路由和单份fallback replay寄存器的等待时间；
-  3) dispatch fast-cache读取和单路 L0 fallback 的mux代价；
+  1) D2分类队首窗口、4x4 legal matrix和multi-grant仲裁的组合深度；
+  2) D3 payload、active ROB/history多路读取和FE宽数据路由；
+  3) completion/retirement bypass的tag比较、优先选择和宽数据扇出；
   4) W0四路任意地址写回的decode和数据扇出；
   5) R0单级退休和输出旋转的组合深度；
   6) FE_NUM=4下的实际FE利用率和服务能力。
@@ -322,11 +364,13 @@ R0需要完成连续DONE检查、最多4路数据选择、输出旋转和result-
 
   1) FE_NUM=4、ISSUE_WIDTH=4；
   2) D2和D3之间保持一个流水边界，不再额外拆分；
-  3) dispatch为每个FE实现一份可同周期消费/重填的launch寄存器，以及8槽返回日历；
-  4) dispatch使用8-bank非权威fast cache，reorder只保留单路fallback lookup；
-  5) dispatch只保存一份128 bit fallback replay数据，不在所有entry中复制宽依赖；
+  3) issue table为每个FE实现一份可同周期消费/重填的selected-tag寄存器，scheduler维护8槽返回日历；
+  4) FE completion只写active ROB，只有retirement写8-bank history；
+  5) dependency gather按四级优先级支持最多4路读取，不在issue entry中复制宽依赖；
   6) R0使用单级退休并直接更新顶层输出寄存器；
   7) 不定义可综合的异常上报、恢复或全局锁死状态，内部一致性由验证侧检查。
+  8) scheduler使用4个深度16的delay分类READY ID FIFO；每类队首最多4项可同周期消费，
+     FIFO只保存4 bit issue ID，宽报文数据不复制。
 
 上述项目只有在后续时序或性能数据证明有必要时才重新评估。变更任一项都必须先同步
 HLD和LLD，不得在RTL中自行启用。
@@ -338,13 +382,13 @@ HLD中展开，统一维护在doc/lld.txt。
 8. 核心架构不变量
 ================================================================================
 
-  1) reorder 是 ROB allocation、retirement 和 occupancy 的唯一所有者。
-  2) dispatch 只管理尚未进入 FE 的调度状态。
-  3) dispatch fast cache 是非权威副本，任意覆盖 miss 必须能够 fallback 恢复。
-  4) FE 返回写 ROB 和 dispatch fast cache，不直接写 retired result bank。
-  5) fallback 中目标仍在 ROB 时读取 ROB，目标退休后读取 result bank。
-  6) 报文装入顶层输出寄存器时视为退休，并同步更新 result bank。
-  7) 所有依赖查询必须检查完整 seq tag。
-  8) Packet、FE和fallback仲裁不得产生永久饥饿。
+  1) backend是ROB allocation、retirement和occupancy的唯一所有者。
+  2) ingress只拥有next_seq_tag，scheduler只管理尚未进入FE的调度状态。
+  3) FE completion只写active ROB并形成bypass/wakeup事件，不写retired history。
+  4) 报文装入顶层输出寄存器时视为退休，并同步更新retired history。
+  5) 依赖解析严格按completion bypass、retirement bypass、active ROB、history排序。
+  6) active ROB命中但result_valid=0时必须等待，禁止继续使用history。
+  7) 所有依赖查询必须检查完整seq tag，bank低位索引不得单独作为命中。
+  8) Packet和FE仲裁不得产生永久饥饿。
   9) 全局反压禁止部分接收一个多lane输入周期。
   10) 顶层输入先寄存再处理，顶层输出只能由寄存器驱动。

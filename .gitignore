@@ -1,4 +1,5 @@
 # VCS / Simulation build artifacts
+flow/
 sim/build/
 sim/run/
 sim/regression/

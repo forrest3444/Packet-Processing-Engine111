@@ -122,7 +122,7 @@ help:
 	@echo "  make run     Run existing elaboration"
 	@echo "  make sim     Compile and run"
 	@echo "  make regress-functional  Run multi-seed functional regression"
-	@echo "  make regress-performance Run P0-P6 performance characterization"
+	@echo "  make regress-performance Run P0-P6 and mixed-load performance characterization"
 	@echo "  make regress             Run functional and performance regressions"
 	@echo "Variables:"
 	@echo "  VERILATOR=$(VERILATOR) RTL_FILELIST=$(RTL_FILELIST)"

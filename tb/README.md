@@ -36,6 +36,11 @@ Supported cases are `P1_DELAY1`, `P1_DELAY2`, `P1_DELAY3`, `P2_MIXED_DELAY`,
 `P3_LANES1`, `P3_LANES2`, `P3_LANES3`, `P4_DEP1_D0`, `P4_DEP1_D3`,
 `P5_DEP2`, `P5_DEP4`, `P5_DEP7`, `P6_DEP25`, `P6_DEP50`, and `P6_DEP75`.
 
+`ppe_load_mix_perf_test` adds a combined exact-ratio load test: 378 packets at
+50% input-port utilization followed by 756 packets at 90% utilization. Delay is
+randomized per packet, and dependency offsets use an exact `14:1:1:1:1:1:1:1`
+distribution for offsets `0..7`.
+
 Regression targets keep functional pass/fail testing separate from performance
 characterization:
 

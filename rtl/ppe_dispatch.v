@@ -134,6 +134,15 @@ module ppe_dispatch #(
     reg [1:0]                 entry_desc_delay [0:15];
     reg [4:0]                 entry_target_seq_tag [0:15];
     reg [2:0]                 entry_state [0:15];
+    reg                       entry_queued [0:15];
+
+    // Four delay-class FIFOs carry only dispatch IDs.  Packet and dependency
+    // data remain in the table above, keeping the scheduling path narrow.
+    // The first four positions of each class are its multi-grant head window.
+    reg [3:0]                 ready_q_id [0:63];
+    reg [4:0]                 ready_q_count [0:3];
+    reg [3:0]                 ready_q_id_next [0:63];
+    reg [4:0]                 ready_q_count_next [0:3];
 
     // Non-authoritative dependency cache.  Index is seq_tag[2:0], but a hit
     // always compares the complete five-bit tag to reject wrapped/old data.
@@ -141,10 +150,11 @@ module ppe_dispatch #(
     reg [4:0]                 dep_cache_seq_tag [0:7];
     reg [PACKET_W-1:0]        dep_cache_data [0:7];
 
-    // Round-robin pointers prevent a continuously ready entry or FE from being
-    // starved by lower-numbered entries.
+    // Separate discovery, delay-class, and FE round-robin pointers keep table
+    // insertion and FE matching fair without rescanning packet data in D2.
     reg [4:0]                 next_seq_tag;
-    reg [3:0]                 packet_rr_ptr;
+    reg [3:0]                 enqueue_rr_ptr;
+    reg [1:0]                 class_rr_ptr;
     reg [1:0]                 fe_rr_ptr;
     reg                       fallback_class_rr;
     reg [1:0]                 fallback_fe_rr_ptr;
@@ -224,13 +234,37 @@ module ppe_dispatch #(
     integer    fallback_scan;
     integer    fallback_index;
 
-    reg [15:0] eligible_mask;
-    integer scan_pos;
-    reg [3:0] scan_index;
-    integer fe_scan;
-    reg [1:0] fe_index;
+    reg                       enqueue_valid [0:3];
+    reg [3:0]                 enqueue_id [0:3];
+    reg [1:0]                 enqueue_class [0:3];
+    reg                       alloc_enqueued0;
+    reg                       alloc_enqueued1;
+    reg                       alloc_enqueued2;
+    reg                       alloc_enqueued3;
+    integer                   enqueue_count;
+    reg [3:0]                 enqueue_last_id;
+    integer                   enqueue_scan;
+    reg [3:0]                 enqueue_scan_id;
+    reg                       enqueue_scan_ready;
+
+    integer d2_round;
+    integer d2_class_scan;
+    integer d2_fe_scan;
+    integer d2_other_class;
+    reg [1:0] d2_class_index;
+    reg [1:0] d2_fe_index;
     reg [3:0] d2_fe_used;
-    reg       d2_match_found;
+    reg [2:0] d2_class_take [0:3];
+    reg       d2_class_found;
+    reg [1:0] d2_chosen_class;
+    reg       d2_fe_found;
+    reg [1:0] d2_chosen_fe;
+    integer   d2_legal_count;
+    integer   d2_best_contention;
+    integer   d2_contention;
+    reg [5:0] d2_queue_index;
+    reg [4:0] d2_candidate_age;
+    reg [4:0] d2_oldest_age;
     reg [2:0] d2_candidate_slot;
     reg [3:0] d2_candidate_rob_id;
     reg d2_select_valid0;
@@ -250,10 +284,16 @@ module ppe_dispatch #(
     reg [2:0] d2_select_return_slot3;
     reg       d2_select_replay3;
     integer d2_select_count;
-    reg [3:0] d2_last_rob_id;
+    integer d2_normal_count;
+    reg [1:0] d2_last_class;
     reg [1:0] d2_last_fe_id;
 
     integer i;
+    integer q_class;
+    integer q_pos;
+    integer q_base;
+    integer q_remaining;
+    integer q_append;
 
     // D0 lane rank gives each valid lane a consecutive sequence number while
     // preserving lane order.  Invalid lanes consume no sequence number.
@@ -495,18 +535,135 @@ module ppe_dispatch #(
         end
     end
 
-    // Joint D2 packet/FE selection.
-    //
-    // A packet is granted only after an FE with a free target return slot is
-    // found.  Conflicting packets are skipped rather than consuming one of the
-    // four issue opportunities.  Each FE can be selected only once per cycle.
+    // Queue next-state permits dequeue and enqueue in the same cycle.  D2 only
+    // removes a consecutive prefix, so compaction is a fixed shift per class.
     always @(*) begin
-        for (scan_pos = 0; scan_pos < 16; scan_pos = scan_pos + 1) begin
-            eligible_mask[scan_pos] =
-                (entry_state[scan_pos] == ST_READY_NODEP) ||
-                (entry_state[scan_pos] == ST_READY_DEP);
+        for (q_class = 0; q_class < 4; q_class = q_class + 1) begin
+            q_base = q_class * 16;
+            q_remaining = {27'd0, ready_q_count[q_class]} -
+                          {29'd0, d2_class_take[q_class]};
+            for (q_pos = 0; q_pos < 16; q_pos = q_pos + 1) begin
+                ready_q_id_next[q_base + q_pos] =
+                    ready_q_id[q_base + q_pos];
+                if (q_pos < q_remaining)
+                    ready_q_id_next[q_base + q_pos] = ready_q_id[
+                        q_base + q_pos + {29'd0, d2_class_take[q_class]}];
+            end
+            q_append = q_remaining;
+            if (enqueue_valid[0] &&
+                (enqueue_class[0] == q_class[1:0])) begin
+                ready_q_id_next[q_base + q_append] = enqueue_id[0];
+                q_append = q_append + 1;
+            end
+            if (enqueue_valid[1] &&
+                (enqueue_class[1] == q_class[1:0])) begin
+                ready_q_id_next[q_base + q_append] = enqueue_id[1];
+                q_append = q_append + 1;
+            end
+            if (enqueue_valid[2] &&
+                (enqueue_class[2] == q_class[1:0])) begin
+                ready_q_id_next[q_base + q_append] = enqueue_id[2];
+                q_append = q_append + 1;
+            end
+            if (enqueue_valid[3] &&
+                (enqueue_class[3] == q_class[1:0])) begin
+                ready_q_id_next[q_base + q_append] = enqueue_id[3];
+                q_append = q_append + 1;
+            end
+            ready_q_count_next[q_class] = q_append[4:0];
+        end
+    end
+
+
+    // READY discovery is separate from D2 matching.  Entries beyond the four
+    // insertion slots remain READY and are found by a later fair scan.
+    always @(*) begin
+        enqueue_count = 0;
+        enqueue_last_id = enqueue_rr_ptr;
+        alloc_enqueued0 = 1'b0;
+        alloc_enqueued1 = 1'b0;
+        alloc_enqueued2 = 1'b0;
+        alloc_enqueued3 = 1'b0;
+        for (enqueue_scan = 0; enqueue_scan < 4;
+             enqueue_scan = enqueue_scan + 1) begin
+            enqueue_valid[enqueue_scan] = 1'b0;
+            enqueue_id[enqueue_scan] = 4'd0;
+            enqueue_class[enqueue_scan] = 2'd0;
+        end
+        for (enqueue_scan = 0; enqueue_scan < 16;
+             enqueue_scan = enqueue_scan + 1) begin
+            enqueue_scan_id = enqueue_rr_ptr + enqueue_scan[3:0];
+            enqueue_scan_ready =
+                (entry_state[enqueue_scan_id] == ST_READY_NODEP) ||
+                (entry_state[enqueue_scan_id] == ST_READY_DEP) ||
+                ((((entry_state[enqueue_scan_id] == ST_WAIT_DEP) ||
+                   (entry_state[enqueue_scan_id] == ST_FALLBACK)) &&
+                  ((dep_cache_valid[
+                        entry_target_seq_tag[enqueue_scan_id][2:0]] &&
+                    (dep_cache_seq_tag[
+                        entry_target_seq_tag[enqueue_scan_id][2:0]] ==
+                     entry_target_seq_tag[enqueue_scan_id])) ||
+                   (wb_valid0 && (wb_seq_tag0 ==
+                                  entry_target_seq_tag[enqueue_scan_id])) ||
+                   (wb_valid1 && (wb_seq_tag1 ==
+                                  entry_target_seq_tag[enqueue_scan_id])) ||
+                   (wb_valid2 && (wb_seq_tag2 ==
+                                  entry_target_seq_tag[enqueue_scan_id])) ||
+                   (wb_valid3 && (wb_seq_tag3 ==
+                                  entry_target_seq_tag[enqueue_scan_id])))) &&
+                 !(fallback_valid_r && fallback_ready &&
+                   (fallback_entry_id == enqueue_scan_id)));
+            if ((enqueue_count < 4) && !entry_queued[enqueue_scan_id] &&
+                enqueue_scan_ready) begin
+                enqueue_valid[enqueue_count] = 1'b1;
+                enqueue_id[enqueue_count] = enqueue_scan_id;
+                enqueue_class[enqueue_count] =
+                    entry_desc_delay[enqueue_scan_id];
+                enqueue_last_id = enqueue_scan_id;
+                enqueue_count = enqueue_count + 1;
+            end
         end
 
+        // A D0 allocation whose dependency is already resolved can enter the
+        // ID FIFO on its capture edge.  Existing unqueued READY entries retain
+        // priority so continuous new traffic cannot starve a wakeup backlog.
+        if ((enqueue_count < 4) && alloc_valid0 &&
+            ((dep_offset0 == 3'd0) || alloc_dep_resolved0)) begin
+            enqueue_valid[enqueue_count] = 1'b1;
+            enqueue_id[enqueue_count] = alloc_rob_id0;
+            enqueue_class[enqueue_count] = in_desc0[1:0];
+            alloc_enqueued0 = 1'b1;
+            enqueue_count = enqueue_count + 1;
+        end
+        if ((enqueue_count < 4) && alloc_valid1 &&
+            ((dep_offset1 == 3'd0) || alloc_dep_resolved1)) begin
+            enqueue_valid[enqueue_count] = 1'b1;
+            enqueue_id[enqueue_count] = alloc_rob_id1;
+            enqueue_class[enqueue_count] = in_desc1[1:0];
+            alloc_enqueued1 = 1'b1;
+            enqueue_count = enqueue_count + 1;
+        end
+        if ((enqueue_count < 4) && alloc_valid2 &&
+            ((dep_offset2 == 3'd0) || alloc_dep_resolved2)) begin
+            enqueue_valid[enqueue_count] = 1'b1;
+            enqueue_id[enqueue_count] = alloc_rob_id2;
+            enqueue_class[enqueue_count] = in_desc2[1:0];
+            alloc_enqueued2 = 1'b1;
+            enqueue_count = enqueue_count + 1;
+        end
+        if ((enqueue_count < 4) && alloc_valid3 &&
+            ((dep_offset3 == 3'd0) || alloc_dep_resolved3)) begin
+            enqueue_valid[enqueue_count] = 1'b1;
+            enqueue_id[enqueue_count] = alloc_rob_id3;
+            enqueue_class[enqueue_count] = in_desc3[1:0];
+            alloc_enqueued3 = 1'b1;
+            enqueue_count = enqueue_count + 1;
+        end
+    end
+
+    // D2 matches four delay classes against four FE return slots.  A class may
+    // take several FEs and consumes consecutive IDs from its registered head.
+    always @(*) begin
         d2_select_valid0 = 1'b0;
         d2_select_rob_id0 = 4'd0;
         d2_select_return_slot0 = 3'd0;
@@ -525,98 +682,202 @@ module ppe_dispatch #(
         d2_select_replay3 = 1'b0;
         d2_fe_used = 4'b0000;
         d2_select_count = 0;
-        d2_last_rob_id = packet_rr_ptr;
+        d2_normal_count = 0;
+        d2_last_class = class_rr_ptr;
         d2_last_fe_id = fe_rr_ptr;
+        d2_fe_scan = 0;
+        d2_other_class = 0;
+        d2_class_index = 2'd0;
+        d2_fe_index = 2'd0;
+        d2_class_found = 1'b0;
+        d2_chosen_class = class_rr_ptr;
+        d2_fe_found = 1'b0;
+        d2_chosen_fe = fe_rr_ptr;
+        d2_legal_count = 0;
+        d2_best_contention = 0;
+        d2_contention = 0;
+        d2_queue_index = 6'd0;
+        d2_candidate_age = 5'd0;
+        d2_oldest_age = 5'd0;
+        d2_candidate_slot = 3'd0;
+        d2_candidate_rob_id = 4'd0;
+        for (d2_class_scan = 0; d2_class_scan < 4;
+             d2_class_scan = d2_class_scan + 1)
+            d2_class_take[d2_class_scan] = 3'd0;
 
-        // Schedule replay first so the single wide fallback buffer is released
-        // quickly and cannot block later authoritative lookups.
+        // Replay bypasses the normal queues and is prioritized to release the
+        // single authoritative dependency buffer.
         if (replay_valid && (entry_state[replay_rob_id] == ST_REPLAY)) begin
-            d2_candidate_rob_id = replay_rob_id;
-            // D2 books one cycle before D3 issues.  FE delay d then returns
-            // d+1 cycles after issue, hence phase + d + 2 from this D2 cycle.
             d2_candidate_slot = schedule_phase +
-                                {1'b0, entry_desc_delay[replay_rob_id]} + 3'd2;
-            d2_match_found = 1'b0;
-            for (fe_scan = 0; fe_scan < 4; fe_scan = fe_scan + 1) begin
-                fe_index = fe_rr_ptr + fe_scan[1:0];
-                if (!d2_match_found && !d2_fe_used[fe_index] &&
-                    !return_valid[{fe_index[1:0], d2_candidate_slot}]) begin
-                    d2_match_found = 1'b1;
-                    d2_fe_used[fe_index] = 1'b1;
-                    d2_last_rob_id = d2_candidate_rob_id;
-                    d2_last_fe_id = fe_index[1:0];
-                    d2_select_count = d2_select_count + 1;
-                    case (fe_index[1:0])
-                        2'd0: begin
-                            d2_select_valid0 = 1'b1;
-                            d2_select_rob_id0 = d2_candidate_rob_id;
+                {1'b0, entry_desc_delay[replay_rob_id]} + 3'd2;
+            d2_fe_found = 1'b0;
+            for (d2_fe_scan = 0; d2_fe_scan < 4;
+                 d2_fe_scan = d2_fe_scan + 1) begin
+                d2_fe_index = fe_rr_ptr + d2_fe_scan[1:0];
+                if (!d2_fe_found &&
+                    !return_valid[{d2_fe_index, d2_candidate_slot}]) begin
+                    d2_fe_found = 1'b1;
+                    d2_fe_used[d2_fe_index] = 1'b1;
+                    d2_last_fe_id = d2_fe_index;
+                    d2_select_count = 1;
+                    case (d2_fe_index)
+                        2'd0: begin d2_select_valid0 = 1'b1;
+                            d2_select_rob_id0 = replay_rob_id;
                             d2_select_return_slot0 = d2_candidate_slot;
-                            d2_select_replay0 = 1'b1;
-                        end
-                        2'd1: begin
-                            d2_select_valid1 = 1'b1;
-                            d2_select_rob_id1 = d2_candidate_rob_id;
+                            d2_select_replay0 = 1'b1; end
+                        2'd1: begin d2_select_valid1 = 1'b1;
+                            d2_select_rob_id1 = replay_rob_id;
                             d2_select_return_slot1 = d2_candidate_slot;
-                            d2_select_replay1 = 1'b1;
-                        end
-                        2'd2: begin
-                            d2_select_valid2 = 1'b1;
-                            d2_select_rob_id2 = d2_candidate_rob_id;
+                            d2_select_replay1 = 1'b1; end
+                        2'd2: begin d2_select_valid2 = 1'b1;
+                            d2_select_rob_id2 = replay_rob_id;
                             d2_select_return_slot2 = d2_candidate_slot;
-                            d2_select_replay2 = 1'b1;
-                        end
-                        default: begin
-                            d2_select_valid3 = 1'b1;
-                            d2_select_rob_id3 = d2_candidate_rob_id;
+                            d2_select_replay2 = 1'b1; end
+                        default: begin d2_select_valid3 = 1'b1;
+                            d2_select_rob_id3 = replay_rob_id;
                             d2_select_return_slot3 = d2_candidate_slot;
-                            d2_select_replay3 = 1'b1;
-                        end
+                            d2_select_replay3 = 1'b1; end
                     endcase
                 end
             end
         end
 
-        // Scan from packet_rr_ptr.  Fixed loop bounds synthesize as hardware;
-        // this is not a multi-cycle software loop.
-        for (scan_pos = 0; scan_pos < 16; scan_pos = scan_pos + 1) begin
-            scan_index = packet_rr_ptr + scan_pos[3:0];
-            if ((d2_select_count < 4) && eligible_mask[scan_index]) begin
-                d2_candidate_rob_id = scan_index;
-                d2_candidate_slot = schedule_phase +
-                    {1'b0, entry_desc_delay[d2_candidate_rob_id]} + 3'd2;
-                d2_match_found = 1'b0;
-                for (fe_scan = 0; fe_scan < 4; fe_scan = fe_scan + 1) begin
-                    fe_index = fe_rr_ptr + fe_scan[1:0];
-                    if (!d2_match_found && !d2_fe_used[fe_index] &&
-                        !return_valid[{fe_index[1:0], d2_candidate_slot}]) begin
-                        d2_match_found = 1'b1;
-                        d2_fe_used[fe_index] = 1'b1;
-                        d2_last_rob_id = d2_candidate_rob_id;
-                        d2_last_fe_id = fe_index[1:0];
-                        d2_select_count = d2_select_count + 1;
-                        case (fe_index[1:0])
-                            2'd0: begin
-                                d2_select_valid0 = 1'b1;
-                                d2_select_rob_id0 = d2_candidate_rob_id;
-                                d2_select_return_slot0 = d2_candidate_slot;
-                            end
-                            2'd1: begin
-                                d2_select_valid1 = 1'b1;
-                                d2_select_rob_id1 = d2_candidate_rob_id;
-                                d2_select_return_slot1 = d2_candidate_slot;
-                            end
-                            2'd2: begin
-                                d2_select_valid2 = 1'b1;
-                                d2_select_rob_id2 = d2_candidate_rob_id;
-                                d2_select_return_slot2 = d2_candidate_slot;
-                            end
-                            default: begin
-                                d2_select_valid3 = 1'b1;
-                                d2_select_rob_id3 = d2_candidate_rob_id;
-                                d2_select_return_slot3 = d2_candidate_slot;
-                            end
-                        endcase
+        // Fixed rounds synthesize into bounded matching.  First force the
+        // globally oldest schedulable head; later rounds use constrained-first
+        // and rotating class priority.
+        for (d2_round = 0; d2_round < 4; d2_round = d2_round + 1) begin
+            d2_class_found = 1'b0;
+            d2_chosen_class = class_rr_ptr;
+            if ((d2_select_count < 4) && (d2_normal_count == 0)) begin
+                d2_oldest_age = 5'd0;
+                for (d2_class_scan = 0; d2_class_scan < 4;
+                     d2_class_scan = d2_class_scan + 1) begin
+                    d2_legal_count = 0;
+                    d2_candidate_slot = schedule_phase +
+                        {1'b0, d2_class_scan[1:0]} + 3'd2;
+                    for (d2_fe_scan = 0; d2_fe_scan < 4;
+                         d2_fe_scan = d2_fe_scan + 1)
+                        if (!d2_fe_used[d2_fe_scan] &&
+                            !return_valid[{d2_fe_scan[1:0], d2_candidate_slot}])
+                            d2_legal_count = d2_legal_count + 1;
+                    if (({2'b00, d2_class_take[d2_class_scan]} <
+                         ready_q_count[d2_class_scan]) &&
+                        (d2_class_take[d2_class_scan] < 3'd4) &&
+                        (d2_legal_count != 0)) begin
+                        d2_queue_index = {d2_class_scan[1:0], 4'b0000} +
+                            {3'b000, d2_class_take[d2_class_scan]};
+                        d2_candidate_rob_id = ready_q_id[d2_queue_index];
+                        d2_candidate_age = next_seq_tag -
+                            entry_seq_tag[d2_candidate_rob_id];
+                        if (!d2_class_found ||
+                            (d2_candidate_age > d2_oldest_age)) begin
+                            d2_class_found = 1'b1;
+                            d2_chosen_class = d2_class_scan[1:0];
+                            d2_oldest_age = d2_candidate_age;
+                        end
                     end
+                end
+            end else if (d2_select_count < 4) begin
+                // Protect a class that has only one remaining FE choice.
+                for (d2_class_scan = 0; d2_class_scan < 4;
+                     d2_class_scan = d2_class_scan + 1) begin
+                    d2_class_index = class_rr_ptr + d2_class_scan[1:0];
+                    d2_legal_count = 0;
+                    d2_candidate_slot = schedule_phase +
+                        {1'b0, d2_class_index} + 3'd2;
+                    for (d2_fe_scan = 0; d2_fe_scan < 4;
+                         d2_fe_scan = d2_fe_scan + 1)
+                        if (!d2_fe_used[d2_fe_scan] &&
+                            !return_valid[{d2_fe_scan[1:0], d2_candidate_slot}])
+                            d2_legal_count = d2_legal_count + 1;
+                    if (!d2_class_found &&
+                        ({2'b00, d2_class_take[d2_class_index]} <
+                         ready_q_count[d2_class_index]) &&
+                        (d2_class_take[d2_class_index] < 3'd4) &&
+                        (d2_legal_count == 1)) begin
+                        d2_class_found = 1'b1;
+                        d2_chosen_class = d2_class_index;
+                    end
+                end
+                if (!d2_class_found) begin
+                    for (d2_class_scan = 0; d2_class_scan < 4;
+                         d2_class_scan = d2_class_scan + 1) begin
+                        d2_class_index = class_rr_ptr + d2_class_scan[1:0];
+                        d2_legal_count = 0;
+                        d2_candidate_slot = schedule_phase +
+                            {1'b0, d2_class_index} + 3'd2;
+                        for (d2_fe_scan = 0; d2_fe_scan < 4;
+                             d2_fe_scan = d2_fe_scan + 1)
+                            if (!d2_fe_used[d2_fe_scan] &&
+                                !return_valid[{d2_fe_scan[1:0],
+                                               d2_candidate_slot}])
+                                d2_legal_count = d2_legal_count + 1;
+                        if (!d2_class_found &&
+                            ({2'b00, d2_class_take[d2_class_index]} <
+                             ready_q_count[d2_class_index]) &&
+                            (d2_class_take[d2_class_index] < 3'd4) &&
+                            (d2_legal_count != 0)) begin
+                            d2_class_found = 1'b1;
+                            d2_chosen_class = d2_class_index;
+                        end
+                    end
+                end
+            end
+
+            if (d2_class_found && (d2_select_count < 4)) begin
+                d2_candidate_slot = schedule_phase +
+                    {1'b0, d2_chosen_class} + 3'd2;
+                d2_queue_index = {d2_chosen_class, 4'b0000} +
+                    {3'b000, d2_class_take[d2_chosen_class]};
+                d2_candidate_rob_id = ready_q_id[d2_queue_index];
+                d2_fe_found = 1'b0;
+                d2_chosen_fe = fe_rr_ptr;
+                d2_best_contention = 5;
+                for (d2_fe_scan = 0; d2_fe_scan < 4;
+                     d2_fe_scan = d2_fe_scan + 1) begin
+                    d2_fe_index = fe_rr_ptr + d2_fe_scan[1:0];
+                    if (!d2_fe_used[d2_fe_index] &&
+                        !return_valid[{d2_fe_index, d2_candidate_slot}]) begin
+                        d2_contention = 0;
+                        for (d2_other_class = 0; d2_other_class < 4;
+                             d2_other_class = d2_other_class + 1)
+                            if ((d2_other_class[1:0] != d2_chosen_class) &&
+                                ({2'b00, d2_class_take[d2_other_class]} <
+                                 ready_q_count[d2_other_class]) &&
+                                !return_valid[{d2_fe_index,
+                                    (schedule_phase +
+                                     {1'b0, d2_other_class[1:0]} + 3'd2)}])
+                                d2_contention = d2_contention + 1;
+                        if (!d2_fe_found ||
+                            (d2_contention < d2_best_contention)) begin
+                            d2_fe_found = 1'b1;
+                            d2_chosen_fe = d2_fe_index;
+                            d2_best_contention = d2_contention;
+                        end
+                    end
+                end
+                if (d2_fe_found) begin
+                    d2_fe_used[d2_chosen_fe] = 1'b1;
+                    d2_class_take[d2_chosen_class] =
+                        d2_class_take[d2_chosen_class] + 3'd1;
+                    d2_select_count = d2_select_count + 1;
+                    d2_normal_count = d2_normal_count + 1;
+                    d2_last_class = d2_chosen_class;
+                    d2_last_fe_id = d2_chosen_fe;
+                    case (d2_chosen_fe)
+                        2'd0: begin d2_select_valid0 = 1'b1;
+                            d2_select_rob_id0 = d2_candidate_rob_id;
+                            d2_select_return_slot0 = d2_candidate_slot; end
+                        2'd1: begin d2_select_valid1 = 1'b1;
+                            d2_select_rob_id1 = d2_candidate_rob_id;
+                            d2_select_return_slot1 = d2_candidate_slot; end
+                        2'd2: begin d2_select_valid2 = 1'b1;
+                            d2_select_rob_id2 = d2_candidate_rob_id;
+                            d2_select_return_slot2 = d2_candidate_slot; end
+                        default: begin d2_select_valid3 = 1'b1;
+                            d2_select_rob_id3 = d2_candidate_rob_id;
+                            d2_select_return_slot3 = d2_candidate_slot; end
+                    endcase
                 end
             end
         end
@@ -632,7 +893,8 @@ module ppe_dispatch #(
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             next_seq_tag <= 5'd0;
-            packet_rr_ptr <= 4'd0;
+            enqueue_rr_ptr <= 4'd0;
+            class_rr_ptr <= 2'd0;
             fe_rr_ptr <= 2'd0;
             fallback_class_rr <= 1'b0;
             fallback_fe_rr_ptr <= 2'd0;
@@ -645,6 +907,10 @@ module ppe_dispatch #(
             fe_launch_valid3 <= 1'b0;
             for (i = 0; i < 16; i = i + 1) begin
                 entry_state[i] <= ST_FREE;
+                entry_queued[i] <= 1'b0;
+            end
+            for (i = 0; i < 4; i = i + 1) begin
+                ready_q_count[i] <= 5'd0;
             end
             for (i = 0; i < 8; i = i + 1) begin
                 dep_cache_valid[i] <= 1'b0;
@@ -653,6 +919,21 @@ module ppe_dispatch #(
                 return_valid[i] <= 1'b0;
             end
         end else begin
+            // Commit the queue next-state computed from simultaneous grants and
+            // READY discovery.
+            for (q_class = 0; q_class < 4; q_class = q_class + 1) begin
+                for (q_pos = 0; q_pos < 16; q_pos = q_pos + 1)
+                    ready_q_id[(q_class * 16) + q_pos] <=
+                        ready_q_id_next[(q_class * 16) + q_pos];
+                ready_q_count[q_class] <= ready_q_count_next[q_class];
+            end
+            if (enqueue_count != 0)
+                enqueue_rr_ptr <= enqueue_last_id + 4'd1;
+            for (i = 0; i < 4; i = i + 1) begin
+                if (enqueue_valid[i])
+                    entry_queued[enqueue_id[i]] <= 1'b1;
+            end
+
             fe_launch_valid0 <= 1'b0;
             fe_launch_valid1 <= 1'b0;
             fe_launch_valid2 <= 1'b0;
@@ -710,7 +991,9 @@ module ppe_dispatch #(
                       (entry_target_seq_tag[i] == wb_seq_tag2)) ||
                      (wb_valid3 &&
                       (entry_target_seq_tag[i][3:0] == wb_rob_id3) &&
-                      (entry_target_seq_tag[i] == wb_seq_tag3)))) begin
+                      (entry_target_seq_tag[i] == wb_seq_tag3))) &&
+                    !(fallback_valid_r && fallback_ready &&
+                      (fallback_entry_id == i[3:0]))) begin
                     entry_state[i] <= ST_READY_DEP;
                 end
             end
@@ -813,6 +1096,8 @@ module ppe_dispatch #(
                 return_rob_id[{2'd0, d2_select_return_slot0}] <= d2_select_rob_id0;
                 return_seq_tag[{2'd0, d2_select_return_slot0}] <=
                     entry_seq_tag[d2_select_rob_id0];
+                if (!d2_select_replay0)
+                    entry_queued[d2_select_rob_id0] <= 1'b0;
             end
             if (d2_select_valid1) begin
                 fe_launch_valid1 <= 1'b1;
@@ -827,6 +1112,8 @@ module ppe_dispatch #(
                 return_rob_id[{2'd1, d2_select_return_slot1}] <= d2_select_rob_id1;
                 return_seq_tag[{2'd1, d2_select_return_slot1}] <=
                     entry_seq_tag[d2_select_rob_id1];
+                if (!d2_select_replay1)
+                    entry_queued[d2_select_rob_id1] <= 1'b0;
             end
             if (d2_select_valid2) begin
                 fe_launch_valid2 <= 1'b1;
@@ -841,6 +1128,8 @@ module ppe_dispatch #(
                 return_rob_id[{2'd2, d2_select_return_slot2}] <= d2_select_rob_id2;
                 return_seq_tag[{2'd2, d2_select_return_slot2}] <=
                     entry_seq_tag[d2_select_rob_id2];
+                if (!d2_select_replay2)
+                    entry_queued[d2_select_rob_id2] <= 1'b0;
             end
             if (d2_select_valid3) begin
                 fe_launch_valid3 <= 1'b1;
@@ -855,11 +1144,13 @@ module ppe_dispatch #(
                 return_rob_id[{2'd3, d2_select_return_slot3}] <= d2_select_rob_id3;
                 return_seq_tag[{2'd3, d2_select_return_slot3}] <=
                     entry_seq_tag[d2_select_rob_id3];
+                if (!d2_select_replay3)
+                    entry_queued[d2_select_rob_id3] <= 1'b0;
             end
-            if (d2_select_count != 0) begin
-                packet_rr_ptr <= d2_last_rob_id + 4'd1;
+            if (d2_normal_count != 0)
+                class_rr_ptr <= d2_last_class + 2'd1;
+            if (d2_select_count != 0)
                 fe_rr_ptr <= d2_last_fe_id + 2'd1;
-            end
 
             // D0 creates new entries.  Dependency identity is stored once as a
             // full target tag; target ROB ID and cache bank are its low bits.
@@ -871,6 +1162,7 @@ module ppe_dispatch #(
                 entry_state[alloc_rob_id0] <= (dep_offset0 == 3'd0) ?
                     ST_READY_NODEP :
                     (alloc_dep_resolved0 ? ST_READY_DEP : ST_FALLBACK);
+                entry_queued[alloc_rob_id0] <= alloc_enqueued0;
             end
             if (alloc_valid1) begin
                 entry_packet[alloc_rob_id1] <= in_packet1;
@@ -880,6 +1172,7 @@ module ppe_dispatch #(
                 entry_state[alloc_rob_id1] <= (dep_offset1 == 3'd0) ?
                     ST_READY_NODEP :
                     (alloc_dep_resolved1 ? ST_READY_DEP : ST_FALLBACK);
+                entry_queued[alloc_rob_id1] <= alloc_enqueued1;
             end
             if (alloc_valid2) begin
                 entry_packet[alloc_rob_id2] <= in_packet2;
@@ -889,6 +1182,7 @@ module ppe_dispatch #(
                 entry_state[alloc_rob_id2] <= (dep_offset2 == 3'd0) ?
                     ST_READY_NODEP :
                     (alloc_dep_resolved2 ? ST_READY_DEP : ST_FALLBACK);
+                entry_queued[alloc_rob_id2] <= alloc_enqueued2;
             end
             if (alloc_valid3) begin
                 entry_packet[alloc_rob_id3] <= in_packet3;
@@ -898,6 +1192,7 @@ module ppe_dispatch #(
                 entry_state[alloc_rob_id3] <= (dep_offset3 == 3'd0) ?
                     ST_READY_NODEP :
                     (alloc_dep_resolved3 ? ST_READY_DEP : ST_FALLBACK);
+                entry_queued[alloc_rob_id3] <= alloc_enqueued3;
             end
 
             if (!bkps && (accept_count != 3'd0)) begin

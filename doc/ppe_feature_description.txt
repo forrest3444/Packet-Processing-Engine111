@@ -114,7 +114,7 @@ valid：
   MAX_DEP = 7
   SEQ_W  = $clog2(ROB_DEPTH + MAX_DEP)
 
-RTL seq 按 2^SEQ_W 回绕。严格输出顺序由 ROB 的 head/tail 指针维护，不得使用普通
+RTL seq 按 2^SEQ_W 回绕。严格输出顺序由 ROB 的 head 指针和有效entry状态维护，不得使用普通
 无符号大小比较推断两个回绕 seq 的先后关系。依赖目标按 SEQ_W 位模减法计算：
 
   dep_seq = seq - dep_offset
@@ -124,11 +124,10 @@ RTL seq 按 2^SEQ_W 回绕。严格输出顺序由 ROB 的 head/tail 指针维�
 ROB 在途报文，以及 ROB head 之前最多 MAX_DEP 个仍可能被引用的历史结果，从而
 保证有限位宽 seq 在整个相关窗口内不会产生身份混淆。
 
-为支持 8-bank 依赖结果缓存，RTL 还必须维护 3 bit seq_residue，表示抽象全局
-报文序对 8 取模的结果，并按 0→1→...→7→0 循环。当前 SEQ_W 大于 3 且有限
-seq_tag 的回绕模数是 8 的整数倍，因此 seq_residue 可直接取 seq_tag[2:0]；实现
-仍可将其作为显式字段保存在 ROB entry 中。 同周期接收多个报文时，seq_tag 和
-seq_residue 均按 lane 递增顺序逐一推进。
+8-bank已退休依赖历史的bank索引直接取完整seq_tag的低3位，即seq_tag[2:0]。
+seq_tag回绕模数是8的整数倍，因此不需要维护或存储独立推进的seq_residue状态。
+所有bank访问都必须从对应完整seq_tag派生低3位索引，并以完整SEQ_W位tag比较确认
+命中；低3位只用于索引，不得单独作为结果身份。
 
 ================================================================================
 4. 输入接收与全局反压
@@ -145,7 +144,7 @@ bkps 不支持 per-lane 独立反压。bkps 仅由 ROB 容量不足产生：ROB 
 锁死状态。
 
 ROB_DEPTH 必须满足 ROB_DEPTH >= N，保证任意一个 N 路全 valid 的输入批次最终
-能够被整体接收。输入接收沿可直接将 packet、descriptor、seq_tag 和 seq_residue
+能够被整体接收。输入接收沿可直接将 packet、descriptor 和 seq_tag
 写入新分配的 ROB entry；该 ROB 写入本身满足顶层输入寄存器打拍要求，不强制增加
 独立 input FIFO。
 
@@ -156,8 +155,8 @@ ROB_DEPTH 必须满足 ROB_DEPTH >= N，保证任意一个 N 路全 valid 的输
   rob_available_count = rob_free_count + retire_count
   bkps = !internal_rst_n || (rob_available_count < input_count)
 
-允许输入批次在同一上升沿复用本周期退休释放的 ROB 条目。若 allocation ROB ID 与
-退休 ROB ID 相同，退休输出、依赖结果缓存更新必须读取该沿之前的旧 entry 内容，
+允许输入批次在同一上升沿复用本周期退休释放的 ROB 条目。若allocation seq_tag低位
+索引与退休条目物理索引相同，退休输出、依赖history更新必须读取该沿之前的旧entry内容，
 该沿之后 entry 保存新 allocation 的 metadata 且 result 尚未有效。该定义消除 ROB
 满载边界的保守反压气泡，但形成从 ROB DONE 前缀检查到 bkps 的组合控制路径。
 
@@ -193,42 +192,38 @@ ROB_DEPTH 必须满足 ROB_DEPTH >= N，保证任意一个 N 路全 valid 的输
   的dep_offset，也不为非法输入定义完成、输出或错误恢复行为。合法输入的依赖目标
   始终直接使用desc[4:2]计算，不存在内部依赖降级。
 
-6.2 依赖结果缓存
+6.2 依赖结果存储与读取
 
-  Reorder 维护 8 个权威已退休结果 bank，bank 编号为 0..7。每个 bank 固定保存
-  seq_residue 等于该 bank 编号的已退休报文结果。每个 bank entry 至少包含：
+  Reorder ROB是未退休报文结果的权威存储。Reorder另维护8个权威已退休结果history
+  bank，bank编号为0..7。每个bank保存最近一个seq_tag[2:0]等于该bank编号的已退休
+  报文结果。每个history entry至少包含：
     - valid；
     - 完整 SEQ_W 位 seq_tag；
     - 128 bit result_data。
 
   FE 返回时，fe_out_data 先写入对应 ROB entry，并设置该 entry 的 result_valid；
-  FE 乱序完成不得直接覆盖 reorder 的已退休 result bank。
+  FE乱序完成不得写入或覆盖已退休history。只有报文从ROB严格按序退休时，才把该
+  报文结果写入history[seq_tag[2:0]]。
 
-  Dispatch 另维护 8 个非权威依赖 fast-cache bank，每项保存 valid、完整 SEQ_W 位
-  seq_tag 和 128 bit result_data。FE writeback 可以按 seq_residue 直接更新该 fast
-  cache；乱序返回导致的同 bank 覆盖只允许造成 cache miss，不得造成依赖丢失。
-  Fast cache 不拥有结果生命周期，不能替代 ROB 和已退休 result bank。
+  对target_seq_tag的依赖解析按以下优先级逐级选择，并且每一级都必须比较完整tag：
+    a) Completion bypass：匹配本周期有效FE completion的完整seq_tag；ROB索引由tag低位派生；
+    b) Retirement bypass：匹配本周期退休前缀的完整seq_tag，使用沿前旧ROB数据；
+    c) Active ROB：目标entry仍在ROB且完整tag匹配时，result_valid=1方可使用；若
+       result_valid=0，依赖继续等待，禁止继续查询history；
+    d) Retired history：目标已不在active ROB时，以target_seq_tag[2:0]选择history，
+       并要求history.valid及完整seq_tag同时匹配。
 
-  报文查找依赖目标时优先以 target_residue 直接索引 dispatch fast cache，并要求
-  valid 和完整 seq_tag 同时匹配。Fast-cache miss 必须通过单路 fallback lookup
-  查询 reorder 的权威结果：
-    a) 若目标 seq_tag 对应的 entry 仍在 ROB 中，则从该 ROB entry 读取结果；若其
-       result_valid 尚未置位，当前报文继续等待，不得转而使用已退休 result bank
-       中同 residue 的历史结果。
-    b) 若目标报文已经从 ROB 退休，则以 target_residue 选择已退休 result bank，
-       并要求 bank.valid = 1 且 bank.seq_tag 与 target_seq_tag 完整匹配后方可使用。
+  Completion bypass只允许在completion写ROB的上升沿完成依赖状态初始化或唤醒；
+  被唤醒报文最早从下一周期参与FE派发，不允许形成FE completion到另一FE输入的
+  同周期组合直通。Retirement bypass用于保证同周期退休、history更新和ROB槽复用时
+  读取沿前旧结果，不依赖存储体未定义的read-during-write行为。
 
-  每周期最多执行一路 fallback lookup。多个 fast-cache miss 可以增加等待延迟，
-  但必须公平地得到查询机会。Fallback 命中数据可直接用于当前 FE 请求或回填 fast
-  cache；无论采用哪种方式，都不得因另一路 writeback 覆盖 fast cache 而丢失结果。
-
-  target_seq_tag 由当前 seq_tag 减 dep_offset 得到；target_residue
-  由当前 seq_residue 减 dep_offset 并按模 8 回绕得到，也可直接使用
-  target_seq_tag[2:0]。dep_offset = 7 时，target_residue 是当前
-  seq_residue 加 1 后的模 8 结果。
+  target_seq_tag由当前seq_tag减dep_offset得到。Active ROB索引和history bank索引均
+  从target_seq_tag低位派生，但只有完整SEQ_W位tag匹配才能确认目标身份。同一结果
+  被多个请求引用时允许一次读取后广播给多个FE。
 
   报文装入顶层输出寄存器时视为从 ROB 退休。退休沿同时将该报文的 fe_out_data
-  写入 result_bank[seq_residue]，随后释放 ROB entry。由于退休严格按 seq 顺序，
+  写入 history[seq_tag[2:0]]，随后释放 ROB entry。由于退休严格按 seq 顺序，
   当 R+8 退休并覆盖 R 所在 bank 时，所有可能依赖 R 的报文 R+1..R+7 均已退休，
   因此覆盖是安全的。
 
@@ -243,13 +238,17 @@ ROB_DEPTH 必须满足 ROB_DEPTH >= N，保证任意一个 N 路全 valid 的输
 ================================================================================
 
 PPE 在满足以下全部条件时将报文派发至 FE：
-  1) dep_offset = 0，或其依赖结果已在 ROB/result bank 中有效；
+  1) dep_offset = 0，或其依赖结果已在active ROB/history中有效；
   2) 至少一个 FE 在该请求的目标返回周期没有已经预约的返回。
 
 每周期最大派发数 ISSUE_WIDTH 的合法范围为 1..FE_NUM，由微架构选择。调度策略
 不要求每周期占满全部无冲突 FE，但必须保证持续处于可派发状态的报文最终能够进入
 FE，不得产生永久饥饿。FE 可用性只由本周期输入端口是否已经使用以及目标返回周期
 是否已经预约决定，不得因该 FE 存在其他在途请求而将其整体标记为不可用。
+
+调度器不得把相同 delay 的报文人为限制为每周期最多派发一个；当多个相同 delay
+报文可分别使用不同 FE 且目标返回周期均无冲突时，允许同周期派发多个。依赖尚未
+满足的报文不得阻塞其他已经满足依赖的报文参与调度。
 
 调度器必须在请求进入 FE 前为其返回事件保存完整的报文关联信息。请求在 cycle n
 进入 FE 且 delay=d 时，其关联信息必须唯一对应 cycle n+d+1 的该 FE 返回端口。
@@ -393,8 +392,9 @@ FE 接口协议；ROB/tag/writeback 等内部一致性错误由验证侧 asserti
   9) bkps 拉高时所有输入 lane 统一停止。
   10) 单个 FE 支持多 inflight；每周期最多接收一个请求，且所有在途请求的目标
       返回周期必须互不冲突。
-  11) fe_out_data 返回时先写 ROB，并可同时更新 dispatch fast cache；报文退休时再
-      写入对应的 8-bank 权威已退休结果缓存。
+  11) fe_out_data返回时只写ROB；只有报文退休时才写入对应的8-bank权威已退休
+      history。依赖读取按completion bypass、retirement bypass、active ROB、history
+      的优先级解析，并始终比较完整tag。
   12) 复位异步生效、同步释放，并同时取消 PPE 与全部 FE 的在途事务。
   13) 顶层输入必须先寄存再参与内部处理，不允许从顶层输入组合直通 FE 或输出。
   14) 所有顶层输出 data/valid 必须由寄存器驱动，不允许内部状态组合直通端口。
