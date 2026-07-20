@@ -8,7 +8,8 @@
 //
 // Description :
 //   Owns all in-flight ordering and result state. The block allocates ROB
-//   entries in dense input order, accepts tagged FE completions, resolves
+//   entries from the registered ingress FIFO head, accepts tagged FE
+//   completions, resolves
 //   dependencies from authoritative storage, and emits a dense in-order
 //   retirement prefix.
 //
@@ -35,16 +36,12 @@ module ppe_rob #(
     input  logic                                           clk_i,
     input  logic                                           rst_ni,
 
-    // Raw top-level demand, used only by the capacity calculation. These
-    // valids are deliberately not qualified by bkps_o.
-    input  logic [ppe_types_pkg::N-1:0]                    input_valid_i,
-    output logic                                           bkps_o,
-
-    // Accepted allocation event from ingress. Each local physical index is
-    // derived from the complete sequence tag; no allocation-ID response exists.
-    input  logic [ppe_types_pkg::N-1:0]                    alloc_valid_i,
+    // Registered FIFO-head request from ingress. alloc_ready_o accepts or
+    // stalls the complete batch; allocation is never accepted per lane.
+    input  logic [ppe_types_pkg::N-1:0]                    alloc_req_valid_i,
     input  logic [ppe_types_pkg::N-1:0]
                  [ppe_types_pkg::SEQ_W-1:0]                alloc_seq_tag_i,
+    output logic                                           alloc_ready_o,
 
     // D0 dependency-status queries. "available" means that result data can be
     // obtained now; it is neither handshake ready nor a tag-only hit.
@@ -124,7 +121,7 @@ module ppe_rob #(
     rob_id_t                head_ptr_q;
     logic [OCCUPANCY_W-1:0] occupancy_q;
 
-    lane_count_t input_count;
+    lane_count_t request_count;
     lane_count_t alloc_count;
     lane_count_t retire_count;
 
@@ -137,24 +134,31 @@ module ppe_rob #(
     logic [N-1:0][ROB_ID_W-1:0] alloc_rob_id;
     logic [N-1:0][ROB_ID_W-1:0] retire_rob_id;
     logic [N-1:0][SEQ_W-1:0]    retire_seq_tag;
+    logic [N-1:0]               alloc_fire;
 
     //--------------------------------------------------------------------------
-    // Local allocation indices and raw input demand
+    // Local allocation request decode
     //--------------------------------------------------------------------------
 
     always_comb begin
-        input_count    = '0;
-        alloc_count    = '0;
+        request_count  = '0;
         alloc_rob_id   = '0;
 
         for (int unsigned lane_idx = 0; lane_idx < N; lane_idx++) begin
-            if (input_valid_i[lane_idx]) begin
-                input_count = input_count + lane_count_t'(1);
-            end
-
-            if (alloc_valid_i[lane_idx]) begin
+            if (alloc_req_valid_i[lane_idx]) begin
+                request_count = request_count + lane_count_t'(1);
                 alloc_rob_id[lane_idx] = rob_id_t'(
                     alloc_seq_tag_i[lane_idx][ROB_ID_W-1:0]);
+            end
+        end
+    end
+
+    assign alloc_fire = alloc_req_valid_i & {N{alloc_ready_o}};
+
+    always_comb begin
+        alloc_count = '0;
+        for (int unsigned lane_idx = 0; lane_idx < N; lane_idx++) begin
+            if (alloc_fire[lane_idx]) begin
                 alloc_count = alloc_count + lane_count_t'(1);
             end
         end
@@ -215,17 +219,19 @@ module ppe_rob #(
     end
 
     //--------------------------------------------------------------------------
-    // Global backpressure
+    // Registered-head allocation capacity
     //--------------------------------------------------------------------------
 
     always_comb begin
         free_count      = OCCUPANCY_W'(ROB_DEPTH) - occupancy_q;
         available_count = free_count + OCCUPANCY_W'(retire_count);
 
-        // Reset only gates admission. Entry and history valids are cleared by
-        // the sequential reset rather than broadcasting reset over datapaths.
-        bkps_o = !rst_ni
-                 || (available_count < OCCUPANCY_W'(input_count));
+        // This is an internal request-dependent permission, not a PPE output.
+        // The ingress request is zero while its FIFO is empty or in reset, so
+        // reset need not be broadcast into this combinational capacity path.
+        alloc_ready_o = (request_count != '0)
+                        && (available_count
+                            >= OCCUPANCY_W'(request_count));
     end
 
     //--------------------------------------------------------------------------
@@ -414,7 +420,7 @@ module ppe_rob #(
 
             // A0: allocation is the final writer for same-edge slot reuse.
             for (int unsigned alloc_idx = 0; alloc_idx < N; alloc_idx++) begin
-                if (alloc_valid_i[alloc_idx]) begin
+                if (alloc_fire[alloc_idx]) begin
                     rob_valid_q[alloc_rob_id[alloc_idx]] <= 1'b1;
                     rob_seq_tag_q[alloc_rob_id[alloc_idx]] <=
                         alloc_seq_tag_i[alloc_idx];

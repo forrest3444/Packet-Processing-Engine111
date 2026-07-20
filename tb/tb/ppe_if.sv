@@ -8,7 +8,10 @@
 `define PPE_IF_SV
 
 interface ppe_if #(
-    parameter int PACKET_W = 128
+    parameter int PACKET_W    = 128,
+    parameter int DBG_SEQ_W   = 5,
+    parameter int DBG_ROB_ID_W = 4,
+    parameter int DBG_OCC_W   = 5
 ) (
     input logic clk,
     input logic rst_n
@@ -39,24 +42,24 @@ interface ppe_if #(
 
     // Verification-only visibility for directed and performance checks.
     logic [3:0]           dbg_wb_valid;
-    logic [19:0]          dbg_wb_seq_tag;
+    logic [(4*DBG_SEQ_W)-1:0] dbg_wb_seq_tag;
     logic                 dbg_fallback_valid;
     logic                 dbg_fallback_ready;
     logic                 dbg_fallback_from_d3;
-    logic [4:0]           dbg_fallback_seq_tag;
-    logic [3:0]           dbg_fallback_rob_id;
+    logic [DBG_SEQ_W-1:0] dbg_fallback_seq_tag;
+    logic [DBG_ROB_ID_W-1:0] dbg_fallback_rob_id;
     logic [2:0]           dbg_fallback_residue;
     logic                 dbg_cache0_valid;
-    logic [4:0]           dbg_cache0_seq_tag;
+    logic [DBG_SEQ_W-1:0] dbg_cache0_seq_tag;
     logic [2:0]           dbg_entry1_state;
     logic                 dbg_rob0_valid;
-    logic [4:0]           dbg_rob0_seq_tag;
+    logic [DBG_SEQ_W-1:0] dbg_rob0_seq_tag;
     logic                 dbg_result0_valid;
-    logic [4:0]           dbg_result0_seq_tag;
-    logic [3:0]           dbg_head_ptr;
+    logic [DBG_SEQ_W-1:0] dbg_result0_seq_tag;
+    logic [DBG_ROB_ID_W-1:0] dbg_head_ptr;
     logic                 dbg_fallback_lookup_hit;
     logic [3:0]           dbg_fe_in_valid;
-    logic [4:0]           dbg_rob_occupancy;
+    logic [DBG_OCC_W-1:0] dbg_rob_occupancy;
 
     logic                 fe_probe_in_valid;
     logic [PACKET_W-1:0]  fe_probe_in_data;

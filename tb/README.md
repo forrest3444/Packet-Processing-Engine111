@@ -55,3 +55,38 @@ Functional regression uses seeds `1 23` by default. Override them with
 Each test/case gets a unique directory under `sim/run`. Regression summaries
 are written below `sim/regression/<target>/`, with performance metrics collected
 in `performance_metrics.log`.
+
+## SystemVerilog DUT with the shared UVM environment
+
+The new `rtl-sv` implementation uses a separate UVM top and filelist while
+reusing the existing interface, agents, sequences, scoreboard, and tests. The
+legacy `tb_top` is unchanged.
+
+```sh
+make elab FILELIST=./script/filelist_sv.f TB_TOP=tb_top_sv BUILD_NAME=sv
+make run  FILELIST=./script/filelist_sv.f TB_TOP=tb_top_sv BUILD_NAME=sv \
+  TESTNAME=ppe_basic_test SEED=1 RUN_TAG=sv_basic_seed_1
+```
+
+The ROB32 saturation and wraparound test is:
+
+```sh
+make run FILELIST=./script/filelist_sv.f TB_TOP=tb_top_sv BUILD_NAME=sv \
+  TESTNAME=ppe_rob32_wrap_test SEED=1 RUN_TAG=sv_rob32_wrap_seed_1
+```
+
+## Registered top-level boundary verification
+
+The `rtl-sv` implementation must add checks for the registered external-interface
+contract before it replaces the current bring-up RTL:
+
+- raw input changes must not affect allocation, scheduling, or any top-level
+  output until after an input-capture clock edge;
+- except for asynchronous reset assertion, `bkps`, `out_valid`, and `out_packet`
+  may change only after a clock edge and must remain stable between edges;
+- maximum-width traffic must not overflow, drop, duplicate, or partially accept
+  a batch while registered `bkps` is taking effect;
+- FIFO-full/empty, simultaneous enqueue/dequeue, ROB-full with retirement, and
+  reset assertion/release cases must be covered;
+- sustained four-wide retirement and allocation must demonstrate that the skid
+  FIFO does not introduce avoidable steady-state bubbles.

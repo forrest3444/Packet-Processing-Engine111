@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// Directed sequence for cache overwrite after dependency wakeup.
+// Directed sequence for authoritative retired-history timing.
 // -----------------------------------------------------------------------------
 
 `ifndef PPE_DEP_LOSS_SEQ_SV
@@ -35,7 +35,8 @@ class ppe_dep_loss_seq extends uvm_sequence #(ppe_item);
         tr.desc   = '{5'b100_00, 5'b101_00, 5'b110_00, 5'b111_00};
         finish_item(tr);
 
-        // S8 shares cache residue 0 with S0 and returns one cycle after S0.
+        // S8 shares history bank 0 with S0 and returns after S0. Its completion
+        // must not overwrite the bank; only its later retirement may do so.
         tr = ppe_item::type_id::create("s8_cache_overwriter");
         start_item(tr);
         tr.valid  = '{1'b1, 1'b0, 1'b0, 1'b0};

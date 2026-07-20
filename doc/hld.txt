@@ -20,9 +20,9 @@ PPE High-Level Design
 PPE按状态所有权划分为以下主要逻辑模块：
 
   1) ppe_top：顶层集成及FE阵列例化；
-  2) ppe_ingress：输入接收、报文序分配、依赖目标预计算和allocation bundle生成；
+  2) ppe_ingress：输入skid FIFO、寄存bkps、报文序分配、依赖目标预计算和allocation bundle生成；
   3) scheduler：issue table、依赖等待、候选选择、FE匹配、operand gather和返回日历；
-  4) backend：ROB、FE写回、依赖结果解析、保序退休、history和全局反压。
+  4) backend：ROB、FE写回、依赖结果解析、保序退休、history和内部allocation容量判断。
 
 SystemVerilog实现可将scheduler和backend中的状态所有者、纯组合选择器进一步拆为独立
 文件，但不得因此形成多模块共同写同一状态数组。具体文件和接口在LLD中定义。
@@ -33,9 +33,9 @@ SystemVerilog实现可将scheduler和backend中的状态所有者、纯组合选
   FE_NUM       = 4
   MAX_DEP      = 7
   ISSUE_WIDTH  = 4
-  ROB_DEPTH    = 16
-  ROB_ID_W     = 4
-  SEQ_W        = 5
+  ROB_DEPTH    = 32
+  ROB_ID_W     = 5
+  SEQ_W        = 6
   RTL_LANGUAGE = SystemVerilog
 
 新架构可综合RTL位于rtl-sv目录，使用.sv文件和可综合SystemVerilog语法。现有rtl目录
@@ -64,7 +64,7 @@ SystemVerilog实现可将scheduler和backend中的状态所有者、纯组合选
   |       v                                                                |
   |  +-------------+      +---------------------------+                    |
   |  | ppe_ingress |----->|         scheduler         |                    |
-  |  | rank / seq  |      | issue / wakeup / matching |                    |
+  |  | skid/bkps   |      | issue / wakeup / matching |                    |
   |  +------+------+      | gather / return calendar  |                    |
   |         |             +-------------+-------------+                    |
   |         | allocation metadata       | FE requests                      |
@@ -78,7 +78,8 @@ SystemVerilog实现可将scheduler和backend中的状态所有者、纯组合选
   |  |       active results / bypasses / 8-bank retired history        |  |
   |  |  retire_output: lane mapping / registers / start-lane rotation  |  |
   |  +---------------------------+--------------------------------------+  |
-  |                              +--> bkps / output                        |
+  |                              +--> allocation ready / output             |
+  |  ingress registered bkps ------------------------------------------->  |
   +------------------------------------------------------------------------+
 
 主数据流：
@@ -87,9 +88,10 @@ SystemVerilog实现可将scheduler和backend中的状态所有者、纯组合选
 
 主要控制回馈：
 
-  Backend -> Scheduler：ROB分配ID、依赖满足状态、依赖结果数据和retirement事件
-  Backend -> Top/Input：全局bkps
-  Top -> Backend：未经bkps门控的原始in_valid，仅用于容量查询
+  Backend -> Ingress：基于注册请求批次的内部allocation ready
+  Ingress -> Top/Input：寄存全局bkps
+  Top Input -> Ingress：仅连接输入捕获寄存器
+  Backend -> Scheduler：依赖满足状态、依赖结果数据和retirement事件
   Scheduler -> Backend：分配metadata、依赖目标请求和FE writeback关联信息
 
 ================================================================================
@@ -113,13 +115,16 @@ ppe_top 不保存报文级状态，不参与报文序、依赖或保序决策。
 
 ppe_ingress负责：
 
-  - 顶层输入批次准入和输入寄存器边界；
+  - 顶层输入批次准入、两项整批输入skid FIFO和唯一输入寄存器边界；
+  - 生成并保存寄存全局bkps；
   - 有效lane rank计算和密集seq tag分配；
   - 从完整seq tag预计算target seq tag；
   - 将输入descriptor解码为delay和dep_required语义字段；
-  - 向issue table和ROB形成同一allocation事件的valid和seq metadata。
+  - 向ROB形成寄存head request/metadata，并向issue table形成同一被接受allocation
+    事件的valid和seq metadata。
 
-ppe_ingress只拥有next_seq_tag。它不拥有ROB容量、等待状态、依赖结果或FE调度状态。
+ppe_ingress拥有两项输入批次FIFO、bkps寄存器和next_seq_tag。它不拥有ROB容量、等待
+状态、依赖结果或FE调度状态。
 完整seq tag是allocation的唯一跨模块身份；issue table和backend分别从其低位派生本地
 物理索引。History bank索引直接从完整seq tag低3位派生，ingress不产生、不输出独立
 ROB ID或residue字段。
@@ -138,7 +143,7 @@ scheduler管理尚未进入FE的报文，负责：
 Scheduler只拥有报文进入FE之前的调度状态。报文成功进入FE后，长期顺序和输出
 状态继续由backend ROB保存。
 
-其中ppe_issue_table同时拥有16项issue entry、4个delay-class ID FIFO、独立queued
+其中ppe_issue_table同时拥有32项issue entry、4个delay-class ID FIFO、独立queued
 标志和READY发现轮询指针。它向ppe_fe_scheduler提供每类最多4项的寄存器化队首窗口；
 packet宽数据不进入候选接口，仅在D3按已选seq tag低位从ppe_issue_table读取。
 
@@ -161,7 +166,7 @@ ppe_rob是全局顺序、结果和容量状态的唯一所有者，负责：
   - FE completion 写回；
   - completion bypass、retirement bypass、active ROB和retired history四级依赖解析；
   - 8-bank已退休history生命周期管理；
-  - ROB 容量相关的全局 bkps。
+  - 根据注册的输入FIFO头批次和本周期退休前缀生成内部allocation ready。
 
 ppe_rob不保存物理输出lane状态，也不直接驱动顶层输出寄存器。它向ppe_retire_output输出
 按报文序排列、从slot 0开始无空洞的逻辑retirement bundle。
@@ -184,10 +189,11 @@ ppe_top分别例化并连接两者。该拆分不增加ready或额外流水级�
 
 4.1 输入接收
 
-当bkps允许接收时，ingress对当前所有有效lane分配全局顺序并形成allocation metadata；
-Issue table和backend在同一接收沿捕获该metadata，并分别使用alloc_seq_tag低位索引
-本地entry。完整descriptor不离开ingress；scheduler只接收delay和dep_required。一次输入周期必须整体
-接收或整体停止，禁止部分lane接收。
+当寄存bkps允许接收时，ingress只把当前所有lane的valid、packet和descriptor捕获到
+两项整批输入FIFO，不在该沿执行sequence allocation或ROB容量计算。FIFO保持批次顺序，
+其寄存head批次获得backend内部allocation ready后，ingress才计算密集seq tag和dependency
+target，并在同一内部allocation沿送入Issue Table和ROB。完整descriptor不离开ingress；
+scheduler只接收delay和dep_required。一次输入周期必须整体接收或整体停止，禁止部分lane接收。
 
 4.2 依赖处理
 
@@ -195,8 +201,8 @@ Issue table和backend在同一接收沿捕获该metadata，并分别使用alloc_
 提供的依赖满足状态；目标结果尚未完成时进入ISSUE_WAIT_DEP，已经完成时进入ISSUE_READY。
 初始化查询只读取小位宽valid/tag/result_valid状态，不复制128 bit依赖数据。
 
-输入协议保证dep_offset不超出本次复位后已经建立的历史范围。Ingress直接使用原始
-dep_offset预计算依赖目标，不保存历史计数器，也不检测或降级非法依赖。
+输入协议保证dep_offset不超出本次复位后已经建立的历史范围。Ingress使用输入FIFO
+寄存head中保存的dep_offset预计算依赖目标，不保存历史计数器，也不检测或降级非法依赖。
 
 Scheduler维护小位宽dependency状态，FE completion tag用于唤醒ISSUE_WAIT_DEP报文。
 Completion bypass允许同一接收沿的新entry或等待entry识别该completion，但被唤醒报文
@@ -247,12 +253,16 @@ ppe_rob从ROB head开始退休最多4个连续DONE报文，并向ppe_retire_outp
 
 4.6 全局反压
 
-backend根据ROB沿前空闲容量与本周期连续DONE退休数量生成bkps，允许新输入
-在同一上升沿复用退休释放的空间。这样可消除满 ROB 边界的保守停顿，并保持满载基线
-连续接收。代价是 done-prefix 检查进入 bkps 控制路径；该路径只包含有效位、结果有效
-位、计数和比较，不引入 packet 宽数据路径。
-ppe_top将原始in_valid直接连接到backend的容量查询输入；backend不使用已经bkps
-门控的allocation valid反推当前输入需求。
+bkps由ingress寄存器直接驱动，任何原始顶层输入或ROB状态均不得组合直通该端口。
+两项整批输入FIFO中的第一项满足强制输入寄存边界，第二项吸收寄存反压生效前可能继续
+到达的一批最大宽度输入。bkps next-state只根据已寄存FIFO占用、当前bkps状态和FIFO head
+是否将在本沿获得内部allocation ready计算；不读取当前原始in_valid。
+
+Backend仍根据ROB沿前空闲容量与本周期连续DONE退休数量，对FIFO中已经寄存的head批次
+产生精确内部allocation ready。因此内部allocation仍可在同一上升沿复用退休空间，且当
+ROB持续每周期退休4项、FIFO持续非空时，可保持4-wide内部allocation和外部连续接收。
+相较仅保留一项输入寄存器并按最坏情况预留ROB credit，该方案增加一批宽数据skid存储，
+但避免满载附近的周期性保守停顿，是首版性能/面积/控制复杂度的基线折中。
 
 同址 retirement 与 allocation 可以在同一上升沿发生。retirement 使用沿前 ROB
 内容产生输出并更新retired history，allocation对沿后ROB entry状态具有优先权，
@@ -264,10 +274,13 @@ ppe_top将原始in_valid直接连接到backend的容量查询输入；backend不
 
 5.1 Ingress与Scheduler主流水
 
-输入到FE发射划分为三个寄存边界阶段，并包含一条并行依赖事件通路：
+输入到FE发射划分为四个寄存边界阶段，并包含一条并行依赖事件通路：
+
+  I0：External Input Capture
+      在寄存bkps允许时将完整输入批次写入两项skid FIFO；不执行功能解析。
 
   D0：Input Admission / Allocation
-      输入捕获、顺序分配、依赖目标预计算和 ROB allocation。
+      对FIFO寄存head执行顺序分配、依赖目标预计算和ROB/issue-table allocation。
 
   D2：Packet Select / FE Select
       从4个delay分类队列的队首窗口完成最多4个报文、目标返回周期和FE选择，写入
@@ -325,8 +338,10 @@ A0、G0、W0和R0可以在同周期处理不同ROB entry。它们共享的ROB状
 6.3 D3 宽数据路径
 
 D3正常路径包含issue-table packet选择、最多4路active ROB/history权威依赖读取以及
-4路FE数据路由。每路active ROB读取由target seq tag低ROB_ID_W位直接索引并比较完整
-tag；history由target seq tag低3位索引并比较完整tag。该宽mux可能成为关键路径。
+4路FE数据路由。每路issue packet和active ROB读取均由完整tag低ROB_ID_W位在32项数组中
+直接索引，综合后分别等价于32:1的128 bit宽选择；active ROB读取还必须比较完整tag。
+history由target seq tag低3位索引并比较完整tag。这些宽mux可能成为关键路径，ROB扩深
+带来的吞吐收益必须与其时序代价一并评估。
 
 6.4 G0多路依赖读取
 
@@ -369,8 +384,10 @@ R0需要完成连续DONE检查、最多4路数据选择、输出旋转和history
   5) dependency gather按四级优先级支持最多4路读取，不在issue entry中复制宽依赖；
   6) R0使用单级退休并直接更新顶层输出寄存器；
   7) 不定义可综合的异常上报、恢复或全局锁死状态，内部一致性由验证侧检查。
-  8) scheduler使用4个深度16的delay分类READY ID FIFO；每类队首最多4项可同周期消费，
-     FIFO只保存4 bit issue ID，宽报文数据不复制。
+  8) scheduler使用4个深度32的delay分类READY ID FIFO；每类队首最多4项可同周期消费，
+     FIFO只保存5 bit issue ID，宽报文数据不复制。
+  9) ingress使用两项整批输入skid FIFO并寄存输出bkps；原始顶层输入不进入任何功能
+     组合路径，backend只对FIFO寄存head提供内部allocation ready。
 
 上述项目只有在后续时序或性能数据证明有必要时才重新评估。变更任一项都必须先同步
 HLD和LLD，不得在RTL中自行启用。
@@ -383,7 +400,7 @@ HLD中展开，统一维护在doc/lld.txt。
 ================================================================================
 
   1) backend是ROB allocation、retirement和occupancy的唯一所有者。
-  2) ingress只拥有next_seq_tag，scheduler只管理尚未进入FE的调度状态。
+  2) ingress拥有输入skid FIFO、寄存bkps和next_seq_tag，scheduler只管理尚未进入FE的调度状态。
   3) FE completion只写active ROB并形成bypass/wakeup事件，不写retired history。
   4) 报文装入顶层输出寄存器时视为退休，并同步更新retired history。
   5) 依赖解析严格按completion bypass、retirement bypass、active ROB、history排序。
@@ -391,4 +408,5 @@ HLD中展开，统一维护在doc/lld.txt。
   7) 所有依赖查询必须检查完整seq tag，bank低位索引不得单独作为命中。
   8) Packet和FE仲裁不得产生永久饥饿。
   9) 全局反压禁止部分接收一个多lane输入周期。
-  10) 顶层输入先寄存再处理，顶层输出只能由寄存器驱动。
+  10) 除clk/rst_n外，顶层输入只能驱动ingress输入捕获寄存器；所有顶层输出包括bkps
+      均只能由寄存器直接驱动。

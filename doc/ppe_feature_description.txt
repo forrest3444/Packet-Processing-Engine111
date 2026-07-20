@@ -74,14 +74,19 @@ FE 为黑盒处理单元，其内部算法不属于本规格范围。
 
 2.3 顶层寄存器边界
 
-  输入必须经过寄存器打拍。当 bkps = 0 时，PPE 在接收沿将所有有效 lane 的
-  in_valid_i、in_packet_i 和 in_desc_i 对应信息捕获到内部寄存器；后续报文序
-  分配、ROB 管理及 FE 调度均基于寄存后的信息。顶层输入不得通过组合路径直接
-  驱动 FE 输入或顶层输出。被接收的报文最早从下一周期开始参与 FE 派发。
+  除clk和rst_n外，PPE面向外部环境的所有输入端口必须先由寄存器捕获，后续功能
+  逻辑只能使用寄存后的副本。原始in_valid_i、in_packet_i和in_desc_i不得组合参与
+  sequence allocation、descriptor解析、ROB容量判断、调度、退休或任何顶层输出
+  next-state计算。输入端口允许直接连接的唯一功能状态是其输入捕获寄存器。
 
-  顶层输出必须为寄存器输出。所有 out_valid_i 和 out_packet_i 均只能由输出
-  寄存器驱动，只允许在 clk 上升沿后更新，并在两个相邻上升沿之间保持稳定。
-  ROB 状态、FE 返回及内部选择逻辑不得通过组合路径直接驱动顶层输出端口。
+  PPE面向外部环境的所有输出端口必须由寄存器直接驱动，包括out_valid_o、
+  out_packet_o以及全局反压bkps。任何内部状态、输入端口或组合选择结果均不得组合
+  直通顶层输出。除异步复位断言使输出寄存器进入规定复位值外，所有输出只允许在
+  clk有效沿后更新，并在相邻有效沿之间保持稳定；复位释放仍为同步行为。
+
+  因此PPE顶层不得存在普通输入到普通输出的组合路径。当寄存bkps尚未生效时，PPE
+  必须通过内部已预留容量吸收所有可能到达的最大宽度输入批次，不得丢包或部分接收。
+  被外部接收的报文最早从下一周期开始参与sequence allocation和后续处理。
 
   上述寄存器要求仅约束 PPE 顶层输入和输出边界，不约束内部 FE 接口。
   fe_in_* 可由已寄存的输入信息、ROB 状态及调度逻辑组合产生；fe_out_* 到 PPE
@@ -99,7 +104,7 @@ PPE 自主分配全局报文序，不依赖输入数据中的任何字段。
   b) 同周期内，lane 编号递增分配。即 lane 编号较小的报文获得较小的报文序。
 
 示例：当前全局计数器基值为 G，某周期 bkps = 0，且 lane0、lane2、lane3 同时
-valid：
+valid；该寄存批次后续获得内部allocation许可时：
   lane0 → seq = G
   lane2 → seq = G + 1
   lane3 → seq = G + 2
@@ -112,6 +117,7 @@ valid：
 推荐按以下方式使用有限位宽的模计数器：
 
   MAX_DEP = 7
+  ROB_DEPTH = 32
   SEQ_W  = $clog2(ROB_DEPTH + MAX_DEP)
 
 RTL seq 按 2^SEQ_W 回绕。严格输出顺序由 ROB 的 head 指针和有效entry状态维护，不得使用普通
@@ -135,30 +141,27 @@ seq_tag回绕模数是8的整数倍，因此不需要维护或存储独立推进
 
 PPE 以全局反压信号 bkps 统一控制所有输入 lane。
 
-  bkps = 0：接收当前周期所有 valid 为 1 的 lane 上的报文，并为这些报文分配 seq。
+  bkps = 0：将当前周期所有 valid 为 1 的 lane 作为一个批次捕获到输入寄存缓冲。
   bkps = 1：所有 lane 同时停止接收。上游必须保持各 lane 的 in_valid_i、
             in_packet_i 和 in_desc_i 稳定，直至 bkps 拉低且报文被接收。
 
-bkps 不支持 per-lane 独立反压。bkps 仅由 ROB 容量不足产生：ROB 沿前空闲条目数
-与本周期可退休条目数之和小于当前 valid 输入数时拉高。首版 RTL 不定义内部异常
-锁死状态。
+bkps 不支持 per-lane 独立反压。bkps 表示输入寄存缓冲是否已经为下一接收沿的完整
+N-lane批次预留空间；该空间能否及时释放最终受ROB可分配容量和内部排空能力约束。
+首版 RTL 不定义内部异常锁死状态。
 
-ROB_DEPTH 必须满足 ROB_DEPTH >= N，保证任意一个 N 路全 valid 的输入批次最终
-能够被整体接收。输入接收沿可直接将 packet、descriptor 和 seq_tag
-写入新分配的 ROB entry；该 ROB 写入本身满足顶层输入寄存器打拍要求，不强制增加
-独立 input FIFO。
+ROB_DEPTH 必须满足 ROB_DEPTH >= N，保证任意一个 N 路全 valid 的输入批次最终能够
+被整体处理。外部接收沿只把lane valid、packet和descriptor捕获到输入缓冲；sequence
+allocation、descriptor解析及ROB/issue-table allocation只能基于缓冲中的寄存数据。
 
-当前首版基线中 bkps 为组合输出：
-
-  input_count = popcount(in_valid[0:N-1])
-  retire_count = 从 ROB head 开始、本周期沿前已经 DONE 的连续报文数
-  rob_available_count = rob_free_count + retire_count
-  bkps = !internal_rst_n || (rob_available_count < input_count)
+bkps是寄存输出，复位时置1。bkps next-state只能使用已寄存的输入缓冲状态和内部容量
+状态，不得读取当前原始in_valid。bkps=0表示PPE已经为下一接收沿可能出现的任意合法
+N-lane批次预留了完整缓冲容量。由于反压存在寄存反馈延迟，实现必须至少能额外吸收
+一批最大宽度输入；具体缓冲组织由HLD定义。
 
 允许输入批次在同一上升沿复用本周期退休释放的 ROB 条目。若allocation seq_tag低位
 索引与退休条目物理索引相同，退休输出、依赖history更新必须读取该沿之前的旧entry内容，
-该沿之后 entry 保存新 allocation 的 metadata 且 result 尚未有效。该定义消除 ROB
-满载边界的保守反压气泡，但形成从 ROB DONE 前缀检查到 bkps 的组合控制路径。
+该沿之后 entry 保存新 allocation 的 metadata 且 result 尚未有效。该复用只影响内部
+input-buffer到ROB的allocation，不得形成ROB DONE状态到顶层bkps的组合路径。
 
 ================================================================================
 5. 描述符
@@ -396,6 +399,7 @@ FE 接口协议；ROB/tag/writeback 等内部一致性错误由验证侧 asserti
       history。依赖读取按completion bypass、retirement bypass、active ROB、history
       的优先级解析，并始终比较完整tag。
   12) 复位异步生效、同步释放，并同时取消 PPE 与全部 FE 的在途事务。
-  13) 顶层输入必须先寄存再参与内部处理，不允许从顶层输入组合直通 FE 或输出。
-  14) 所有顶层输出 data/valid 必须由寄存器驱动，不允许内部状态组合直通端口。
+  13) 除clk/rst_n外，所有顶层输入必须先寄存再参与任何功能处理；原始输入只能驱动
+      输入捕获寄存器，不允许参与bkps或其他顶层输出的组合next-state逻辑。
+  14) 所有顶层输出data、valid和bkps必须由寄存器直接驱动，不允许组合逻辑直通端口。
       该寄存器边界要求不适用于内部 fe_in_* 和 fe_out_* 接口。

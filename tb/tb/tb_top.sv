@@ -16,7 +16,7 @@ module tb_top;
     logic clk;
     logic rst_n;
 
-    ppe_if #(PACKET_W) pif (
+    ppe_if #(PACKET_W, TB_SEQ_W, TB_ROB_ID_W, TB_OCC_W) pif (
         .clk   (clk),
         .rst_n (rst_n)
     );

@@ -43,9 +43,9 @@ module ppe_issue_table #(
     input  logic                                           clk_i,
     input  logic                                           rst_ni,
 
-    // D0 allocation bundle. Lane positions remain physical input-lane indices.
-    // The physical issue-entry index is derived from the complete sequence tag.
-    input  logic [ppe_types_pkg::N-1:0]                    alloc_valid_i,
+    // Accepted D0 allocation event. The ROB has already accepted every valid
+    // lane; the physical issue index is derived from the complete sequence tag.
+    input  logic [ppe_types_pkg::N-1:0]                    issue_alloc_valid_i,
     input  logic [ppe_types_pkg::N-1:0]
                  [ppe_types_pkg::SEQ_W-1:0]                alloc_seq_tag_i,
     input  logic [ppe_types_pkg::N-1:0]
@@ -174,7 +174,7 @@ module ppe_issue_table #(
         dep_status_target_seq_tag_o = '0;
 
         for (int unsigned lane_idx = 0; lane_idx < N; lane_idx++) begin
-            if (alloc_valid_i[lane_idx]
+            if (issue_alloc_valid_i[lane_idx]
                 && alloc_dep_required_i[lane_idx]) begin
                 dep_status_valid_o[lane_idx] = 1'b1;
                 dep_status_target_seq_tag_o[lane_idx] =
@@ -233,7 +233,7 @@ module ppe_issue_table #(
 
             alloc_rob_id = rob_id_t'(
                 alloc_seq_tag_i[lane_idx][ROB_ID_W-1:0]);
-            if (alloc_valid_i[lane_idx]) begin
+            if (issue_alloc_valid_i[lane_idx]) begin
                 alloc_hit[alloc_rob_id] = 1'b1;
                 alloc_delay_by_id[alloc_rob_id] =
                     alloc_delay_i[lane_idx];
@@ -428,7 +428,6 @@ module ppe_issue_table #(
         issue_packet_o              = '0;
         issue_delay_o               = '0;
         issue_dep_required_o        = '0;
-        issue_dep_data_o            = '0;
 
         for (int unsigned fe_idx = 0; fe_idx < FE_NUM; fe_idx++) begin
             rob_id_t selected_rob_id;
@@ -447,14 +446,24 @@ module ppe_issue_table #(
                     dep_gather_valid_o[fe_idx] = 1'b1;
                     dep_gather_target_seq_tag_o[fe_idx] =
                         issue_entry_q[selected_rob_id].target_seq_tag;
-
-                    // data_valid is a legal-operation invariant, not a release
-                    // or rollback condition for an irrevocable selection.
-                    if (dep_gather_data_valid_i[fe_idx]) begin
-                        issue_dep_data_o[fe_idx] =
-                            dep_gather_data_i[fe_idx];
-                    end
                 end
+            end
+        end
+    end
+
+    // Keep gather-response adaptation separate from request generation. This
+    // makes the unidirectional request/response dependency explicit and avoids
+    // presenting the integrated design as a combinational feedback process.
+    always_comb begin
+        issue_dep_data_o = '0;
+
+        for (int unsigned fe_idx = 0; fe_idx < FE_NUM; fe_idx++) begin
+            // data_valid is a legal-operation invariant, not a release or
+            // rollback condition for an irrevocable selection.
+            if (selected_valid_q[fe_idx]
+                && issue_dep_required_o[fe_idx]
+                && dep_gather_data_valid_i[fe_idx]) begin
+                issue_dep_data_o[fe_idx] = dep_gather_data_i[fe_idx];
             end
         end
     end
@@ -527,7 +536,7 @@ module ppe_issue_table #(
 
                 alloc_rob_id = rob_id_t'(
                     alloc_seq_tag_i[lane_idx][ROB_ID_W-1:0]);
-                if (alloc_valid_i[lane_idx]) begin
+                if (issue_alloc_valid_i[lane_idx]) begin
                     if (!alloc_dep_required_i[lane_idx]
                         || dep_status_available_i[lane_idx]) begin
                         issue_entry_q[alloc_rob_id].state <= ISSUE_READY;

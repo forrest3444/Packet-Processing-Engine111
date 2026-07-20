@@ -16,9 +16,9 @@ PPE Low-Level Design
   FE_NUM       = 4
   MAX_DEP      = 7
   ISSUE_WIDTH  = 4
-  ROB_DEPTH    = 16
-  ROB_ID_W     = 4
-  SEQ_W        = 5
+  ROB_DEPTH    = 32
+  ROB_ID_W     = 5
+  SEQ_W        = 6
 
   RESULT_BANKS = 8
   PACKET_W     = 128
@@ -43,15 +43,21 @@ lane/FE通路使用packed array、packed struct或interface表达。状态数组
   |                       ingress / scheduler                                |
   |                                                                          |
   |  +---------------------------+                                           |
-  |  | D0 Input Admission        |<------------------------- bkps            |
-  |  | - valid rank              |                                           |
-  |  | - dense seq tag alloc     |---- alloc metadata -------------------+---|--+
+  |  | I0 Registered Batch FIFO  |--------------------- registered bkps ---->|Top
+  |  | - 2 whole-batch entries   |                                           |
+  |  | - raw input capture only  |                                           |
+  |  +-------------+-------------+                                           |
+  |                | registered FIFO head                                    |
+  |                v                                                         |
+  |  +---------------------------+                                           |
+  |  | D0 Allocation             |<---------------- internal alloc_ready      |
+  |  | - valid rank / dense seq  |---- alloc metadata -------------------+---|--+
   |  | - target tag/state init   |                                           |  |
   |  +-------------+-------------+                                           |  |
   |                | registered issue entry                                 |  |
   |                v                                                         |  |
   |  +---------------------------+       +-------------------------------+   |  |
-  |  | Issue Table [0..15]       |       | Sequence / Control State      |   |  |
+  |  | Issue Table [0..31]       |       | Sequence / Control State      |   |  |
   |  | - packet / seq tag        |       | - next_seq_tag                |   |  |
   |  | - target seq tag          |       | - class_rr_ptr / fe_rr_ptr   |   |  |
   |  | - unified state/queued    |       +-------------------------------+   |  |
@@ -104,7 +110,7 @@ lane/FE通路使用packed array、packed struct或interface表达。状态数组
 2.2 Backend内部架构图
 
                          From ppe_ingress
-                    alloc_valid / seq_tag
+                 alloc_req_valid / seq_tag
                                   |
                                   | Flow R-A：ROB分配
                                   v
@@ -117,7 +123,7 @@ lane/FE通路使用packed array、packed struct或interface表达。状态数组
   |                | metadata writes                                           |
   |                v                                                           |
   |  +-----------------------------------------------------------------------+ |
-  |  |                         ROB [0..15]                                  | |
+  |  |                         ROB [0..31]                                  | |
   |  | valid / seq_tag / result_valid / fe_out_data                        | |
   |  +-------+--------------------------+---------------------------+--------+ |
   |          ^                          |                           |          |
@@ -151,9 +157,9 @@ lane/FE通路使用packed array、packed struct或interface表达。状态数组
   |                                          +-----------------------------+   |
   |                                                                            |
   |  +--------------------------+                                              |
-  |  | Backpressure Generator   |<--- occupancy / free_count / input_valid     |
+  |  | Allocation Capacity      |<--- occupancy / retire_count / alloc request |
   |  +-------------+------------+                                              |
-  |                | bkps                                                       |
+  |                | internal alloc_ready                                      |
   +----------------+-----------------------------------------------------------+
 
   Backend内部四条通路：
@@ -165,8 +171,9 @@ lane/FE通路使用packed array、packed struct或interface表达。状态数组
 
 2.3 典型无依赖报文数据流
 
-  1) D0捕获输入并分配seq，Issue Table和A0从seq低位索引本地entry，同时将无依赖报文标记为
-     ISSUE_READY；
+  1) I0在bkps允许时把外部输入捕获为FIFO中的一个寄存批次；
+  2) D0在内部alloc_ready有效时为FIFO head分配seq，Issue Table和A0从seq低位索引
+     本地entry，并将无依赖报文标记为ISSUE_READY；
   3) D2选择报文和目标FE；
   4) D3读取packet并向FE发出请求，issue entry释放；
   5) FE返回，W0按完整seq tag低位写ROB并设置result_valid；
@@ -175,7 +182,8 @@ lane/FE通路使用packed array、packed struct或interface表达。状态数组
 
 2.4 典型依赖等待数据流
 
-  1) D0捕获依赖报文并预计算完整target seq tag，target ROB/history索引由tag低位导出；
+  1) I0捕获依赖报文，D0从寄存FIFO head分配seq并预计算完整target seq tag，
+     target ROB/history索引由tag低位导出；
   2) D0通过G0查询active ROB/history小位宽状态，并检查同周期completion/retirement
      bypass；ready时进入ISSUE_READY，否则进入ISSUE_WAIT_DEP；
   3) 目标FE返回时，W0写active ROB并以完整tag唤醒ISSUE_WAIT_DEP entry；
@@ -215,7 +223,7 @@ FE内部数据算法对PPE保持黑盒。仓库行为模型只需与验证VIP保
 
 3.1 Issue Entry
 
-Issue table深度为16，以ROB ID作为entry索引，主要数据结构为：
+Issue table深度为32，以ROB ID作为entry索引，主要数据结构为：
 
   typedef enum logic [1:0] {
       ISSUE_FREE,
@@ -245,21 +253,34 @@ queued作为独立于issue_entry_t的FIFO成员资格账本，仅表示READY ent
 唯一一个delay-class FIFO。保留该位是为了支持READY事件超过单周期入队带宽时的后续
 发现；它不改变报文功能状态。target ROB ID固定从target_seq_tag低位派生，不单独保存。
 
-3.2 Sequence State
+3.2 Ingress Input Buffer and Sequence State
+
+Ingress保存两项整批输入skid FIFO：
+
+  input_fifo_lane_valid[2][N]
+  input_fifo_packet[2][N][127:0]
+  input_fifo_desc[2][N][4:0]
+  input_fifo_rd_ptr
+  input_fifo_wr_ptr
+  input_fifo_count[1:0]
+  bkps_q
 
 Ingress维护：
 
-  next_seq_tag[4:0]
+  next_seq_tag[5:0]
 
+外部in_valid/in_packet/in_desc只允许出现在上述FIFO写入寄存器的捕获逻辑中，不得进入
+rank、descriptor decode、ROB容量或bkps next-state组合逻辑。FIFO head的寄存lane valid、
+packet和desc是D0功能处理的唯一输入。宽packet/desc数组在对应slot无效时不要求复位。
 next_seq_tag按2^SEQ_W回绕。不保存独立residue计数器或entry字段。
 
 3.3 Ready Queue and Arbitration State
 
-Scheduler维护4个按desc_delay分类、每类深度16的READY ID FIFO：
+Scheduler维护4个按desc_delay分类、每类深度32的READY ID FIFO：
 
-  ready_q_id[class][0..15][3:0]
-  ready_q_count[class][4:0]
-  enqueue_rr_ptr[3:0]
+  ready_q_id[class][0..31][4:0]
+  ready_q_count[class][5:0]
+  enqueue_rr_ptr[4:0]
   class_rr_ptr[1:0]
 
 FIFO只保存issue entry ID，报文、tag和依赖信息仍只在issue table保存。每类
@@ -276,12 +297,12 @@ class_rr_ptr和fe_rr_ptr由ppe_fe_scheduler保存，并与return calendar预约�
 为每个FE保存一组selected-tag流水寄存器：
 
   selected_valid
-  selected_seq_tag[4:0]
+  selected_seq_tag[5:0]
 
 ppe_fe_scheduler保存共享返回日历：
 
   return_valid[0:31]
-  return_seq_tag[0:31][4:0]
+  return_seq_tag[0:31][5:0]
 
 selected-tag寄存器是D2到D3的单级控制流水。D3从tag低位临时派生issue entry索引，
 并在每个周期消费当前valid issue bundle
@@ -320,10 +341,10 @@ Scheduler不保存非权威依赖数据副本，也不保存fallback或replay状
 
 4.1 ROB Entry
 
-ROB深度为16，每个entry至少包含：
+ROB深度为32，每个entry至少包含：
 
   valid
-  seq_tag[4:0]
+  seq_tag[5:0]
   result_valid / done
   fe_out_data[127:0]
 
@@ -331,21 +352,21 @@ fe_out_data同时作为最终输出数据和依赖结果，不保存两份128 bi
 
 4.2 ROB Global State
 
-  head_ptr[3:0]
-  occupancy[4:0]
+  head_ptr[4:0]
+  occupancy[5:0]
 
   free_count = ROB_DEPTH - occupancy
   available_count = free_count + retire_count
 
-head_ptr按16自然回绕。Allocation物理索引由alloc_seq_tag低位直接产生，不保存tail_ptr。
-occupancy范围为0..16。
+head_ptr按32自然回绕。Allocation物理索引由alloc_seq_tag低位直接产生，不保存tail_ptr。
+occupancy范围为0..32。
 
 4.3 Retired History Bank
 
 共8个bank。每个bank保存：
 
   valid
-  seq_tag[4:0]
+  seq_tag[5:0]
   result_data[127:0]
 
 bank编号直接等于seq_tag[2:0]。不保存独立seq_residue字段；bank命中必须同时检查
@@ -366,33 +387,50 @@ valid和完整seq_tag。
 5. 模块间逻辑接口
 ================================================================================
 
-5.0 Top输入与Backend反压需求
+5.0 Top输入寄存边界与寄存反压
 
-ppe_top将原始顶层in_valid0..3分别直接连接到backend容量查询输入。
-Backend必须使用未经bkps门控的原始in_valid0..3计算input_count，不得使用alloc_valid
-反推input_count，以避免形成bkps组合环。该路径只读取valid，不向backend传递
-packet或descriptor。
+ppe_top将原始顶层in_valid0..3、in_packet0..3和in_desc0..3只连接到ppe_ingress输入
+捕获端口。其他PPE子模块不得读取这些原始端口。ppe_ingress的bkps_o由bkps_q寄存器
+直接驱动，不得由FIFO占用、ROB状态、retire前缀或当前in_valid组合赋值。
 
 Top将外部独立lane端口适配为ingress内部packed array：
 
   in_valid_i[N]
   in_packet_i[N][127:0]
   in_desc_i[N][4:0]
-  bkps_i
+  bkps_o
 
-5.1 Ingress Allocation Bundle
+5.1 Ingress -> ROB/Issue Table：Registered-Head Allocation
 
-Ingress输出保持原始lane索引，不对128 bit packet做物理压缩：
+Ingress对FIFO寄存head保持原始lane索引，不对128 bit packet做物理压缩。送往ROB的
+request接口为：
 
-  alloc_valid_o[N]
+  alloc_req_valid_o[N]
+  alloc_seq_tag_o[N][SEQ_W-1:0]
+  alloc_ready_i
+
+alloc_req_valid是FIFO head保存的lane-valid向量，不受alloc_ready门控；backend据此统计
+寄存请求批次大小并组合返回alloc_ready。ROB内部定义：
+
+  alloc_fire = alloc_req_valid & {N{alloc_ready}}
+
+并只对alloc_fire写入entry，不需要由ingress把accepted valid绕回ROB。送往Issue Table的
+accepted allocation接口为：
+
+  issue_alloc_valid_o[N]
   alloc_seq_tag_o[N][SEQ_W-1:0]
   alloc_target_seq_tag_o[N][SEQ_W-1:0]
   alloc_packet_o[N][127:0]
   alloc_delay_o[N][1:0]
   alloc_dep_required_o[N]
 
-Issue table和backend同时捕获该metadata，并分别从alloc_seq_tag低位派生本地entry
-索引。不存在allocation ROB ID请求/响应或独立residue接口。
+其中：
+
+  issue_alloc_valid = alloc_req_valid & {N{alloc_ready}}
+
+Issue Table只接收issue_alloc_valid。Ingress在
+|alloc_req_valid && alloc_ready时弹出FIFO head并推进next_seq_tag。Issue table和backend
+分别从alloc_seq_tag低位派生本地entry索引。不存在allocation ROB ID请求/响应或独立residue接口。
 完整desc不跨越ingress边界：desc[1:0]解码为alloc_delay，desc[4:2]是否非零解码为
 alloc_dep_required；实际依赖距离已经体现在alloc_target_seq_tag中。
 
@@ -403,7 +441,7 @@ alloc_dep_required；实际依赖距离已经体现在alloc_target_seq_tag中。
 
   alloc_rob_id = alloc_seq_tag[ROB_ID_W-1:0]
 
-该低位切片只作为本地数组索引，不形成端口或持久metadata字段。首版ROB_DEPTH=16且
+该低位切片只作为本地数组索引，不形成端口或持久metadata字段。基线ROB_DEPTH=32且
 seq tag密集分配，因此无需backend向issue table返回allocation ID或accept响应。采用此
 映射时要求ISSUE_DEPTH=ROB_DEPTH=2^ROB_ID_W；非2次幂ROB必须先重新定义物理索引规则。
 
@@ -438,9 +476,9 @@ dependency模块或额外流水边界。
 
 5.4 Issue Table <-> FE Scheduler
 
-ppe_issue_table接收D0 allocation bundle：
+ppe_issue_table接收D0 accepted allocation bundle：
 
-  alloc_valid[N]
+  issue_alloc_valid[N]
   alloc_seq_tag[N][SEQ_W-1:0]
   alloc_target_seq_tag[N][SEQ_W-1:0]
   alloc_packet[N][127:0]
@@ -539,7 +577,7 @@ completion valid/tag同时送Issue Table执行wakeup并送backend执行writeback
 backend的数据接口为：
 
   wb_valid0..3
-  wb_seq_tag0..3[4:0]
+  wb_seq_tag0..3[5:0]
   wb_data0..3[127:0]
 
 其中wb_valid/wb_seq_tag直接使用对应completion事件，wb_data直接来自FE，不经过
@@ -557,7 +595,7 @@ ppe_rob不输出物理lane编号或start_lane。ppe_retire_output不向ppe_rob�
 
 对外接口分别由对应状态所有者驱动：
 
-  ppe_rob          -> bkps
+  ppe_ingress       -> bkps
   ppe_retire_output -> out_valid0..3
   ppe_retire_output -> out_packet0..3[127:0]
 
@@ -569,32 +607,40 @@ ppe_retire_output和四个FE
 的共享低有效复位。各子模块不得再次同步复位或产生独立释放时序。
 
 ================================================================================
-6. Ingress D0：输入接收与分配
+6. Ingress I0/D0：输入捕获与分配
 ================================================================================
 
-6.1 Input Rank
+6.1 I0 External Input Capture
+
+在上升沿且bkps_q=0时，ingress将全部lane的in_valid、in_packet和in_desc写入FIFO write
+slot；仅当|in_valid时增加FIFO count并推进write pointer。该沿不计算rank、seq tag、
+dependency target或ROB容量。bkps_q=1时不修改FIFO写入状态，上游继续保持输入。
+
+6.2 D0 Registered-Head Rank
 
 对于lane i：
 
-  lane_rank[i] = 当前周期lane编号小于i且valid=1的lane数量
+  lane_rank[i] = FIFO head中lane编号小于i且valid=1的lane数量
 
-当bkps=0时：
+对非空FIFO head：
 
-  seq_tag[i]     = next_seq_tag + lane_rank[i]
-  alloc_valid[i] = in_valid[i]
+  seq_tag[i]        = next_seq_tag + lane_rank[i]
+  alloc_req_valid[i] = input_fifo_lane_valid[rd_ptr][i]
+  issue_alloc_valid[i] = alloc_req_valid[i] && alloc_ready
 
-当bkps=1或internal_rst_n=0时，所有alloc_valid必须为0，issue table和ROB不写新entry。
+当alloc_ready=0或internal_rst_n=0时，所有issue_alloc_valid和ROB内部alloc_fire必须为0，
+Issue Table和ROB均不写新entry；FIFO head及next_seq_tag保持。
 
 seq_tag使用固定位宽自然回绕。Ingress不读取ROB指针，也不产生rob_id或residue输出；
 backend和issue table之间不存在ROB ID通路。
 
-6.2 Dependency Input Contract
+6.3 Dependency Input Contract
 
 输入协议保证非零dep_offset不大于本次复位后排在当前报文之前的报文数量，其中包括
 同周期lane编号更小且同时被接收的报文。Ingress不保存历史计数器，不检测或修改
-非法dep_offset。desc_delay始终保持输入desc[1:0]不变。
+非法dep_offset。desc_delay始终保持FIFO head中已寄存desc[1:0]不变。
 
-6.3 Dependency Target Precompute
+6.4 Dependency Target Precompute
 
 若dep_offset=K且K不为0：
 
@@ -602,21 +648,22 @@ backend和issue table之间不存在ROB ID通路。
 
 密集seq分配建立并必须保持以下不变量：
 
-  rob_id         = seq_tag[3:0]
-  target_rob_id  = target_seq_tag[3:0]
+  rob_id         = seq_tag[4:0]
+  target_rob_id  = target_seq_tag[4:0]
   history_bank   = target_seq_tag[2:0]
 
 ROB和history索引均由完整tag低位组合派生，不作为ingress输出或entry存储字段。
 
-6.4 D0 Register Update
+6.5 D0 Allocation Update
 
-接收沿同时完成：
+|alloc_req_valid && alloc_ready的内部allocation沿同时完成：
 
-  - issue table使用alloc_seq_tag低位和ingress metadata写entry；
-  - ingress向backend提交alloc_valid和alloc_seq_tag；
-  - 推进next_seq_tag。
+  - Issue Table使用alloc_seq_tag低位和ingress metadata写entry；
+  - backend使用内部alloc_fire和alloc_seq_tag写ROB；
+  - ingress弹出FIFO head并按有效lane数量推进next_seq_tag。
 
-输入被捕获后最早下一周期进入D2，不允许组合直通FE。
+外部输入被I0捕获后至少经过一个寄存边界才能进行D0 allocation，不允许组合直通
+sequence allocation、ROB、Issue Table、FE或任何顶层输出。
 
 ================================================================================
 7. Scheduler依赖初始化与事件唤醒
@@ -669,7 +716,7 @@ allocation对沿后issue_entry和queued具有最终优先权；完整seq_tag防�
 8.1 READY Discovery and Classification
 
 ISSUE_READY且queued=0的entry可被发现。发现逻辑从enqueue_rr_ptr开始公平
-扫描16项，每周期最多选择4项；选择后按desc_delay写入对应分类FIFO尾部并置queued=1。
+扫描32项，每周期最多选择4项；选择后按desc_delay写入对应分类FIFO尾部并置queued=1。
 扫描到的既有READY entry和本周期completion命中的等待项优先于D0新分配，防止
 持续输入使唤醒积压饥饿。命中的等待项在状态转为READY的同一沿追加到分类FIFO；若仍
 有入队带宽，D0已经确认依赖满足的新分配也在捕获沿追加，使两类报文下一周期可参与
@@ -677,7 +724,7 @@ D2。若同周期候选量超过4，未入队entry保持或转为READY且queued=
 
 ISSUE_WAIT_DEP不进入分类FIFO。所有FIFO有效ID必须对应ISSUE_READY entry。Completion
 唤醒不组合直通D2，但允许在唤醒沿入队并从
-下一周期参与匹配。全模块最多16个有效entry且每个entry最多入队一次，故任一深度16
+下一周期参与匹配。全模块最多32个有效entry且每个entry最多入队一次，故任一深度32
 分类FIFO不会溢出。
 
 8.2 Head Windows and Legal Matrix
@@ -694,7 +741,7 @@ legal matrix解释为每行至多一个匹配。一个FE每周期仍最多接收
 8.3 Forced-First and Rotating Selection
 
 普通候选的第一个grant从各非空且至少存在一个legal FE的分类队首中选择全局最老
-seq_tag；5 bit序号差在最多16个在途报文
+seq_tag；6 bit序号差在最多32个在途报文
 范围内比较。余下grant从class_rr_ptr开始轮转分类，并优先服务仅剩一个可用FE的受约束
 分类。为分类选择FE时，从fe_rr_ptr开始打破平局，并优先保留被更多其他分类需要的FE。
 
@@ -755,14 +802,15 @@ D3正常路径包含16:1 packet mux、最多4路active ROB/history 128 bit读取
 10. Backend A0：ROB Allocation
 ================================================================================
 
-对于本周期每个alloc_valid：
+对于本周期每个内部alloc_fire：
 
   alloc_rob_id = alloc_seq_tag[ROB_ID_W-1:0]
   rob[alloc_rob_id].valid          <- 1
   rob[alloc_rob_id].seq_tag        <- alloc_seq_tag
   rob[alloc_rob_id].result_valid   <- 0
 
-A0不写fe_out_data。无效entry的数据内容不要求清零。
+A0不写fe_out_data。无效entry的数据内容不要求清零。alloc_fire只由ROB本地
+alloc_req_valid和alloc_ready生成，不设置alloc_valid输入端口。
 
 ================================================================================
 11. Backend G0：依赖状态与数据解析
@@ -858,7 +906,7 @@ fe_out_valid必须与对应return_valid相等。FE返回、D3发射和D2预约�
 
   retire_count = done0 + done1 + done2 + done3
 
-所有ROB索引按16自然回绕。
+所有ROB索引按32自然回绕。
 
 13.2 ROB Logical Retirement Bundle
 
@@ -900,18 +948,33 @@ W0在本周期刚写回的entry不参与同周期R0退休，最早下一周期�
 14. 全局反压
 ================================================================================
 
-  input_count = popcount(in_valid[3:0])
-  free_count  = ROB_DEPTH - occupancy
+Backend只对FIFO寄存head计算内部allocation ready：
+
+  request_count   = popcount(alloc_req_valid[3:0])
+  free_count      = ROB_DEPTH - occupancy
   available_count = free_count + retire_count
+  alloc_ready     = (request_count != 0) && (available_count >= request_count)
 
-  bkps = !internal_rst_n || (available_count < input_count)
+free_count和retire_count均使用本周期沿前注册状态。该内部组合路径允许FIFO head在同一
+上升沿复用退休前缀释放的空间，但不连接顶层端口。
 
-free_count使用本周期上升沿之前的状态。retire_count使用第13.1节由沿前ROB状态形成的
-连续DONE前缀，因此available_count包含本周期上升沿将释放的空间。该控制路径允许满
-ROB时在有足够退休数量的周期继续接收，但不允许使用W0同周期刚写回形成的退休空间。
-复位期间bkps强制为1，不受occupancy和input_count影响。
+Ingress以两项FIFO吸收寄存反压延迟。定义：
 
-ROB_DEPTH=16且issue table以seq_tag低位索引。ROB entry能够退休意味着对应issue entry
+  dequeue = alloc_ready
+  possible_enqueue = !bkps_q
+  reserved_count_next = input_fifo_count - dequeue + possible_enqueue
+  bkps_d = (reserved_count_next >= 2)
+  bkps_o = bkps_q
+
+possible_enqueue不读取当前in_valid；只要本周期bkps_q=0，就按上游可能提交一批最大宽度
+输入保守预留一个slot。实际FIFO enqueue仍由接收沿捕获的|in_valid决定。该规则可能在
+输入气泡且FIFO无法dequeue时产生保守bkps周期，但不会溢出或丢失批次；当FIFO head每
+周期dequeue时，enqueue/dequeue可同沿发生并保持连续接收。
+
+复位期间bkps_q置1，input_fifo_count清零。复位释放后bkps只能在时钟沿拉低。原始
+in_valid不得参与alloc_ready、bkps_d或任何其他功能组合逻辑。
+
+ROB_DEPTH=32且issue table以seq_tag低位索引。ROB entry能够退休意味着对应issue entry
 此前已经派发并释放，因此backend释放的物理槽在同沿也可由相同低位的新allocation复用。
 
 ================================================================================
@@ -951,6 +1014,7 @@ internal_rst_n。
 
 复位清除：
 
+  - ingress input_fifo_count、读写指针，并将bkps_q置1；
   - issue table unified state；
   - ready_q_count、entry queued、enqueue_rr_ptr、class_rr_ptr和fe_rr_ptr；
   - per-FE selected valid和return calendar valid；
@@ -960,7 +1024,7 @@ internal_rst_n。
   - next_seq_tag；
   - ppe_retire_output中的start_lane和out_valid。
 
-无效状态下不要求清零宽数据数组。复位期间bkps=1，所有fe_in_valid和out_valid=0。
+无效状态下不要求清零宽数据数组。复位期间bkps_q=1，所有fe_in_valid和out_valid=0。
 
 ================================================================================
 17. 初始实现风险与后续观察项
@@ -968,8 +1032,9 @@ internal_rst_n。
 
 以下项目不改变首版功能和流水边界，实现后根据编译、仿真和后续时序数据观察：
 
-  1) READY发现、分类FIFO更新、D2 4x4 legal matrix和multi-grant组合深度；
-  2) D3 packet、4路active ROB/history dependency和FE routing的组合深度；
+  1) 32项READY发现、分类FIFO更新、D2 4x4 legal matrix和multi-grant组合深度；
+  2) D3的32:1 packet选择、最多4路32:1 active ROB读取、history dependency和FE routing
+     的组合深度；
   3) completion/retirement bypass tag比较、优先mux和宽数据扇出；
   4) 4路任意地址ROB writeback的decode和宽数据扇出；
   5) R0连续DONE scan、数据mux和输出旋转的组合深度。
@@ -999,3 +1064,8 @@ HLD和LLD，不属于首版RTL编码时的自由选择。
       仍按第3.3节保存物理索引。
   14) queued=1的entry必须处于READY状态并在唯一一个delay分类FIFO中恰好出现一次；
       D2每类只能消费该FIFO的连续队首，等待依赖entry不得进入FIFO。
+  15) 原始顶层输入只允许写ingress输入捕获寄存器；bkps_o必须由bkps_q直接驱动，
+      input FIFO在任意合法输入和ROB停顿序列下不得溢出、丢批或部分接收。
+
+验证必须覆盖ROB occupancy达到32、ROB物理索引31到0回绕、6 bit seq tag从63到0回绕、
+依赖目标跨seq回绕，以及退休释放entry与同沿新allocation复用相同物理索引。

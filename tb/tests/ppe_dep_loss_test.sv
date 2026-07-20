@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// Checks wakeup, same-residue overwrite, and authoritative D3 recovery.
+// Checks dependency wakeup and retirement-only authoritative history updates.
 // -----------------------------------------------------------------------------
 
 `ifndef PPE_DEP_LOSS_TEST_SV
@@ -14,8 +14,10 @@ class ppe_dep_loss_test extends uvm_test;
     ppe_vif_t vif;
     bit       wait_seen;
     bit       s0_wakeup_seen;
-    bit       s8_overwrite_seen;
-    bit       d3_recovery_seen;
+    bit       s0_history_seen;
+    bit       s8_completion_seen;
+    bit       s8_completion_preserved_history;
+    bit       s8_retire_history_seen;
 
     function new(string name, uvm_component parent);
         super.new(name, parent);
@@ -52,13 +54,9 @@ class ppe_dep_loss_test extends uvm_test;
 
         if (!completed) begin
             `uvm_error("DEP_TIMEOUT", $sformatf(
-                "nine expected packets did not complete: got=%0d state1=%0d cache0_tag=%0d fallback=%0b/%0b/%0b target=%0d:%0d:%0d lookup=%0b rob0=%0b:%0d result0=%0b:%0d head=%0d",
+                "nine expected packets did not complete: got=%0d state1=%0d history0_tag=%0d rob0=%0b:%0d result0=%0b:%0d head=%0d",
                 env.scb.got_total, vif.dbg_entry1_state,
-                vif.dbg_cache0_seq_tag, vif.dbg_fallback_valid,
-                vif.dbg_fallback_ready, vif.dbg_fallback_from_d3,
-                vif.dbg_fallback_rob_id, vif.dbg_fallback_seq_tag,
-                vif.dbg_fallback_residue, vif.dbg_fallback_lookup_hit,
-                vif.dbg_rob0_valid,
+                vif.dbg_cache0_seq_tag, vif.dbg_rob0_valid,
                 vif.dbg_rob0_seq_tag, vif.dbg_result0_valid,
                 vif.dbg_result0_seq_tag, vif.dbg_head_ptr))
         end
@@ -68,11 +66,14 @@ class ppe_dep_loss_test extends uvm_test;
         if (!s0_wakeup_seen) begin
             `uvm_error("DEP_WAKE", "S0 writeback did not broadcast to a waiting S1")
         end
-        if (!s8_overwrite_seen) begin
-            `uvm_error("DEP_OVERWRITE", "S8 did not overwrite cache residue 0 after S0 wakeup")
+        if (!s0_history_seen) begin
+            `uvm_error("DEP_HISTORY", "S0 retirement did not populate history bank 0")
         end
-        if (!d3_recovery_seen) begin
-            `uvm_error("DEP_RECOVERY", "dependent D3 request did not recover S0 through fallback")
+        if (!s8_completion_seen || !s8_completion_preserved_history) begin
+            `uvm_error("DEP_HISTORY", "S8 completion overwrote history before retirement")
+        end
+        if (!s8_retire_history_seen) begin
+            `uvm_error("DEP_HISTORY", "S8 retirement did not update history bank 0")
         end
         phase.drop_objection(this);
     endtask
@@ -88,7 +89,8 @@ class ppe_dep_loss_test extends uvm_test;
         end
         for (fe = 0; fe < 4; fe++) begin
             if (vif.dbg_wb_valid[fe] &&
-                (vif.dbg_wb_seq_tag[fe*5 +: 5] == 5'd0) && wait_seen) begin
+                (vif.dbg_wb_seq_tag[fe*TB_SEQ_W +: TB_SEQ_W] == '0)
+                && wait_seen) begin
                 if (!s0_wakeup_seen) begin
                     `uvm_info("DEP_TRACE", $sformatf(
                         "S0 writeback broadcast while cache0 tag=%0d state1=%0d",
@@ -97,24 +99,29 @@ class ppe_dep_loss_test extends uvm_test;
                 s0_wakeup_seen = 1'b1;
             end
             if (vif.dbg_wb_valid[fe] &&
-                (vif.dbg_wb_seq_tag[fe*5 +: 5] == 5'd8) && s0_wakeup_seen) begin
-                if (!s8_overwrite_seen) begin
+                (vif.dbg_wb_seq_tag[fe*TB_SEQ_W +: TB_SEQ_W]
+                 == TB_SEQ_W'(8)) && s0_wakeup_seen) begin
+                if (!s8_completion_seen) begin
                     `uvm_info("DEP_TRACE", $sformatf(
-                        "S8 writeback scheduled cache0 overwrite, state1=%0d",
+                        "S8 completed while history0 tag=%0d state1=%0d",
+                        vif.dbg_cache0_seq_tag,
                         vif.dbg_entry1_state), UVM_MEDIUM)
                 end
-                s8_overwrite_seen = 1'b1;
+                s8_completion_seen = 1'b1;
+                // S0 may not have retired yet. Both an invalid bank and a
+                // valid S0 tag are legal; S8's completion must not install S8.
+                if (!vif.dbg_cache0_valid
+                    || (vif.dbg_cache0_seq_tag != TB_SEQ_W'(8))) begin
+                    s8_completion_preserved_history = 1'b1;
+                end
             end
         end
-        if (s8_overwrite_seen && vif.dbg_cache0_valid &&
-            (vif.dbg_cache0_seq_tag == 5'd8) &&
-            vif.dbg_fallback_valid && vif.dbg_fallback_ready &&
-            vif.dbg_fallback_from_d3 && (vif.dbg_fallback_seq_tag == 5'd0)) begin
-            if (!d3_recovery_seen) begin
-                `uvm_info("DEP_TRACE", "D3 recovered S0 through authoritative fallback",
-                          UVM_MEDIUM)
-            end
-            d3_recovery_seen = 1'b1;
+        if (vif.dbg_cache0_valid && (vif.dbg_cache0_seq_tag == '0)) begin
+            s0_history_seen = 1'b1;
+        end
+        if (s8_completion_seen && vif.dbg_cache0_valid
+            && (vif.dbg_cache0_seq_tag == TB_SEQ_W'(8))) begin
+            s8_retire_history_seen = 1'b1;
         end
     endtask
 endclass
