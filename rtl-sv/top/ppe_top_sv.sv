@@ -17,8 +17,8 @@
 //------------------------------------------------------------------------------
 
 module ppe_top_sv #(
-    parameter int unsigned PACKET_W = 128,
-    parameter int unsigned DESC_W   = 5
+    parameter int PACKET_W = ppe_types_pkg::DEFAULT_PACKET_W,
+    parameter int DESC_W   = ppe_types_pkg::DEFAULT_DESC_W
 ) (
     input  logic                    clk,
     input  logic                    rst_n,
@@ -57,7 +57,7 @@ module ppe_top_sv #(
     logic [1:0] reset_sync_q;
     logic       internal_rst_n;
 
-    always_ff @(posedge clk or negedge rst_n) begin
+    always_ff @(posedge clk or negedge rst_n) begin : reset_synchronizer
         if (!rst_n) begin
             reset_sync_q <= 2'b00;
         end else begin
@@ -71,6 +71,9 @@ module ppe_top_sv #(
     // External-lane adaptation and ingress allocation bundle
     //--------------------------------------------------------------------------
 
+    // Internal point-to-point interconnects intentionally omit _i/_o suffixes;
+    // direction is expressed only at each owning module boundary.
+
     logic [N-1:0]                 in_valid;
     logic [N-1:0][PACKET_W-1:0]   in_packet;
     logic [N-1:0][DESC_W-1:0]     in_desc;
@@ -81,7 +84,7 @@ module ppe_top_sv #(
     logic [N-1:0]                 issue_alloc_valid;
     logic [N-1:0][SEQ_W-1:0]      alloc_target_seq_tag;
     logic [N-1:0][PACKET_W-1:0]   alloc_packet;
-    logic [N-1:0][1:0]            alloc_delay;
+    logic [N-1:0][DELAY_W-1:0]    alloc_delay;
     logic [N-1:0]                 alloc_dep_required;
 
     assign in_valid  = {in_valid3, in_valid2, in_valid1, in_valid0};
@@ -112,9 +115,6 @@ module ppe_top_sv #(
     // Issue table, candidate scheduler, and dependency connections
     //--------------------------------------------------------------------------
 
-    localparam int unsigned DELAY_CLASS_NUM   = 4;
-    localparam int unsigned CAND_WINDOW_DEPTH = 4;
-
     logic [N-1:0]                    dep_status_valid;
     logic [N-1:0][SEQ_W-1:0]         dep_status_target_seq_tag;
     logic [N-1:0]                    dep_status_available;
@@ -136,7 +136,7 @@ module ppe_top_sv #(
 
     logic [FE_NUM-1:0]               issue_valid;
     logic [FE_NUM-1:0][PACKET_W-1:0] issue_packet;
-    logic [FE_NUM-1:0][1:0]          issue_delay;
+    logic [FE_NUM-1:0][DELAY_W-1:0]  issue_delay;
     logic [FE_NUM-1:0]               issue_dep_required;
     logic [FE_NUM-1:0][PACKET_W-1:0] issue_dep_data;
 
@@ -144,9 +144,7 @@ module ppe_top_sv #(
     logic [FE_NUM-1:0][PACKET_W-1:0] fe_out_data;
 
     ppe_issue_table #(
-        .PACKET_W          (PACKET_W),
-        .DELAY_CLASS_NUM   (DELAY_CLASS_NUM),
-        .CAND_WINDOW_DEPTH (CAND_WINDOW_DEPTH)
+        .PACKET_W (PACKET_W)
     ) u_issue_table (
         .clk_i                       (clk),
         .rst_ni                      (internal_rst_n),
@@ -176,11 +174,7 @@ module ppe_top_sv #(
         .issue_dep_data_o            (issue_dep_data)
     );
 
-    ppe_fe_scheduler #(
-        .DELAY_CLASS_NUM   (DELAY_CLASS_NUM),
-        .CAND_WINDOW_DEPTH (CAND_WINDOW_DEPTH),
-        .RETURN_SLOT_NUM   (8)
-    ) u_fe_scheduler (
+    ppe_fe_scheduler u_fe_scheduler (
         .clk_i                (clk),
         .rst_ni               (internal_rst_n),
         .candidate_valid_i    (candidate_valid),
@@ -221,8 +215,7 @@ module ppe_top_sv #(
     logic [N-1:0][PACKET_W-1:0] retire_data;
 
     ppe_rob #(
-        .PACKET_W    (PACKET_W),
-        .ISSUE_WIDTH (FE_NUM)
+        .PACKET_W (PACKET_W)
     ) u_rob (
         .clk_i                       (clk),
         .rst_ni                      (internal_rst_n),

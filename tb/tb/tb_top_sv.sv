@@ -127,13 +127,13 @@ module tb_top_sv;
         if (dut.internal_rst_n) begin
             for (int unsigned fe_idx = 0; fe_idx < 4; fe_idx++) begin
                 if (dut.fe_out_valid[fe_idx] !==
-                    dut.u_fe_scheduler.return_valid_q[fe_idx]
+                    dut.u_fe_scheduler.return_slot_valid_q[fe_idx]
                                                     [dut.u_fe_scheduler
                                                         .schedule_phase_q]) begin
                     `uvm_error("FE_CALENDAR", $sformatf(
                         "FE%0d return valid=%0b calendar=%0b phase=%0d",
                         fe_idx, dut.fe_out_valid[fe_idx],
-                        dut.u_fe_scheduler.return_valid_q[fe_idx]
+                        dut.u_fe_scheduler.return_slot_valid_q[fe_idx]
                                                        [dut.u_fe_scheduler
                                                            .schedule_phase_q],
                         dut.u_fe_scheduler.schedule_phase_q))

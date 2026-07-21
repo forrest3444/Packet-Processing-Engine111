@@ -43,6 +43,7 @@ package ppe_tb_pkg;
     `include "ppe_load_mix_perf_seq.sv"
     `include "ppe_fe_pipeline_seq.sv"
     `include "ppe_rob32_wrap_seq.sv"
+    `include "ppe_ingress_elastic_stress_seq.sv"
     `include "ppe_basic_test.sv"
     `include "ppe_dep_loss_test.sv"
     `include "ppe_p0_perf_test.sv"
@@ -50,6 +51,7 @@ package ppe_tb_pkg;
     `include "ppe_load_mix_perf_test.sv"
     `include "ppe_fe_pipeline_test.sv"
     `include "ppe_rob32_wrap_test.sv"
+    `include "ppe_ingress_elastic_stress_test.sv"
 
 endpackage
 

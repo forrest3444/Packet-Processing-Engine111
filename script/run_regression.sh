@@ -4,17 +4,39 @@ set -uo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TARGET=${1:-all}
-BUILD_NAME=${BUILD_NAME:-regression}
+DUT=${DUT:-sv}
 FUNC_SEEDS=${FUNC_SEEDS:-"1 23"}
 PERF_SEEDS=${PERF_SEEDS:-"1"}
 RUN_TIME=${RUN_TIME:-60s}
 VERB=${VERB:-UVM_LOW}
 MAKE_CMD=${MAKE_CMD:-make}
+VERILATOR=${VERILATOR:-verilator}
+
+case "${DUT}" in
+    sv)
+        BUILD_NAME=${BUILD_NAME:-sv_regression}
+        FILELIST=${FILELIST:-./script/filelist_sv.f}
+        TB_TOP=${TB_TOP:-tb_top_sv}
+        RTL_FILELIST=${RTL_FILELIST:-./rtl-sv/filelist.f}
+        ;;
+    legacy)
+        BUILD_NAME=${BUILD_NAME:-legacy_regression}
+        FILELIST=${FILELIST:-./script/filelist.f}
+        TB_TOP=${TB_TOP:-tb_top}
+        RTL_FILELIST=${RTL_FILELIST:-./script/rtl_filelist.f}
+        ;;
+    *)
+        echo "DUT must be 'sv' or 'legacy'" >&2
+        exit 2
+        ;;
+esac
 
 FUNCTIONAL_TESTS=(
     ppe_basic_test
     ppe_fe_pipeline_test
     ppe_dep_loss_test
+    ppe_rob32_wrap_test
+    ppe_ingress_elastic_stress_test
 )
 
 PERFORMANCE_CASES=(
@@ -43,7 +65,7 @@ case "${TARGET}" in
         ;;
 esac
 
-SUMMARY_DIR="${ROOT_DIR}/sim/regression/${TARGET}"
+SUMMARY_DIR="${ROOT_DIR}/sim/regression/${DUT}/${TARGET}"
 SUMMARY_LOG="${SUMMARY_DIR}/summary.log"
 BUILD_LOG="${SUMMARY_DIR}/build.log"
 METRICS_LOG="${SUMMARY_DIR}/performance_metrics.log"
@@ -82,10 +104,10 @@ run_uvm() {
     local status
 
     if [[ -n "${case_name}" ]]; then
-        run_tag="${category}_${case_name}_seed_${seed}"
+        run_tag="${DUT}_${category}_${case_name}_seed_${seed}"
         label="${testname}/${case_name}/seed=${seed}"
     else
-        run_tag="${category}_${testname}_seed_${seed}"
+        run_tag="${DUT}_${category}_${testname}_seed_${seed}"
         label="${testname}/seed=${seed}"
     fi
     run_log="${ROOT_DIR}/sim/run/${run_tag}/log/run.log"
@@ -93,12 +115,14 @@ run_uvm() {
     printf 'RUN  %s\n' "${label}" | tee -a "${SUMMARY_LOG}"
     if [[ -n "${case_name}" ]]; then
         "${MAKE_CMD}" -C "${ROOT_DIR}" run \
+            FILELIST="${FILELIST}" TB_TOP="${TB_TOP}" \
             BUILD_NAME="${BUILD_NAME}" TESTNAME="${testname}" SEED="${seed}" \
             RUN_TAG="${run_tag}" RUN_TIME="${RUN_TIME}" VERB="${VERB}" \
             USER_SIM_OPTS="+PERF_CASE=${case_name}"
         status=$?
     else
         "${MAKE_CMD}" -C "${ROOT_DIR}" run \
+            FILELIST="${FILELIST}" TB_TOP="${TB_TOP}" \
             BUILD_NAME="${BUILD_NAME}" TESTNAME="${testname}" SEED="${seed}" \
             RUN_TAG="${run_tag}" RUN_TIME="${RUN_TIME}" VERB="${VERB}"
         status=$?
@@ -136,12 +160,19 @@ run_performance() {
 }
 
 cd "${ROOT_DIR}"
-echo "Building regression image: ${BUILD_NAME}" | tee -a "${SUMMARY_LOG}"
-if ! "${MAKE_CMD}" lint >> "${BUILD_LOG}" 2>&1; then
+echo "Building ${DUT} regression image: ${BUILD_NAME}" | tee -a "${SUMMARY_LOG}"
+if [[ "${DUT}" == "sv" ]]; then
+    lint_cmd=("${VERILATOR}" --lint-only --Wall -Wno-fatal
+              --top-module ppe_top_sv -f "${RTL_FILELIST}")
+else
+    lint_cmd=("${MAKE_CMD}" lint RTL_FILELIST="${RTL_FILELIST}")
+fi
+if ! "${lint_cmd[@]}" >> "${BUILD_LOG}" 2>&1; then
     echo "FAIL lint log=${BUILD_LOG}" | tee -a "${SUMMARY_LOG}"
     exit 1
 fi
-if ! "${MAKE_CMD}" elab BUILD_NAME="${BUILD_NAME}" >> "${BUILD_LOG}" 2>&1; then
+if ! "${MAKE_CMD}" elab FILELIST="${FILELIST}" TB_TOP="${TB_TOP}" \
+    BUILD_NAME="${BUILD_NAME}" >> "${BUILD_LOG}" 2>&1; then
     echo "FAIL elab log=${BUILD_LOG}" | tee -a "${SUMMARY_LOG}"
     exit 1
 fi
@@ -153,8 +184,9 @@ if [[ "${TARGET}" == "performance" || "${TARGET}" == "all" ]]; then
     run_performance
 fi
 
-printf 'SUMMARY target=%s pass=%d fail=%d\n' \
-    "${TARGET}" "${pass_count}" "${fail_count}" | tee -a "${SUMMARY_LOG}"
+printf 'SUMMARY dut=%s target=%s pass=%d fail=%d\n' \
+    "${DUT}" "${TARGET}" "${pass_count}" "${fail_count}" \
+    | tee -a "${SUMMARY_LOG}"
 if [[ "${TARGET}" == "performance" || "${TARGET}" == "all" ]]; then
     echo "Performance metrics: ${METRICS_LOG}" | tee -a "${SUMMARY_LOG}"
 fi

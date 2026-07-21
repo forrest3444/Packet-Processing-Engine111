@@ -1,5 +1,5 @@
 PPE High-Level Design
-版本：Draft 0.3
+版本：Draft 0.4
 状态：首版 RTL 系统架构与流水边界已收口
 
 本文档描述 PPE 的系统架构、模块职责、状态所有权、主要数据流和流水级边界。
@@ -20,7 +20,7 @@ PPE High-Level Design
 PPE按状态所有权划分为以下主要逻辑模块：
 
   1) ppe_top：顶层集成及FE阵列例化；
-  2) ppe_ingress：输入skid FIFO、寄存bkps、报文序分配、依赖目标预计算和allocation bundle生成；
+  2) ppe_ingress：两项elastic batch FIFO、寄存bkps、报文序分配、依赖目标预计算和allocation bundle生成；
   3) scheduler：issue table、依赖等待、候选选择、FE匹配、operand gather和返回日历；
   4) backend：ROB、FE写回、依赖结果解析、保序退休、history和内部allocation容量判断。
 
@@ -34,9 +34,16 @@ SystemVerilog实现可将scheduler和backend中的状态所有者、纯组合选
   MAX_DEP      = 7
   ISSUE_WIDTH  = 4
   ROB_DEPTH    = 32
+  ISSUE_DEPTH  = 32
   ROB_ID_W     = 5
   SEQ_W        = 6
   RTL_LANGUAGE = SystemVerilog
+
+共享基线配置由ppe_types_pkg统一定义，跨模块使用且必须保持一致的结构参数不得在子模块
+例化处重复硬编码。ISSUE_DEPTH由ROB_DEPTH派生，ISSUE_WIDTH由FE_NUM派生；ROB_ID_W、
+SEQ_W和history索引宽度继续由基础配置推导。只有直接定义可复用模块端口数据宽度的
+PACKET_W/DESC_W保留为模块参数，并由顶层统一向下传递。模块私有存储深度和计数器宽度
+使用localparam，不向外暴露。
 
 新架构可综合RTL位于rtl-sv目录，使用.sv文件和可综合SystemVerilog语法。现有rtl目录
 中的Verilog-2001实现保留为旧基线参考，不作为新架构内部接口和模块所有权的来源。
@@ -51,6 +58,18 @@ SystemVerilog实现可将scheduler和backend中的状态所有者、纯组合选
 
 当前环境不使用定量评分模型指导编码取舍。缺少工具数据时，PPA 判断仅作为定性分析，
 不得为了未经验证的功耗或面积收益主动牺牲明确的吞吐能力。
+
+1.2 阶段性时序目标
+
+当前Nangate45比较环境的系统级阶段性目标频率固定为350 MHz，对应时钟周期2.857 ns。
+该目标用于前端综合和pre-CTS布局后的相对收敛判断，不代表公司工艺签核结论。默认使用
+typical Liberty、0.050 ns时钟不确定度和0.200 ns输入输出延迟，并在报告中明确寄生参数
+模型和时钟阶段。
+
+为给跨模块连线、setup和后续时钟实现保留余量，scheduler各寄存边界之间的数据到达
+时间以不超过2.3 ns为局部优化目标；超过2.5 ns的单级路径必须进入结构复审。局部目标
+是设计预算而非功能语义，不得通过降低多发射吞吐、取消公平性或改变FE返回冲突规则
+换取时序。新增流水边界时必须同步本HLD和LLD中的逐周期定义。
 
 ================================================================================
 2. 系统框图
@@ -115,7 +134,7 @@ ppe_top 不保存报文级状态，不参与报文序、依赖或保序决策。
 
 ppe_ingress负责：
 
-  - 顶层输入批次准入、两项整批输入skid FIFO和唯一输入寄存器边界；
+  - 顶层输入批次准入和两项整批elastic FIFO；
   - 生成并保存寄存全局bkps；
   - 有效lane rank计算和密集seq tag分配；
   - 从完整seq tag预计算target seq tag；
@@ -123,11 +142,17 @@ ppe_ingress负责：
   - 向ROB形成寄存head request/metadata，并向issue table形成同一被接受allocation
     事件的valid和seq metadata。
 
-ppe_ingress拥有两项输入批次FIFO、bkps寄存器和next_seq_tag。它不拥有ROB容量、等待
+ppe_ingress拥有两项输入批次槽位、读写指针、占用计数、bkps寄存器和next_seq_tag。两项
+槽位同时承担顶层输入寄存和有序FIFO存储，不设置独立capture数据副本。它不拥有ROB容量、等待
 状态、依赖结果或FE调度状态。
 完整seq tag是allocation的唯一跨模块身份；issue table和backend分别从其低位派生本地
 物理索引。History bank索引直接从完整seq tag低3位派生，ingress不产生、不输出独立
 ROB ID或residue字段。
+
+两项输入FIFO按固定深度结构实现：沿后占用由capture/head release组合更新，宽
+packet/descriptor存储采用bank-local写使能，避免动态bank写索引进入宽寄存器使能路径。
+固定N=4配置下，lane rank和有效报文计数采用平衡的小位宽前缀网络；这些实现策略不改变
+I0/D0寄存边界、整批准入语义或allocation吞吐能力。
 
 3.3 scheduler
 
@@ -144,13 +169,16 @@ Scheduler只拥有报文进入FE之前的调度状态。报文成功进入FE后�
 状态继续由backend ROB保存。
 
 其中ppe_issue_table同时拥有32项issue entry、4个delay-class ID FIFO、独立queued
-标志和READY发现轮询指针。它向ppe_fe_scheduler提供每类最多4项的寄存器化队首窗口；
+标志和READY发现轮询指针。它向ppe_fe_scheduler提供每类8项的寄存器化队首lookahead；
 packet宽数据不进入候选接口，仅在D3按已选seq tag低位从ppe_issue_table读取。
 
-ppe_fe_scheduler拥有candidate-to-FE匹配、per-FE 8槽return calendar、schedule_phase以及
-class/FE公平轮询指针。它在同一选择沿同时输出Issue Table不可撤销select并建立返回槽
-预约；FE返回时以当前calendar槽保存的完整tag形成completion事件。FE的128 bit结果数据
-不经过该控制模块，直接连接backend ROB。
+ppe_fe_scheduler拥有两级D2、candidate-to-FE匹配、per-FE 8槽return calendar、
+schedule_phase以及class/FE公平轮询指针。D2A使用固定4x4小位宽匹配网络形成最多4项
+不可撤销pending grant；D2B下一周期以现有select接口原子地锁定Issue Table entry并将
+pending reservation提交到正式return calendar。D2A把当前pending reservation视为已占用，
+并在8项class lookahead中跳过最多4项pending前缀后继续观察后续4项。FE返回时以当前
+calendar槽保存的完整tag形成completion事件。FE的128 bit结果数据不经过该控制模块，
+直接连接backend ROB。
 
 ppe_fe_scheduler按FE编号向ppe_issue_table返回一次不可撤销的完整seq tag。ppe_issue_table内部
 保存每个FE的selected seq tag，下一周期从其低位索引entry并形成D3 issue bundle，随后
@@ -171,6 +199,13 @@ ppe_rob是全局顺序、结果和容量状态的唯一所有者，负责：
 ppe_rob不保存物理输出lane状态，也不直接驱动顶层输出寄存器。它向ppe_retire_output输出
 按报文序排列、从slot 0开始无空洞的逻辑retirement bundle。
 
+固定ROB_DEPTH=32、N=4实现将128 bit active result按ROB ID低2位组织为4个bank，每个
+bank含8项；valid、result_valid和完整seq_tag继续作为独立小位宽metadata阵列。四路
+writeback先共享小位宽tag/entry decode，再形成每个entry唯一的本地写使能和数据选择，
+不得以动态宽数组写索引生成覆盖全部result存储的写数据网络。连续4项退休先从每个bank
+各读取一个8项窗口，再按head低2位通过固定两级置换恢复逻辑顺序。该物理组织不改变
+ROB ID、同周期四路任意写回、active dependency读取或退休周期语义。
+
 3.5 ppe_retire_output
 
 ppe_retire_output是backend功能域内独立的最终输出子模块，负责退休结果的外部呈现：
@@ -189,9 +224,10 @@ ppe_top分别例化并连接两者。该拆分不增加ready或额外流水级�
 
 4.1 输入接收
 
-当寄存bkps允许接收时，ingress只把当前所有lane的valid、packet和descriptor捕获到
-两项整批输入FIFO，不在该沿执行sequence allocation或ROB容量计算。FIFO保持批次顺序，
-其寄存head批次获得backend内部allocation ready后，ingress才计算密集seq tag和dependency
+当寄存bkps允许接收时，ingress只把当前所有lane的valid、packet和descriptor写入
+两项elastic FIFO的寄存tail槽位，不在该沿执行sequence allocation、空批判断或ROB容量
+计算。FIFO保持批次顺序；下一周期起，寄存head为空批时直接释放，非空head获得backend
+内部allocation ready后，ingress才计算密集seq tag和dependency
 target，并在同一内部allocation沿送入Issue Table和ROB。完整descriptor不离开ingress；
 scheduler只接收delay和dep_required。一次输入周期必须整体接收或整体停止，禁止部分lane接收。
 
@@ -206,29 +242,33 @@ scheduler只接收delay和dep_required。一次输入周期必须整体接收或
 
 Scheduler维护小位宽dependency状态，FE completion tag用于唤醒ISSUE_WAIT_DEP报文。
 Completion bypass允许同一接收沿的新entry或等待entry识别该completion，但被唤醒报文
-只能从下一周期开始参与D2。D3对最多4个ISSUE_SELECTED依赖报文从backend执行权威数据gather，
+只能从下一周期开始参与D2A。D3对最多4个ISSUE_SELECTED依赖报文从backend执行权威数据gather，
 依次检查completion bypass、retirement bypass、active ROB和8-bank retired history。
 依赖宽数据不复制到所有issue entry中，也不存在fast-cache、fallback或replay状态。
 
 4.3 FE 调度
 
 ISSUE_READY报文按delay进入4个分类ID队列，报文宽数据仍只保存在issue table。每个分类
-队列提供最多4个队首ID作为候选，同一分类允许获得多个FE。ISSUE_WAIT_DEP报文不占
+队列提供8个队首ID作为流水lookahead，D2A跳过当前pending前缀后仍可观察最多4个新
+候选，同一分类允许获得多个FE。ISSUE_WAIT_DEP报文不占
 READY队列位置，避免未满足依赖的报文形成队头阻塞。
 
-调度器在4个分类队首窗口与4个FE之间建立legal matrix。普通候选先保证全局最老队首
-报文，再按delay分类轮转补齐其余grant，并优先保护可选FE较少
-的分类。FE选择按轮转次序打破同等约束。调度应保持无饥饿，并在 READY 报文和 FE
-资源允许时尽量维持多发射。
+调度器在4个分类有效队首与4个FE之间建立legal matrix。D2A先按class_rr_ptr和
+fe_rr_ptr把矩阵归一化；归一化FE lane f使用从归一化class f开始的固定循环优先级，
+并行提名一个合法分类。同一分类收到多个FE提名时，按归一化FE顺序执行并行前缀计数，
+把第k个有效提名映射到该分类第k个可见候选。该单轮固定网络不保证每周期全局最大
+匹配，但必须保持单分类最多四发、多分类分散服务和轮转无饥饿；不得使用跨四轮
+grant的串行greedy依赖链。
 
 FE本身是固定1~4周期延迟的无阻塞流水线，每周期最多接收一个请求，并允许输入和
-输出同周期发生。Scheduler维护per-FE 8槽环形返回日历。D2按请求delay计算D3发射后
-的目标返回周期，只能选择对应日历槽未占用的FE，并在选择沿写入完整seq_tag。
-Issue table为每个FE设置一份D2到D3 selected-tag寄存器；D3消费当前issue bundle的同一周期，D2允许写入该FE
-的下一请求，因此无冲突流量下每个FE可以逐周期接收请求。
+输出同周期发生。Scheduler维护per-FE 8槽环形返回日历。D2A按请求delay和下一D2B
+commit phase计算D3发射后的目标返回周期，只能选择正式calendar和pending reservation
+均未占用该槽的FE；D2B下一周期提交完整seq_tag。Issue table为每个FE设置一份D2B到
+D3 selected-tag寄存器；无冲突流量下D2A、D2B和D3可分别处理相邻三批请求，每个FE仍
+可以逐周期接收请求。
 
-返回日历使用共享modulo-8周期索引，不移动宽tag字段。8槽覆盖D2提前一周期预约和
-FE最长4周期返回的完整窗口。合法选择保证D3权威依赖gather必定available；D3不以
+返回日历使用共享modulo-8周期索引，不移动宽tag字段。8槽覆盖D2A pending、D2B提交、
+D3发射和FE最长4周期返回的完整窗口。合法选择保证D3权威依赖gather必定available；D3不以
 gather响应设置ready、取消或重放通路。依赖未available属于内部状态不一致，验证侧
 必须报错。
 
@@ -254,15 +294,16 @@ ppe_rob从ROB head开始退休最多4个连续DONE报文，并向ppe_retire_outp
 4.6 全局反压
 
 bkps由ingress寄存器直接驱动，任何原始顶层输入或ROB状态均不得组合直通该端口。
-两项整批输入FIFO中的第一项满足强制输入寄存边界，第二项吸收寄存反压生效前可能继续
-到达的一批最大宽度输入。bkps next-state只根据已寄存FIFO占用、当前bkps状态和FIFO head
-是否将在本沿获得内部allocation ready计算；不读取当前原始in_valid。
+两项elastic FIFO槽位直接终止所有原始输入，总计提供两批物理容量。bkps next-state
+只根据寄存占用、当前bkps状态和寄存head是否将在本沿释放计算；不读取任何当前原始输入。
 
-Backend仍根据ROB沿前空闲容量与本周期连续DONE退休数量，对FIFO中已经寄存的head批次
+Backend仍根据ROB沿前空闲容量与本周期连续DONE退休数量，对已经寄存的head批次
 产生精确内部allocation ready。因此内部allocation仍可在同一上升沿复用退休空间，且当
 ROB持续每周期退休4项、FIFO持续非空时，可保持4-wide内部allocation和外部连续接收。
-相较仅保留一项输入寄存器并按最坏情况预留ROB credit，该方案增加一批宽数据skid存储，
-但避免满载附近的周期性保守停顿，是首版性能/面积/控制复杂度的基线折中。
+当bkps_q=0时，tail capture和head release允许同沿发生，因此连续可分配流量不产生结构
+气泡。若capture后两槽占满，则下一拍bkps拉高；满状态中的head释放后，bkps在下一有效沿
+重新拉低。相较三批结构，本方案减少一批宽数据存储和一级搬移选择，代价是依赖重载或ROB
+停顿时更早施加反压；不得以此为由降低内部4-wide allocation能力。
 
 同址 retirement 与 allocation 可以在同一上升沿发生。retirement 使用沿前 ROB
 内容产生输出并更新retired history，allocation对沿后ROB entry状态具有优先权，
@@ -274,17 +315,23 @@ ROB持续每周期退休4项、FIFO持续非空时，可保持4-wide内部alloca
 
 5.1 Ingress与Scheduler主流水
 
-输入到FE发射划分为四个寄存边界阶段，并包含一条并行依赖事件通路：
+输入到FE发射划分为五个寄存边界阶段，并包含一条并行依赖事件通路：
 
   I0：External Input Capture
-      在寄存bkps允许时将完整输入批次写入两项skid FIFO；不执行功能解析。
+      在寄存bkps允许时将完整原始输入无条件写入两项elastic FIFO的tail槽位；
+      不执行功能解析或capture到FIFO的数据搬移。
 
   D0：Input Admission / Allocation
-      对FIFO寄存head执行顺序分配、依赖目标预计算和ROB/issue-table allocation。
+      对elastic FIFO寄存head执行空批释放、顺序分配、依赖目标预计算和
+      ROB/issue-table allocation。
 
-  D2：Packet Select / FE Select
-      从4个delay分类队列的队首窗口完成最多4个报文、目标返回周期和FE选择，写入
-      返回日历预约并锁存launch信息。每类可多grant。
+  D2A：Packet Match / Pending Claim
+      从4个delay分类队列的8项lookahead跳过当前pending前缀，使用固定4x4网络完成
+      最多4个报文、目标返回周期和FE选择，并锁存不可撤销pending grant。
+
+  D2B：Return-slot Commit / Issue Select
+      将上一周期pending grant原子提交到return calendar和Issue Table selected流水；
+      本级不再执行候选仲裁且没有ready或rollback。
 
   D3：Operand Read / FE Issue
       读取launch报文，通过backend四级权威解析读取最多4路依赖数据，并完成FE路由。
@@ -293,8 +340,9 @@ ROB持续每周期退休4项、FIFO持续非空时，可保持4-wide内部alloca
       D0以active ROB/history状态及completion/retirement bypass初始化entry；后续
       completion tag唤醒ISSUE_WAIT_DEP entry。该通路不增加输入流水级，也不允许同沿直通FE。
 
-D2 和 D3 必须保持逻辑分离。READY发现和分类入队不进入D2匹配关键路径；D2只处理
-小位宽队首ID、4x4合法矩阵和返回槽控制，D3再读取宽报文与依赖数据。
+D2A、D2B和D3必须保持逻辑分离。READY发现和分类入队不进入D2A匹配关键路径；D2A
+只处理小位宽队首ID、4x4合法矩阵和pending grant，D2B只提交预约，D3再读取宽报文与
+依赖数据。
 
 5.2 Backend并行通路
 
@@ -310,10 +358,10 @@ A0、G0、W0和R0可以在同周期处理不同ROB entry。它们共享的ROB状
 
 5.3 高层流水关系
 
-  Input D0 -> D2 -> D3 -> FE(fixed delay + 1 cycles)
-                              |
-                              v
-                      Backend W0 -> R0 -> Output Registers
+  Input I0 -> D0 -> D2A -> D2B -> D3 -> FE(fixed delay + 1 cycles)
+                  |
+                  v
+          Backend W0 -> R0 -> Output Registers
 
   Backend A0与Input D0并行工作。
   Backend G0为D0提供最多4路小位宽available状态，并为D3提供最多4路128 bit依赖数据。
@@ -327,13 +375,14 @@ A0、G0、W0和R0可以在同周期处理不同ROB entry。它们共享的ROB状
 
 4个FE均支持无阻塞流水，每个FE理论上可逐周期接收请求，但同一FE的目标输出周期
 不得冲突。8槽返回日历和可同周期消费/重填的selected-tag寄存器释放FE流水吞吐；实现后
-重点检查混合delay造成的槽碎片、D2匹配效率以及长流下是否接近4路持续issue。
+重点检查混合delay造成的槽碎片、D2A匹配效率以及长流下是否接近4路持续issue。
 
-6.2 D2 多发射仲裁
+6.2 D2A 多发射仲裁
 
-4个分类队首窗口与4个FE形成小位宽legal matrix。首版按LLD采用forced-first加分类
-轮转，并在FE选择时优先保护受约束分类。同一分类必须允许多grant。实现后重点观察
-多轮grant依赖、动态日历索引和匹配组合深度；不得退化为每类每周期最多一发。
+4个分类队首与4个FE形成固定小位宽legal matrix。D2A采用class/FE双轮转归一化、四个
+并行固定优先编码器和按分类的并行前缀rank网络；每个FE只产生一个class提名，同类第k个
+提名直接取得第k个候选，不使用动态数组索引或跨四轮grant的串行greedy依赖。同一分类
+必须允许多grant。D2B将动态日历写入与匹配隔离；不得退化为每类每周期最多一发。
 
 6.3 D3 宽数据路径
 
@@ -354,17 +403,26 @@ Completion和retirement bypass均先做小位宽ID/tag比较，再选择128 bit�
 
 W0必须无条件接收最多4路任意seq tag写回，并从tag低位派生本地ROB写地址。不得依赖单写端口存储或通过反压FE解决。
 多路地址decode和宽数据扇出是主要实现风险。
+固定基线使用共享小位宽decode生成per-entry one-hot commit；每个result entry只在自身
+commit有效时更新128 bit数据。RTL仅描述clock-enable语义，不手动例化ICG。
 
 6.6 R0 多路退休
 
 R0需要完成连续DONE检查、最多4路数据选择、输出旋转和history更新。第一版保持
 单级退休；若后续拆分流水，必须继续支持连续每周期最多4个报文退休。
+Active result的4-bank组织保证连续4个ROB ID分别落入不同bank。R0对每个bank只执行
+一次8:1行选择，再按head低2位以固定rotate-by-1/rotate-by-2网络恢复slot 0..3顺序，
+避免四份相互独立的32:1宽数据选择。
+ppe_retire_output在固定N=4基线下使用由start_lane两位分别控制的rotate-by-1和
+rotate-by-2两级barrel网络，不使用动态物理lane写索引。retire_count由合法dense-prefix
+valid的五种编码直接译码。每个物理输出lane继续使用公共packet寄存器使能，以保留自动
+clock-gating推断机会并抑制无效lane宽数据翻转。
 
 6.7 实现后的优化观察方向
 
 首版结构按第7节固定。实现完成后可根据时序与性能数据观察：
 
-  1) D2分类队首窗口、4x4 legal matrix和multi-grant仲裁的组合深度；
+  1) D2A固定4x4 legal/multi-grant网络以及pending lookahead旁路的组合深度；
   2) D3 payload、active ROB/history多路读取和FE宽数据路由；
   3) completion/retirement bypass的tag比较、优先选择和宽数据扇出；
   4) W0四路任意地址写回的decode和数据扇出；
@@ -378,16 +436,18 @@ R0需要完成连续DONE检查、最多4路数据选择、输出旋转和history
 首版 RTL 固定采用：
 
   1) FE_NUM=4、ISSUE_WIDTH=4；
-  2) D2和D3之间保持一个流水边界，不再额外拆分；
-  3) issue table为每个FE实现一份可同周期消费/重填的selected-tag寄存器，scheduler维护8槽返回日历；
+  2) D2拆为D2A匹配/claim和D2B预约/commit，D2B与D3之间继续保持selected-tag流水边界；
+  3) issue table为每个FE实现一份可同周期消费/重填的selected-tag寄存器，scheduler维护
+     一组pending grant和8槽返回日历；
   4) FE completion只写active ROB，只有retirement写8-bank history；
   5) dependency gather按四级优先级支持最多4路读取，不在issue entry中复制宽依赖；
   6) R0使用单级退休并直接更新顶层输出寄存器；
   7) 不定义可综合的异常上报、恢复或全局锁死状态，内部一致性由验证侧检查。
-  8) scheduler使用4个深度32的delay分类READY ID FIFO；每类队首最多4项可同周期消费，
-     FIFO只保存5 bit issue ID，宽报文数据不复制。
-  9) ingress使用两项整批输入skid FIFO并寄存输出bkps；原始顶层输入不进入任何功能
-     组合路径，backend只对FIFO寄存head提供内部allocation ready。
+  8) scheduler使用4个深度32的delay分类READY ID FIFO；每类输出8项只读lookahead，
+     前4项最多由当前D2B提交消费，后4项允许D2A继续形成下一批pending grant；FIFO只
+     保存5 bit issue ID，宽报文数据不复制。
+  9) ingress使用两项整批elastic FIFO并寄存输出bkps；两个槽位均是输入边界寄存器，
+     原始顶层输入不进入任何功能组合路径，backend只对寄存head提供内部allocation ready。
 
 上述项目只有在后续时序或性能数据证明有必要时才重新评估。变更任一项都必须先同步
 HLD和LLD，不得在RTL中自行启用。

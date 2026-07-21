@@ -28,7 +28,7 @@
 //------------------------------------------------------------------------------
 
 module ppe_retire_output #(
-    parameter int unsigned PACKET_W = 128
+    parameter int PACKET_W = ppe_types_pkg::DEFAULT_PACKET_W
 ) (
     // Clock and reset
     input  logic                                      clk_i,
@@ -52,30 +52,17 @@ module ppe_retire_output #(
     // Local types and output start-lane state
     //--------------------------------------------------------------------------
 
-    localparam int unsigned LANE_ID_W = (N > 1) ? $clog2(N) : 1;
-    localparam int unsigned RETIRE_COUNT_W = $clog2(N + 1);
+    localparam int LANE_ID_W      = (N > 1) ? $clog2(N) : 1;
+    localparam int RETIRE_COUNT_W = $clog2(N + 1);
 
     typedef logic [LANE_ID_W-1:0]      lane_id_t;
     typedef logic [RETIRE_COUNT_W-1:0] retire_count_t;
 
-    function automatic lane_id_t lane_add(
-        input lane_id_t      base,
-        input retire_count_t offset
-    );
-        logic [RETIRE_COUNT_W:0] sum;
-        begin
-            sum = (RETIRE_COUNT_W + 1)'(base)
-                  + (RETIRE_COUNT_W + 1)'(offset);
-            if (sum >= (RETIRE_COUNT_W + 1)'(N)) begin
-                sum = sum - (RETIRE_COUNT_W + 1)'(N);
-            end
-            lane_add = lane_id_t'(sum);
-        end
-    endfunction
-
     lane_id_t start_lane_q;
     retire_count_t retire_count;
 
+    logic [N-1:0]               rotate_one_valid;
+    logic [N-1:0][PACKET_W-1:0] rotate_one_data;
     logic [N-1:0]               mapped_valid;
     logic [N-1:0][PACKET_W-1:0] mapped_data;
 
@@ -83,44 +70,54 @@ module ppe_retire_output #(
     // Logical-retirement to physical-lane mapping
     //--------------------------------------------------------------------------
 
-    always_comb begin
-        retire_count = '0;
-        mapped_valid = '0;
-        mapped_data  = '0;
-
-        for (int unsigned retire_idx = 0; retire_idx < N; retire_idx++) begin
-            lane_id_t physical_lane;
-
-            physical_lane = lane_add(
-                start_lane_q, retire_count_t'(retire_idx));
-
-            if (retire_valid_i[retire_idx]) begin
-                mapped_valid[physical_lane] = 1'b1;
-                mapped_data[physical_lane]  = retire_data_i[retire_idx];
-                retire_count = retire_count + retire_count_t'(1);
-            end
+    always_comb begin : retirement_lane_mapping
+        // Stage one optionally rotates the logical bundle by one lane.
+        rotate_one_valid = retire_valid_i;
+        rotate_one_data  = retire_data_i;
+        if (start_lane_q[0]) begin
+            rotate_one_valid = {retire_valid_i[2:0], retire_valid_i[3]};
+            rotate_one_data  = {retire_data_i[2:0], retire_data_i[3]};
         end
+
+        // Stage two optionally rotates the stage-one bundle by two lanes.
+        mapped_valid = rotate_one_valid;
+        mapped_data  = rotate_one_data;
+        if (start_lane_q[1]) begin
+            mapped_valid = {rotate_one_valid[1:0], rotate_one_valid[3:2]};
+            mapped_data  = {rotate_one_data[1:0], rotate_one_data[3:2]};
+        end
+
+        // retire_valid_i is contractually a dense prefix from logical slot 0.
+        unique case (retire_valid_i)
+            4'b0000: retire_count = RETIRE_COUNT_W'(0);
+            4'b0001: retire_count = RETIRE_COUNT_W'(1);
+            4'b0011: retire_count = RETIRE_COUNT_W'(2);
+            4'b0111: retire_count = RETIRE_COUNT_W'(3);
+            4'b1111: retire_count = RETIRE_COUNT_W'(4);
+            default: retire_count = '0;
+        endcase
     end
 
     //--------------------------------------------------------------------------
     // Registered output update
     //--------------------------------------------------------------------------
 
-    always_ff @(posedge clk_i or negedge rst_ni) begin
+    always_ff @(posedge clk_i or negedge rst_ni) begin : output_state_update
         if (!rst_ni) begin
             start_lane_q <= '0;
             out_valid_o  <= '0;
         end else begin
             out_valid_o <= mapped_valid;
 
-            for (int unsigned lane_idx = 0; lane_idx < N; lane_idx++) begin
+            for (int lane_idx = 0; lane_idx < N; lane_idx++) begin
                 if (mapped_valid[lane_idx]) begin
                     out_packet_o[lane_idx] <= mapped_data[lane_idx];
                 end
             end
 
             if (retire_count != '0) begin
-                start_lane_q <= lane_add(start_lane_q, retire_count);
+                // N is fixed at four; truncation implements modulo-four wrap.
+                start_lane_q <= start_lane_q + lane_id_t'(retire_count);
             end
         end
     end

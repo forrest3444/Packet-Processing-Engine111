@@ -29,8 +29,7 @@
 //------------------------------------------------------------------------------
 
 module ppe_rob #(
-    parameter int unsigned PACKET_W    = 128,
-    parameter int unsigned ISSUE_WIDTH = 4
+    parameter int PACKET_W = ppe_types_pkg::DEFAULT_PACKET_W
 ) (
     // Clock and reset
     input  logic                                           clk_i,
@@ -52,11 +51,12 @@ module ppe_rob #(
 
     // D3 dependency-data gather. data_valid reports that authoritative result
     // data was resolved; it does not apply backpressure to the request.
-    input  logic [ISSUE_WIDTH-1:0]                         dep_gather_valid_i,
-    input  logic [ISSUE_WIDTH-1:0]
+    input  logic [ppe_types_pkg::ISSUE_WIDTH-1:0]          dep_gather_valid_i,
+    input  logic [ppe_types_pkg::ISSUE_WIDTH-1:0]
                  [ppe_types_pkg::SEQ_W-1:0]                dep_gather_target_seq_tag_i,
-    output logic [ISSUE_WIDTH-1:0]                         dep_gather_data_valid_o,
-    output logic [ISSUE_WIDTH-1:0][PACKET_W-1:0]           dep_gather_data_o,
+    output logic [ppe_types_pkg::ISSUE_WIDTH-1:0]          dep_gather_data_valid_o,
+    output logic [ppe_types_pkg::ISSUE_WIDTH-1:0]
+                 [PACKET_W-1:0]                            dep_gather_data_o,
 
     // Tagged FE completions. There is no ready; every protocol-valid return
     // must be captured in its asserted cycle.
@@ -77,14 +77,17 @@ module ppe_rob #(
     // Local parameters, types, and pointer arithmetic
     //--------------------------------------------------------------------------
 
-    localparam int unsigned LANE_COUNT_W  = $clog2(N + 1);
-    localparam int unsigned OCCUPANCY_W   = $clog2(ROB_DEPTH + 1);
-    localparam int unsigned HISTORY_DEPTH = 8;
-    localparam int unsigned HISTORY_ID_W  = $clog2(HISTORY_DEPTH);
-    localparam int unsigned PTR_SUM_W     = ROB_ID_W + 1;
+    localparam int LANE_COUNT_W = $clog2(N + 1);
+    localparam int OCCUPANCY_W  = $clog2(ROB_DEPTH + 1);
+    localparam int PTR_SUM_W    = ROB_ID_W + 1;
+    localparam int DATA_BANK_NUM = N;
+    localparam int DATA_BANK_W   = $clog2(DATA_BANK_NUM);
+    localparam int DATA_ROW_NUM  = ROB_DEPTH / DATA_BANK_NUM;
+    localparam int DATA_ROW_W    = $clog2(DATA_ROW_NUM);
 
-    typedef logic [ROB_ID_W-1:0]     rob_id_t;
     typedef logic [LANE_COUNT_W-1:0] lane_count_t;
+    typedef logic [DATA_BANK_W-1:0]  data_bank_t;
+    typedef logic [DATA_ROW_W-1:0]   data_row_t;
 
     // ROB_DEPTH >= N means adding one batch requires at most one wrap.
     function automatic rob_id_t rob_ptr_add(
@@ -105,14 +108,16 @@ module ppe_rob #(
     // Active ROB and retired-history storage
     //--------------------------------------------------------------------------
 
-    logic [ROB_DEPTH-1:0]               rob_valid_q;
-    logic [ROB_DEPTH-1:0]               rob_result_valid_q;
-    logic [ROB_DEPTH-1:0][SEQ_W-1:0]    rob_seq_tag_q;
-    logic [ROB_DEPTH-1:0][PACKET_W-1:0] rob_data_q;
+    logic [ROB_DEPTH-1:0]            rob_valid_q;
+    logic [ROB_DEPTH-1:0]            rob_result_valid_q;
+    logic [ROB_DEPTH-1:0][SEQ_W-1:0] rob_seq_tag_q;
 
-    logic [HISTORY_DEPTH-1:0]               history_valid_q;
-    logic [HISTORY_DEPTH-1:0][SEQ_W-1:0]    history_seq_tag_q;
-    logic [HISTORY_DEPTH-1:0][PACKET_W-1:0] history_data_q;
+    logic [DATA_BANK_NUM-1:0][DATA_ROW_NUM-1:0]
+          [PACKET_W-1:0] rob_data_q;
+
+    logic [RESULT_BANKS-1:0]               history_valid_q;
+    logic [RESULT_BANKS-1:0][SEQ_W-1:0]    history_seq_tag_q;
+    logic [RESULT_BANKS-1:0][PACKET_W-1:0] history_data_q;
 
     //--------------------------------------------------------------------------
     // Global state and per-cycle events
@@ -136,15 +141,42 @@ module ppe_rob #(
     logic [N-1:0][SEQ_W-1:0]    retire_seq_tag;
     logic [N-1:0]               alloc_fire;
 
+    logic [ROB_DEPTH-1:0][FE_NUM-1:0]      wb_entry_commit;
+    logic [ROB_DEPTH-1:0]                  wb_entry_write_en;
+    logic [ROB_DEPTH-1:0][PACKET_W-1:0]    wb_entry_write_data;
+
+    logic [RESULT_BANKS-1:0]               history_write_en;
+    logic [RESULT_BANKS-1:0][SEQ_W-1:0]    history_write_seq_tag;
+    logic [RESULT_BANKS-1:0][PACKET_W-1:0] history_write_data;
+
+    logic [DATA_BANK_NUM-1:0][PACKET_W-1:0] retire_bank_data;
+    logic [DATA_BANK_NUM-1:0][PACKET_W-1:0] retire_rotate_one_data;
+
+    logic [N-1:0]             dep_status_active_match;
+    logic [N-1:0]             dep_status_active_available;
+    logic [N-1:0]             dep_status_history_match;
+    logic [ISSUE_WIDTH-1:0]   dep_gather_active_match;
+    logic [ISSUE_WIDTH-1:0]   dep_gather_active_available;
+    logic [ISSUE_WIDTH-1:0]   dep_gather_history_match;
+    logic [ISSUE_WIDTH-1:0][PACKET_W-1:0] dep_gather_active_data;
+    logic [ISSUE_WIDTH-1:0][PACKET_W-1:0] dep_gather_history_data;
+
+    function automatic logic [PACKET_W-1:0] rob_data_read(
+        input rob_id_t rob_id
+    );
+        rob_data_read = rob_data_q[rob_id[DATA_BANK_W-1:0]]
+                                  [rob_id[ROB_ID_W-1:DATA_BANK_W]];
+    endfunction
+
     //--------------------------------------------------------------------------
     // Local allocation request decode
     //--------------------------------------------------------------------------
 
-    always_comb begin
+    always_comb begin : allocation_request_decode
         request_count  = '0;
         alloc_rob_id   = '0;
 
-        for (int unsigned lane_idx = 0; lane_idx < N; lane_idx++) begin
+        for (int lane_idx = 0; lane_idx < N; lane_idx++) begin
             if (alloc_req_valid_i[lane_idx]) begin
                 request_count = request_count + lane_count_t'(1);
                 alloc_rob_id[lane_idx] = rob_id_t'(
@@ -155,32 +187,47 @@ module ppe_rob #(
 
     assign alloc_fire = alloc_req_valid_i & {N{alloc_ready_o}};
 
-    always_comb begin
-        alloc_count = '0;
-        for (int unsigned lane_idx = 0; lane_idx < N; lane_idx++) begin
-            if (alloc_fire[lane_idx]) begin
-                alloc_count = alloc_count + lane_count_t'(1);
-            end
-        end
+    always_comb begin : allocation_count_decode
+        alloc_count = alloc_ready_o ? request_count : '0;
     end
 
     //--------------------------------------------------------------------------
     // Writeback qualification and completion-bypass event generation
     //--------------------------------------------------------------------------
 
-    always_comb begin
-        wb_commit = '0;
-        wb_rob_id = '0;
+    always_comb begin : writeback_qualification
+        wb_commit          = '0;
+        wb_rob_id          = '0;
+        wb_entry_commit    = '0;
+        wb_entry_write_en  = '0;
+        wb_entry_write_data = '0;
 
-        for (int unsigned wb_idx = 0; wb_idx < FE_NUM; wb_idx++) begin
+        for (int wb_idx = 0; wb_idx < FE_NUM; wb_idx++) begin
             wb_rob_id[wb_idx] = rob_id_t'(
                 wb_seq_tag_i[wb_idx][ROB_ID_W-1:0]);
-            if (wb_valid_i[wb_idx]
-                && rob_valid_q[wb_rob_id[wb_idx]]
-                && (rob_seq_tag_q[wb_rob_id[wb_idx]]
-                    == wb_seq_tag_i[wb_idx])
-                && !rob_result_valid_q[wb_rob_id[wb_idx]]) begin
-                wb_commit[wb_idx] = 1'b1;
+
+            for (int entry_idx = 0;
+                 entry_idx < ROB_DEPTH;
+                 entry_idx++) begin
+                if (wb_valid_i[wb_idx]
+                    && (wb_rob_id[wb_idx] == rob_id_t'(entry_idx))
+                    && rob_valid_q[entry_idx]
+                    && (rob_seq_tag_q[entry_idx] == wb_seq_tag_i[wb_idx])
+                    && !rob_result_valid_q[entry_idx]) begin
+                    wb_entry_commit[entry_idx][wb_idx] = 1'b1;
+                    wb_commit[wb_idx] = 1'b1;
+                end
+            end
+        end
+
+        for (int entry_idx = 0;
+             entry_idx < ROB_DEPTH;
+             entry_idx++) begin
+            for (int wb_idx = 0; wb_idx < FE_NUM; wb_idx++) begin
+                if (wb_entry_commit[entry_idx][wb_idx]) begin
+                    wb_entry_write_en[entry_idx] = 1'b1;
+                    wb_entry_write_data[entry_idx] = wb_data_i[wb_idx];
+                end
             end
         end
     end
@@ -194,21 +241,19 @@ module ppe_rob #(
         rob_id_t scan_rob_id;
 
         retire_valid_o = '0;
-        retire_data_o  = '0;
         retire_rob_id  = '0;
         retire_seq_tag = '0;
         retire_count   = '0;
         prefix_done    = 1'b1;
         scan_rob_id    = '0;
 
-        for (int unsigned retire_idx = 0; retire_idx < N; retire_idx++) begin
+        for (int retire_idx = 0; retire_idx < N; retire_idx++) begin
             scan_rob_id = rob_ptr_add(head_ptr_q, lane_count_t'(retire_idx));
 
             if (prefix_done
                 && rob_valid_q[scan_rob_id]
                 && rob_result_valid_q[scan_rob_id]) begin
                 retire_valid_o[retire_idx] = 1'b1;
-                retire_data_o[retire_idx]  = rob_data_q[scan_rob_id];
                 retire_rob_id[retire_idx]  = scan_rob_id;
                 retire_seq_tag[retire_idx] = rob_seq_tag_q[scan_rob_id];
                 retire_count = retire_count + lane_count_t'(1);
@@ -218,11 +263,70 @@ module ppe_rob #(
         end
     end
 
+    always_comb begin : retirement_data_read
+        data_row_t bank_row;
+
+        retire_bank_data       = '0;
+        retire_rotate_one_data = '0;
+        retire_data_o          = '0;
+        bank_row               = '0;
+
+        // Four consecutive ROB IDs touch each low-two-bit bank exactly once.
+        for (int bank_idx = 0;
+             bank_idx < DATA_BANK_NUM;
+             bank_idx++) begin
+            bank_row = data_row_t'(head_ptr_q[ROB_ID_W-1:DATA_BANK_W]);
+            if (data_bank_t'(bank_idx)
+                < head_ptr_q[DATA_BANK_W-1:0]) begin
+                bank_row = bank_row + data_row_t'(1);
+            end
+            retire_bank_data[bank_idx] = rob_data_q[bank_idx][bank_row];
+        end
+
+        // Rotate bank order into logical retirement order head, head+1, ... .
+        retire_rotate_one_data = retire_bank_data;
+        if (head_ptr_q[0]) begin
+            retire_rotate_one_data = {
+                retire_bank_data[0], retire_bank_data[3:1]
+            };
+        end
+
+        retire_data_o = retire_rotate_one_data;
+        if (head_ptr_q[1]) begin
+            retire_data_o = {
+                retire_rotate_one_data[1:0], retire_rotate_one_data[3:2]
+            };
+        end
+    end
+
+    // Convert retirement history updates to local bank enables.
+    always_comb begin : history_write_decode
+        history_write_en      = '0;
+        history_write_seq_tag = '0;
+        history_write_data    = '0;
+
+        for (int history_idx = 0;
+             history_idx < RESULT_BANKS;
+             history_idx++) begin
+            for (int retire_idx = 0; retire_idx < N; retire_idx++) begin
+                if (retire_valid_o[retire_idx]
+                    && (retire_seq_tag[retire_idx][HISTORY_ID_W-1:0]
+                        == HISTORY_ID_W'(history_idx))) begin
+                    history_write_en[history_idx] = 1'b1;
+                    history_write_seq_tag[history_idx] =
+                        retire_seq_tag[retire_idx];
+                    history_write_data[history_idx] =
+                        retire_data_o[retire_idx];
+                end
+            end
+        end
+    end
+
     //--------------------------------------------------------------------------
     // Registered-head allocation capacity
     //--------------------------------------------------------------------------
 
-    always_comb begin
+    always_comb begin : allocation_capacity
         free_count      = OCCUPANCY_W'(ROB_DEPTH) - occupancy_q;
         available_count = free_count + OCCUPANCY_W'(retire_count);
 
@@ -235,26 +339,98 @@ module ppe_rob #(
     end
 
     //--------------------------------------------------------------------------
-    // D0 dependency-status resolution
+    // Shared per-query active-ROB and history lookup metadata
     //--------------------------------------------------------------------------
 
-    always_comb begin : dependency_status_resolve
-        dep_status_available_o = '0;
+    always_comb begin : dependency_lookup_decode
+        dep_status_active_match       = '0;
+        dep_status_active_available   = '0;
+        dep_status_history_match      = '0;
+        dep_gather_active_match       = '0;
+        dep_gather_active_available   = '0;
+        dep_gather_history_match      = '0;
+        dep_gather_active_data        = '0;
+        dep_gather_history_data       = '0;
 
-        for (int unsigned query_idx = 0; query_idx < N; query_idx++) begin
-            logic                    source_resolved;
+        for (int query_idx = 0; query_idx < N; query_idx++) begin
             rob_id_t                 target_rob_id;
             logic [HISTORY_ID_W-1:0] history_id;
 
-            source_resolved = 1'b0;
             target_rob_id = rob_id_t'(
                 dep_status_target_seq_tag_i[query_idx][ROB_ID_W-1:0]);
             history_id = dep_status_target_seq_tag_i[query_idx]
                          [HISTORY_ID_W-1:0];
 
             if (dep_status_valid_i[query_idx]) begin
+                if (rob_valid_q[target_rob_id]
+                    && (rob_seq_tag_q[target_rob_id]
+                        == dep_status_target_seq_tag_i[query_idx])) begin
+                    dep_status_active_match[query_idx] = 1'b1;
+                    dep_status_active_available[query_idx] =
+                        rob_result_valid_q[target_rob_id];
+                end
+
+                if (history_valid_q[history_id]
+                    && (history_seq_tag_q[history_id]
+                        == dep_status_target_seq_tag_i[query_idx])) begin
+                    dep_status_history_match[query_idx] = 1'b1;
+                end
+            end
+        end
+
+        for (int query_idx = 0;
+             query_idx < ISSUE_WIDTH;
+             query_idx++) begin
+            rob_id_t                 target_rob_id;
+            logic [HISTORY_ID_W-1:0] history_id;
+
+            target_rob_id = rob_id_t'(
+                dep_gather_target_seq_tag_i[query_idx][ROB_ID_W-1:0]);
+            history_id = dep_gather_target_seq_tag_i[query_idx]
+                         [HISTORY_ID_W-1:0];
+
+            if (dep_gather_valid_i[query_idx]) begin
+                if (rob_valid_q[target_rob_id]
+                    && (rob_seq_tag_q[target_rob_id]
+                        == dep_gather_target_seq_tag_i[query_idx])) begin
+                    dep_gather_active_match[query_idx] = 1'b1;
+                    dep_gather_active_available[query_idx] =
+                        rob_result_valid_q[target_rob_id];
+                    if (rob_result_valid_q[target_rob_id]) begin
+                        dep_gather_active_data[query_idx] =
+                            rob_data_read(target_rob_id);
+                    end
+                end
+
+                if (history_valid_q[history_id]
+                    && (history_seq_tag_q[history_id]
+                        == dep_gather_target_seq_tag_i[query_idx])) begin
+                    dep_gather_history_match[query_idx] = 1'b1;
+                    dep_gather_history_data[query_idx] =
+                        history_data_q[history_id];
+                end
+            end
+        end
+    end
+
+    //--------------------------------------------------------------------------
+    // D0 dependency-status resolution
+    //--------------------------------------------------------------------------
+
+    always_comb begin : dependency_status_resolve
+        dep_status_available_o = '0;
+
+        for (int query_idx = 0; query_idx < N; query_idx++) begin
+            logic    source_resolved;
+            rob_id_t target_rob_id;
+
+            source_resolved = 1'b0;
+            target_rob_id = rob_id_t'(
+                dep_status_target_seq_tag_i[query_idx][ROB_ID_W-1:0]);
+
+            if (dep_status_valid_i[query_idx]) begin
                 // 1) Completion bypass.
-                for (int unsigned wb_idx = 0; wb_idx < FE_NUM; wb_idx++) begin
+                for (int wb_idx = 0; wb_idx < FE_NUM; wb_idx++) begin
                     if (!source_resolved
                         && wb_commit[wb_idx]
                         && (wb_rob_id[wb_idx] == target_rob_id)
@@ -266,7 +442,7 @@ module ppe_rob #(
                 end
 
                 // 2) Retirement bypass using pre-edge ROB contents.
-                for (int unsigned retire_idx = 0;
+                for (int retire_idx = 0;
                      retire_idx < N;
                      retire_idx++) begin
                     if (!source_resolved
@@ -281,19 +457,15 @@ module ppe_rob #(
                 // 3) Active ROB. A pending full-tag match is authoritative and
                 // must stop the search before retired history.
                 if (!source_resolved
-                    && rob_valid_q[target_rob_id]
-                    && (rob_seq_tag_q[target_rob_id]
-                        == dep_status_target_seq_tag_i[query_idx])) begin
+                    && dep_status_active_match[query_idx]) begin
                     source_resolved = 1'b1;
                     dep_status_available_o[query_idx] =
-                        rob_result_valid_q[target_rob_id];
+                        dep_status_active_available[query_idx];
                 end
 
                 // 4) Retired history.
                 if (!source_resolved
-                    && history_valid_q[history_id]
-                    && (history_seq_tag_q[history_id]
-                        == dep_status_target_seq_tag_i[query_idx])) begin
+                    && dep_status_history_match[query_idx]) begin
                     dep_status_available_o[query_idx] = 1'b1;
                 end
             end
@@ -308,22 +480,19 @@ module ppe_rob #(
         dep_gather_data_valid_o = '0;
         dep_gather_data_o       = '0;
 
-        for (int unsigned query_idx = 0;
+        for (int query_idx = 0;
              query_idx < ISSUE_WIDTH;
              query_idx++) begin
-            logic                    source_resolved;
-            rob_id_t                 target_rob_id;
-            logic [HISTORY_ID_W-1:0] history_id;
+            logic    source_resolved;
+            rob_id_t target_rob_id;
 
             source_resolved = 1'b0;
             target_rob_id = rob_id_t'(
                 dep_gather_target_seq_tag_i[query_idx][ROB_ID_W-1:0]);
-            history_id = dep_gather_target_seq_tag_i[query_idx]
-                         [HISTORY_ID_W-1:0];
 
             if (dep_gather_valid_i[query_idx]) begin
                 // 1) Completion bypass.
-                for (int unsigned wb_idx = 0; wb_idx < FE_NUM; wb_idx++) begin
+                for (int wb_idx = 0; wb_idx < FE_NUM; wb_idx++) begin
                     if (!source_resolved
                         && wb_commit[wb_idx]
                         && (wb_rob_id[wb_idx] == target_rob_id)
@@ -336,7 +505,7 @@ module ppe_rob #(
                 end
 
                 // 2) Retirement bypass.
-                for (int unsigned retire_idx = 0;
+                for (int retire_idx = 0;
                      retire_idx < N;
                      retire_idx++) begin
                     if (!source_resolved
@@ -352,25 +521,22 @@ module ppe_rob #(
 
                 // 3) Active ROB, including the authoritative pending case.
                 if (!source_resolved
-                    && rob_valid_q[target_rob_id]
-                    && (rob_seq_tag_q[target_rob_id]
-                        == dep_gather_target_seq_tag_i[query_idx])) begin
+                    && dep_gather_active_match[query_idx]) begin
                     source_resolved = 1'b1;
                     dep_gather_data_valid_o[query_idx] =
-                        rob_result_valid_q[target_rob_id];
-                    if (rob_result_valid_q[target_rob_id]) begin
+                        dep_gather_active_available[query_idx];
+                    if (dep_gather_active_available[query_idx]) begin
                         dep_gather_data_o[query_idx] =
-                            rob_data_q[target_rob_id];
+                            dep_gather_active_data[query_idx];
                     end
                 end
 
                 // 4) Retired history.
                 if (!source_resolved
-                    && history_valid_q[history_id]
-                    && (history_seq_tag_q[history_id]
-                        == dep_gather_target_seq_tag_i[query_idx])) begin
+                    && dep_gather_history_match[query_idx]) begin
                     dep_gather_data_valid_o[query_idx] = 1'b1;
-                    dep_gather_data_o[query_idx] = history_data_q[history_id];
+                    dep_gather_data_o[query_idx] =
+                        dep_gather_history_data[query_idx];
                 end
             end
         end
@@ -380,46 +546,28 @@ module ppe_rob #(
     // Concurrent state update
     //--------------------------------------------------------------------------
 
-    // Within one edge the effective priority is writeback, retirement, then
-    // allocation. Allocation therefore owns the final state of a slot reused
-    // from the retirement prefix on that edge.
-    always_ff @(posedge clk_i or negedge rst_ni) begin
+    // Within one edge the effective metadata priority is writeback,
+    // retirement, then allocation. Allocation therefore owns the final state
+    // of a slot reused from the retirement prefix on that edge.
+    always_ff @(posedge clk_i or negedge rst_ni) begin : rob_metadata_update
         if (!rst_ni) begin
             rob_valid_q        <= '0;
             rob_result_valid_q <= '0;
-            history_valid_q    <= '0;
-            head_ptr_q         <= '0;
-            occupancy_q        <= '0;
         end else begin
-            // W0: capture all qualified FE completions.
-            for (int unsigned wb_idx = 0; wb_idx < FE_NUM; wb_idx++) begin
+            for (int wb_idx = 0; wb_idx < FE_NUM; wb_idx++) begin
                 if (wb_commit[wb_idx]) begin
-                    rob_data_q[wb_rob_id[wb_idx]] <= wb_data_i[wb_idx];
                     rob_result_valid_q[wb_rob_id[wb_idx]] <= 1'b1;
                 end
             end
 
-            // R0: history and output observe pre-edge ROB contents.
-            for (int unsigned retire_idx = 0;
-                 retire_idx < N;
-                 retire_idx++) begin
+            for (int retire_idx = 0; retire_idx < N; retire_idx++) begin
                 if (retire_valid_o[retire_idx]) begin
-                    history_valid_q[
-                        retire_seq_tag[retire_idx][HISTORY_ID_W-1:0]] <= 1'b1;
-                    history_seq_tag_q[
-                        retire_seq_tag[retire_idx][HISTORY_ID_W-1:0]] <=
-                        retire_seq_tag[retire_idx];
-                    history_data_q[
-                        retire_seq_tag[retire_idx][HISTORY_ID_W-1:0]] <=
-                        retire_data_o[retire_idx];
-
                     rob_valid_q[retire_rob_id[retire_idx]] <= 1'b0;
                     rob_result_valid_q[retire_rob_id[retire_idx]] <= 1'b0;
                 end
             end
 
-            // A0: allocation is the final writer for same-edge slot reuse.
-            for (int unsigned alloc_idx = 0; alloc_idx < N; alloc_idx++) begin
+            for (int alloc_idx = 0; alloc_idx < N; alloc_idx++) begin
                 if (alloc_fire[alloc_idx]) begin
                     rob_valid_q[alloc_rob_id[alloc_idx]] <= 1'b1;
                     rob_seq_tag_q[alloc_rob_id[alloc_idx]] <=
@@ -427,7 +575,59 @@ module ppe_rob #(
                     rob_result_valid_q[alloc_rob_id[alloc_idx]] <= 1'b0;
                 end
             end
+        end
+    end
 
+    // Wide active-result data has an entry-local write enable and is not reset.
+    always_ff @(posedge clk_i) begin : rob_result_data_update
+        for (int bank_idx = 0;
+             bank_idx < DATA_BANK_NUM;
+             bank_idx++) begin
+            for (int row_idx = 0;
+                 row_idx < DATA_ROW_NUM;
+                 row_idx++) begin
+                if (wb_entry_write_en[
+                        (row_idx * DATA_BANK_NUM) + bank_idx]) begin
+                    rob_data_q[bank_idx][row_idx] <=
+                        wb_entry_write_data[
+                            (row_idx * DATA_BANK_NUM) + bank_idx];
+                end
+            end
+        end
+    end
+
+    always_ff @(posedge clk_i or negedge rst_ni) begin : history_metadata_update
+        if (!rst_ni) begin
+            history_valid_q <= '0;
+        end else begin
+            for (int history_idx = 0;
+                 history_idx < RESULT_BANKS;
+                 history_idx++) begin
+                if (history_write_en[history_idx]) begin
+                    history_valid_q[history_idx] <= 1'b1;
+                    history_seq_tag_q[history_idx] <=
+                        history_write_seq_tag[history_idx];
+                end
+            end
+        end
+    end
+
+    // History data is architecturally ignored while its valid bit is clear.
+    always_ff @(posedge clk_i) begin : history_data_update
+        for (int history_idx = 0;
+             history_idx < RESULT_BANKS;
+             history_idx++) begin
+            if (history_write_en[history_idx]) begin
+                history_data_q[history_idx] <= history_write_data[history_idx];
+            end
+        end
+    end
+
+    always_ff @(posedge clk_i or negedge rst_ni) begin : rob_control_update
+        if (!rst_ni) begin
+            head_ptr_q  <= '0;
+            occupancy_q <= '0;
+        end else begin
             if (retire_count != '0) begin
                 head_ptr_q <= rob_ptr_add(head_ptr_q, retire_count);
             end

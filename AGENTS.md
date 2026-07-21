@@ -82,6 +82,22 @@ After editing RTL:
 3. Check logs for assertions, timeouts, dropped packets, duplicates, ordering failures, and dependency mismatches.
 4. Report verification performed and clearly label any unmeasured PPA expectations as qualitative.
 
+## STA environment and handoff
+
+- Docker is installed and user `wwh` belongs to the `docker` group. If an existing agent process has stale group membership, run Docker commands as `sg docker -c '<command>'`.
+- OpenROAD-flow-scripts is installed at `/home/wwh/github/OpenROAD-flow-scripts`. Its Docker image provides Yosys/ABC, OpenROAD/OpenSTA, KLayout, and the bundled Nangate45 platform. Host-side Verilator and GTKWave are also available.
+- The repository has a 1 GHz starting point under `flow/orfs/`: `config.mk`, `constraint_1ghz.sdc`, and `report_critical.tcl`. Before reuse, synchronize its top, RTL file list, and result paths with the current design; do not assume the checked-in configuration follows later RTL restructuring automatically.
+- Run front-end synthesis from the repository root with:
+
+  ```sh
+  sg docker -c '/home/wwh/github/OpenROAD-flow-scripts/flow/util/docker_shell --image openroad/orfs:latest make --file=/OpenROAD-flow-scripts/flow/Makefile DESIGN_CONFIG=/work/flow/orfs/config.mk WORK_HOME=/work/flow/orfs/work synth'
+  ```
+
+  Use the `place` target only when placement-estimated parasitics are needed. Do not run the default full RTL-to-GDS target for ordinary front-end timing work.
+- Nangate45 currently uses its typical Liberty corner and is suitable for comparative optimization, not foundry signoff. Every timing result must state clock period, uncertainty, I/O delays, corner, and whether delays are synthesis-only or placement-estimated; report WNS, TNS, and the actual startpoint/endpoint path. Never claim that 1 GHz is met from synthesis completion alone.
+- Treat inferred latches, unconstrained endpoints, combinational loops, incomplete synthesis, or missing clocks as hard blockers to a credible critical-path report. Preserve the failing log and fix or report the modeling/RTL issue first.
+- Known environment limits: the available prebuilt ORFS images have triggered a repeatable `illegal instruction` in the post-CTS flow on this VMware host, while synthesis and pre-CTS stages run. VCS may also fail when the license server is unavailable. Do not misreport either condition as an RTL timing failure.
+
 ## Review checklist
 
 - Externally observable behavior matches the functional specification.
