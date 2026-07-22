@@ -109,14 +109,14 @@ module tb_top_sv;
     // Translate the unified two-bit issue state into the closest legacy debug
     // encoding so existing diagnostic messages remain readable.
     always_comb begin
-        unique case (dut.u_issue_table.issue_entry_q[1].state)
+        unique case (dut.u_issue_table.issue_state_q[1])
             2'd0: pif.dbg_entry1_state = 3'd0;
             2'd1: pif.dbg_entry1_state = 3'd2;
             2'd2: pif.dbg_entry1_state =
-                      dut.u_issue_table.issue_entry_q[1].dep_required
+                      dut.u_issue_table.issue_dep_required_q[1]
                       ? 3'd4 : 3'd3;
             default: pif.dbg_entry1_state =
-                         dut.u_issue_table.issue_entry_q[1].dep_required
+                         dut.u_issue_table.issue_dep_required_q[1]
                          ? 3'd6 : 3'd5;
         endcase
     end

@@ -160,7 +160,7 @@ scheduler管理尚未进入FE的报文，负责：
 
   - 等待依赖和等待 FE 的报文管理；
   - 接收沿依赖状态初始化和FE completion tag唤醒；
-  - 4个delay分类READY ID队列和公平的多路FE/返回槽选择；
+  - 4个delay分类READY tag队列和公平的多路FE/返回槽选择；
   - per-FE 8槽返回周期预约及返回tag关联；
   - payload读取和最多4路权威依赖结果gather；
   - 将FE completion关联为带完整seq tag的writeback事件。
@@ -168,8 +168,9 @@ scheduler管理尚未进入FE的报文，负责：
 Scheduler只拥有报文进入FE之前的调度状态。报文成功进入FE后，长期顺序和输出
 状态继续由backend ROB保存。
 
-其中ppe_issue_table同时拥有32项issue entry、4个delay-class ID FIFO、独立queued
-标志和READY发现轮询指针。它向ppe_fe_scheduler提供每类8项的寄存器化队首lookahead；
+其中ppe_issue_table同时拥有32项issue entry、4个delay-class循环tag FIFO、独立queued
+标志和READY发现轮询指针。每类FIFO以head/tail/count管理，不移动既有槽位；保存完整
+seq tag并向ppe_fe_scheduler提供8项队首lookahead，避免候选阶段再次动态读取entry tag。
 packet宽数据不进入候选接口，仅在D3按已选seq tag低位从ppe_issue_table读取。
 
 ppe_fe_scheduler拥有两级D2、candidate-to-FE匹配、per-FE 8槽return calendar、
@@ -248,10 +249,15 @@ Completion bypass允许同一接收沿的新entry或等待entry识别该completi
 
 4.3 FE 调度
 
-ISSUE_READY报文按delay进入4个分类ID队列，报文宽数据仍只保存在issue table。每个分类
-队列提供8个队首ID作为流水lookahead，D2A跳过当前pending前缀后仍可观察最多4个新
+ISSUE_READY报文按delay进入4个分类循环tag队列，报文宽数据仍只保存在issue table。每个分类
+队列提供8个队首完整tag作为流水lookahead，D2A跳过当前pending前缀后仍可观察最多4个新
 候选，同一分类允许获得多个FE。ISSUE_WAIT_DEP报文不占
 READY队列位置，避免未满足依赖的报文形成队头阻塞。
+
+READY发现按enqueue_rr_ptr旋转后使用固定深度的32取4平衡前缀网络；既有READY及
+同周期completion wakeup优先于新D0 allocation，二者均保持旋转后的物理entry顺序。
+禁止使用循环携带selected_count的跨32项串行greedy链。每类FIFO同周期最多弹出连续
+4项并追加4项，只有新写槽位更新，head/tail/count使用显式小位宽运算。
 
 调度器在4个分类有效队首与4个FE之间建立legal matrix。D2A先按class_rr_ptr和
 fe_rr_ptr把矩阵归一化；归一化FE lane f使用从归一化class f开始的固定循环优先级，
@@ -443,9 +449,10 @@ clock-gating推断机会并抑制无效lane宽数据翻转。
   5) dependency gather按四级优先级支持最多4路读取，不在issue entry中复制宽依赖；
   6) R0使用单级退休并直接更新顶层输出寄存器；
   7) 不定义可综合的异常上报、恢复或全局锁死状态，内部一致性由验证侧检查。
-  8) scheduler使用4个深度32的delay分类READY ID FIFO；每类输出8项只读lookahead，
+  8) scheduler使用4个深度32的delay分类READY循环tag FIFO；每类输出8项只读lookahead，
      前4项最多由当前D2B提交消费，后4项允许D2A继续形成下一批pending grant；FIFO只
-     保存5 bit issue ID，宽报文数据不复制。
+     保存完整6 bit seq tag，低位临时派生issue ID，宽报文数据不复制。READY发现采用
+     固定32取4平衡前缀网络，FIFO使用head/tail/count且不整体搬移存储槽位。
   9) ingress使用两项整批elastic FIFO并寄存输出bkps；两个槽位均是输入边界寄存器，
      原始顶层输入不进入任何功能组合路径，backend只对寄存head提供内部allocation ready。
 

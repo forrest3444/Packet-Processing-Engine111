@@ -12,7 +12,7 @@
 //   delay, dependency state, and unified issue state. READY-queue membership is
 //   maintained as separate bookkeeping rather than part of the entry payload.
 //
-//   This block also owns READY discovery and four delay-class ID FIFOs. It
+//   This block also owns READY discovery and four delay-class tag FIFOs. It
 //   exposes only registered FIFO head windows to the combinational candidate
 //   selector; packet-width data is read later through the D3 issue bundle.
 //
@@ -110,29 +110,26 @@ module ppe_issue_table #(
         ISSUE_SELECTED
     } issue_state_e;
 
-    typedef struct packed {
-        issue_state_e        state;
-        logic [SEQ_W-1:0]    seq_tag;
-        logic [SEQ_W-1:0]    target_seq_tag;
-        delay_t              delay;
-        logic                dep_required;
-        logic [PACKET_W-1:0] packet;
-    } issue_entry_t;
-
     localparam int QUEUE_COUNT_W = $clog2(ISSUE_DEPTH + 1);
-    localparam int PTR_SUM_W     = ROB_ID_W + 1;
+    localparam int ENQUEUE_COUNT_W = $clog2(READY_ENQUEUE_WIDTH + 1);
+    localparam int PREFIX_STAGE_NUM = $clog2(ISSUE_DEPTH);
+    localparam int ROTATE_INDEX_W = $clog2(2 * ISSUE_DEPTH);
 
-    function automatic rob_id_t issue_ptr_add(
-        input rob_id_t base,
-        input rob_id_t offset
+    function automatic logic [ENQUEUE_COUNT_W-1:0] saturated_count_add(
+        input logic [ENQUEUE_COUNT_W-1:0] lhs,
+        input logic [ENQUEUE_COUNT_W-1:0] rhs
     );
-        logic [PTR_SUM_W-1:0] sum;
+        logic [ENQUEUE_COUNT_W:0] sum;
         begin
-            sum = PTR_SUM_W'(base) + PTR_SUM_W'(offset);
-            if (sum >= PTR_SUM_W'(ISSUE_DEPTH)) begin
-                sum = sum - PTR_SUM_W'(ISSUE_DEPTH);
+            sum = {1'b0, lhs} + {1'b0, rhs};
+            if (sum[ENQUEUE_COUNT_W]
+                || (sum[ENQUEUE_COUNT_W-1:0]
+                    > ENQUEUE_COUNT_W'(READY_ENQUEUE_WIDTH))) begin
+                saturated_count_add =
+                    ENQUEUE_COUNT_W'(READY_ENQUEUE_WIDTH);
+            end else begin
+                saturated_count_add = ENQUEUE_COUNT_W'(sum);
             end
-            issue_ptr_add = rob_id_t'(sum);
         end
     endfunction
 
@@ -141,17 +138,36 @@ module ppe_issue_table #(
     // Issue-entry payload and metadata storage
     //--------------------------------------------------------------------------
 
-    issue_entry_t issue_entry_q [ISSUE_DEPTH];
-    logic [ISSUE_DEPTH-1:0] queued_q;
+    issue_state_e issue_state_q [ISSUE_DEPTH];
+    logic [ISSUE_DEPTH-1:0][SEQ_W-1:0]    issue_seq_tag_q;
+    logic [ISSUE_DEPTH-1:0][SEQ_W-1:0]    issue_target_seq_tag_q;
+    logic [ISSUE_DEPTH-1:0][DELAY_W-1:0]  issue_delay_q;
+    logic [ISSUE_DEPTH-1:0]               issue_dep_required_q;
+    logic [ISSUE_DEPTH-1:0][PACKET_W-1:0] issue_packet_q;
+    logic [ISSUE_DEPTH-1:0]               queued_q;
+
+    logic [ISSUE_DEPTH-1:0]               packet_write_en;
+    logic [ISSUE_DEPTH-1:0][PACKET_W-1:0] packet_write_data;
 
     logic [DELAY_CLASS_NUM-1:0][ISSUE_DEPTH-1:0]
-          [ROB_ID_W-1:0] ready_q_id_q;
-    logic [DELAY_CLASS_NUM-1:0][ISSUE_DEPTH-1:0]
-          [ROB_ID_W-1:0] ready_q_id_d;
+          [SEQ_W-1:0] ready_q_seq_tag_q;
+    logic [DELAY_CLASS_NUM-1:0][ROB_ID_W-1:0] ready_q_head_q;
+    logic [DELAY_CLASS_NUM-1:0][ROB_ID_W-1:0] ready_q_tail_q;
     logic [DELAY_CLASS_NUM-1:0][QUEUE_COUNT_W-1:0]
           ready_q_count_q;
-    logic [DELAY_CLASS_NUM-1:0][QUEUE_COUNT_W-1:0]
-          ready_q_count_d;
+
+    logic [DELAY_CLASS_NUM-1:0][ENQUEUE_COUNT_W-1:0]
+          ready_pop_count;
+    logic [DELAY_CLASS_NUM-1:0][ENQUEUE_COUNT_W-1:0]
+          ready_push_count;
+    logic [DELAY_CLASS_NUM-1:0][ISSUE_DEPTH-1:0]
+          ready_write_en;
+    logic [DELAY_CLASS_NUM-1:0][ISSUE_DEPTH-1:0][SEQ_W-1:0]
+          ready_write_seq_tag;
+    logic [READY_ENQUEUE_WIDTH-1:0][ENQUEUE_COUNT_W-1:0]
+          enqueue_rank_in_class;
+    logic [READY_ENQUEUE_WIDTH-1:0][ROB_ID_W-1:0]
+          enqueue_write_position;
 
     rob_id_t enqueue_rr_ptr_q;
     rob_id_t enqueue_rr_ptr_d;
@@ -185,16 +201,16 @@ module ppe_issue_table #(
         for (int entry_idx = 0;
              entry_idx < ISSUE_DEPTH;
              entry_idx++) begin
-            if (issue_entry_q[entry_idx].state == ISSUE_WAIT_DEP) begin
+            if (issue_state_q[entry_idx] == ISSUE_WAIT_DEP) begin
                 for (int comp_idx = 0;
                      comp_idx < FE_NUM;
                      comp_idx++) begin
                     if (completion_valid_i[comp_idx]
-                        && (issue_entry_q[entry_idx].target_seq_tag
+                        && (issue_target_seq_tag_q[entry_idx]
                             [ROB_ID_W-1:0]
                             == completion_seq_tag_i[comp_idx]
                                [ROB_ID_W-1:0])
-                        && (issue_entry_q[entry_idx].target_seq_tag
+                        && (issue_target_seq_tag_q[entry_idx]
                             == completion_seq_tag_i[comp_idx])) begin
                         wake_hit[entry_idx] = 1'b1;
                     end
@@ -209,6 +225,7 @@ module ppe_issue_table #(
 
     logic [ISSUE_DEPTH-1:0] alloc_hit;
     logic [ISSUE_DEPTH-1:0] alloc_entry_ready;
+    logic [ISSUE_DEPTH-1:0][SEQ_W-1:0] alloc_seq_tag_by_id;
     logic [ISSUE_DEPTH-1:0][DELAY_W-1:0] alloc_delay_by_id;
 
     logic [ISSUE_DEPTH-1:0] existing_ready_unqueued;
@@ -216,13 +233,45 @@ module ppe_issue_table #(
 
     logic [READY_ENQUEUE_WIDTH-1:0]               enqueue_valid;
     logic [READY_ENQUEUE_WIDTH-1:0][ROB_ID_W-1:0] enqueue_rob_id;
+    logic [READY_ENQUEUE_WIDTH-1:0][SEQ_W-1:0]    enqueue_seq_tag;
     logic [READY_ENQUEUE_WIDTH-1:0][DELAY_W-1:0]  enqueue_delay;
     logic [ISSUE_DEPTH-1:0]                       enqueue_hit;
+
+    logic [ISSUE_DEPTH-1:0] rotated_existing_ready;
+    logic [ISSUE_DEPTH-1:0] rotated_new_ready;
+    logic [(2*ISSUE_DEPTH)-1:0] doubled_existing_ready;
+    logic [(2*ISSUE_DEPTH)-1:0] doubled_new_ready;
+    logic [ROTATE_INDEX_W-1:0] rotation_base;
+
+    logic [PREFIX_STAGE_NUM:0][ISSUE_DEPTH-1:0]
+          [ENQUEUE_COUNT_W-1:0] existing_prefix_count;
+    logic [PREFIX_STAGE_NUM:0][ISSUE_DEPTH-1:0]
+          [ENQUEUE_COUNT_W-1:0] new_prefix_count;
+    logic [ISSUE_DEPTH-1:0][ENQUEUE_COUNT_W-1:0]
+          existing_rank_before;
+    logic [ISSUE_DEPTH-1:0][ENQUEUE_COUNT_W-1:0]
+          new_rank_before;
+    logic [ENQUEUE_COUNT_W-1:0] existing_selected_count;
+    logic [ISSUE_DEPTH-1:0][ENQUEUE_COUNT_W-1:0]
+          new_combined_rank;
+
+    logic [READY_ENQUEUE_WIDTH-1:0][ISSUE_DEPTH-1:0]
+          existing_select_onehot;
+    logic [READY_ENQUEUE_WIDTH-1:0][ISSUE_DEPTH-1:0]
+          new_select_onehot;
+    logic [READY_ENQUEUE_WIDTH-1:0][ISSUE_DEPTH-1:0]
+          enqueue_select_onehot;
+    logic [READY_ENQUEUE_WIDTH-1:0] enqueue_from_allocation;
+    logic [READY_ENQUEUE_WIDTH-1:0][ROB_ID_W-1:0]
+          enqueue_rotated_offset;
 
     always_comb begin : allocation_ready_decode
         alloc_hit         = '0;
         alloc_entry_ready = '0;
+        alloc_seq_tag_by_id = '0;
         alloc_delay_by_id = '0;
+        packet_write_en   = '0;
+        packet_write_data = '0;
 
         for (int lane_idx = 0; lane_idx < N; lane_idx++) begin
             rob_id_t alloc_rob_id;
@@ -231,11 +280,15 @@ module ppe_issue_table #(
                 alloc_seq_tag_i[lane_idx][ROB_ID_W-1:0]);
             if (issue_alloc_valid_i[lane_idx]) begin
                 alloc_hit[alloc_rob_id] = 1'b1;
+                alloc_seq_tag_by_id[alloc_rob_id] =
+                    alloc_seq_tag_i[lane_idx];
                 alloc_delay_by_id[alloc_rob_id] =
                     alloc_delay_i[lane_idx];
                 alloc_entry_ready[alloc_rob_id] =
                     !alloc_dep_required_i[lane_idx]
                     || dep_status_available_i[lane_idx];
+                packet_write_en[alloc_rob_id] = 1'b1;
+                packet_write_data[alloc_rob_id] = alloc_packet_i[lane_idx];
             end
         end
     end
@@ -251,7 +304,7 @@ module ppe_issue_table #(
             // so the old entry must not be discovered on this edge.
             if (!alloc_hit[entry_idx]) begin
                 existing_ready_unqueued[entry_idx] =
-                    ((issue_entry_q[entry_idx].state == ISSUE_READY)
+                    ((issue_state_q[entry_idx] == ISSUE_READY)
                      && !queued_q[entry_idx])
                     || wake_hit[entry_idx];
             end
@@ -262,54 +315,166 @@ module ppe_issue_table #(
     end
 
     // Existing READY entries and same-edge wakeups have priority over new D0
-    // allocations. Both passes scan from the same rotating fairness pointer.
-    always_comb begin : ready_discovery
-        int selected_count;
-        rob_id_t scan_rob_id;
-        rob_id_t last_rob_id;
+    // allocations. Rotate both event maps once, then use fixed-depth saturated
+    // prefix trees to assign ranks zero through three without a serial scan.
+    always_comb begin : ready_event_rotation
+        doubled_existing_ready = {
+            existing_ready_unqueued, existing_ready_unqueued
+        };
+        doubled_new_ready = {
+            new_ready_allocation, new_ready_allocation
+        };
+        rotation_base = ROTATE_INDEX_W'(enqueue_rr_ptr_q);
+        rotated_existing_ready =
+            doubled_existing_ready[rotation_base +: ISSUE_DEPTH];
+        rotated_new_ready =
+            doubled_new_ready[rotation_base +: ISSUE_DEPTH];
+    end
 
+    always_comb begin : ready_prefix_select
+        existing_prefix_count   = '0;
+        new_prefix_count        = '0;
+        existing_rank_before    = '0;
+        new_rank_before         = '0;
+        existing_selected_count = '0;
+        new_combined_rank       = '0;
+        existing_select_onehot  = '0;
+        new_select_onehot       = '0;
+        enqueue_select_onehot   = '0;
+
+        for (int prefix_entry = 0;
+             prefix_entry < ISSUE_DEPTH;
+             prefix_entry++) begin
+            existing_prefix_count[0][prefix_entry] =
+                ENQUEUE_COUNT_W'(rotated_existing_ready[prefix_entry]);
+            new_prefix_count[0][prefix_entry] =
+                ENQUEUE_COUNT_W'(rotated_new_ready[prefix_entry]);
+        end
+
+        for (int prefix_stage = 1;
+             prefix_stage <= PREFIX_STAGE_NUM;
+             prefix_stage++) begin
+            for (int prefix_entry = 0;
+                 prefix_entry < ISSUE_DEPTH;
+                 prefix_entry++) begin
+                if (prefix_entry < (1 << (prefix_stage - 1))) begin
+                    existing_prefix_count[prefix_stage][prefix_entry] =
+                        existing_prefix_count[prefix_stage-1][prefix_entry];
+                    new_prefix_count[prefix_stage][prefix_entry] =
+                        new_prefix_count[prefix_stage-1][prefix_entry];
+                end else begin
+                    existing_prefix_count[prefix_stage][prefix_entry] =
+                        saturated_count_add(
+                            existing_prefix_count[prefix_stage-1]
+                                                 [prefix_entry],
+                            existing_prefix_count[prefix_stage-1]
+                                                 [prefix_entry
+                                                  - (1 << (prefix_stage - 1))]);
+                    new_prefix_count[prefix_stage][prefix_entry] =
+                        saturated_count_add(
+                            new_prefix_count[prefix_stage-1][prefix_entry],
+                            new_prefix_count[prefix_stage-1]
+                                            [prefix_entry
+                                             - (1 << (prefix_stage - 1))]);
+                end
+            end
+        end
+
+        existing_selected_count =
+            existing_prefix_count[PREFIX_STAGE_NUM][ISSUE_DEPTH-1];
+
+        for (int prefix_entry = 0;
+             prefix_entry < ISSUE_DEPTH;
+             prefix_entry++) begin
+            if (prefix_entry == 0) begin
+                existing_rank_before[prefix_entry] = '0;
+                new_rank_before[prefix_entry] = '0;
+            end else begin
+                existing_rank_before[prefix_entry] =
+                    existing_prefix_count[PREFIX_STAGE_NUM]
+                                         [prefix_entry-1];
+                new_rank_before[prefix_entry] =
+                    new_prefix_count[PREFIX_STAGE_NUM][prefix_entry-1];
+            end
+
+            new_combined_rank[prefix_entry] = saturated_count_add(
+                existing_selected_count, new_rank_before[prefix_entry]);
+
+            for (int enqueue_rank = 0;
+                 enqueue_rank < READY_ENQUEUE_WIDTH;
+                 enqueue_rank++) begin
+                existing_select_onehot[enqueue_rank][prefix_entry] =
+                    rotated_existing_ready[prefix_entry]
+                    && (existing_rank_before[prefix_entry]
+                        == ENQUEUE_COUNT_W'(enqueue_rank));
+                new_select_onehot[enqueue_rank][prefix_entry] =
+                    rotated_new_ready[prefix_entry]
+                    && (new_combined_rank[prefix_entry]
+                        == ENQUEUE_COUNT_W'(enqueue_rank));
+                enqueue_select_onehot[enqueue_rank][prefix_entry] =
+                    existing_select_onehot[enqueue_rank][prefix_entry]
+                    || new_select_onehot[enqueue_rank][prefix_entry];
+            end
+        end
+    end
+
+    generate
+        for (genvar enqueue_rank = 0;
+             enqueue_rank < READY_ENQUEUE_WIDTH;
+             enqueue_rank++) begin : ready_offset_encode
+            assign enqueue_from_allocation[enqueue_rank] =
+                |new_select_onehot[enqueue_rank];
+            assign enqueue_rotated_offset[enqueue_rank][0] =
+                |(enqueue_select_onehot[enqueue_rank] & 32'haaaa_aaaa);
+            assign enqueue_rotated_offset[enqueue_rank][1] =
+                |(enqueue_select_onehot[enqueue_rank] & 32'hcccc_cccc);
+            assign enqueue_rotated_offset[enqueue_rank][2] =
+                |(enqueue_select_onehot[enqueue_rank] & 32'hf0f0_f0f0);
+            assign enqueue_rotated_offset[enqueue_rank][3] =
+                |(enqueue_select_onehot[enqueue_rank] & 32'hff00_ff00);
+            assign enqueue_rotated_offset[enqueue_rank][4] =
+                |(enqueue_select_onehot[enqueue_rank] & 32'hffff_0000);
+        end
+    endgenerate
+
+    always_comb begin : ready_discovery_encode
         enqueue_valid    = '0;
         enqueue_rob_id   = '0;
+        enqueue_seq_tag  = '0;
         enqueue_delay    = '0;
         enqueue_rr_ptr_d = enqueue_rr_ptr_q;
-        selected_count   = 0;
-        scan_rob_id      = '0;
-        last_rob_id      = enqueue_rr_ptr_q;
 
-        for (int scan_offset = 0;
-             scan_offset < ISSUE_DEPTH;
-             scan_offset++) begin
-            scan_rob_id = issue_ptr_add(
-                enqueue_rr_ptr_q, rob_id_t'(scan_offset));
-            if ((selected_count < READY_ENQUEUE_WIDTH)
-                && existing_ready_unqueued[scan_rob_id]) begin
-                enqueue_valid[selected_count]  = 1'b1;
-                enqueue_rob_id[selected_count] = scan_rob_id;
-                enqueue_delay[selected_count]  =
-                    issue_entry_q[scan_rob_id].delay;
-                last_rob_id = scan_rob_id;
-                selected_count = selected_count + 1;
+        for (int enqueue_idx = 0;
+             enqueue_idx < READY_ENQUEUE_WIDTH;
+             enqueue_idx++) begin
+            enqueue_valid[enqueue_idx] =
+                |enqueue_select_onehot[enqueue_idx];
+            enqueue_rob_id[enqueue_idx] =
+                enqueue_rr_ptr_q + enqueue_rotated_offset[enqueue_idx];
+
+            if (enqueue_valid[enqueue_idx]) begin
+                if (enqueue_from_allocation[enqueue_idx]) begin
+                    enqueue_seq_tag[enqueue_idx] =
+                        alloc_seq_tag_by_id[enqueue_rob_id[enqueue_idx]];
+                    enqueue_delay[enqueue_idx] =
+                        alloc_delay_by_id[enqueue_rob_id[enqueue_idx]];
+                end else begin
+                    enqueue_seq_tag[enqueue_idx] =
+                        issue_seq_tag_q[enqueue_rob_id[enqueue_idx]];
+                    enqueue_delay[enqueue_idx] =
+                        issue_delay_q[enqueue_rob_id[enqueue_idx]];
+                end
             end
         end
 
-        for (int scan_offset = 0;
-             scan_offset < ISSUE_DEPTH;
-             scan_offset++) begin
-            scan_rob_id = issue_ptr_add(
-                enqueue_rr_ptr_q, rob_id_t'(scan_offset));
-            if ((selected_count < READY_ENQUEUE_WIDTH)
-                && new_ready_allocation[scan_rob_id]) begin
-                enqueue_valid[selected_count]  = 1'b1;
-                enqueue_rob_id[selected_count] = scan_rob_id;
-                enqueue_delay[selected_count]  =
-                    alloc_delay_by_id[scan_rob_id];
-                last_rob_id = scan_rob_id;
-                selected_count = selected_count + 1;
-            end
-        end
-
-        if (selected_count != 0) begin
-            enqueue_rr_ptr_d = issue_ptr_add(last_rob_id, rob_id_t'(1));
+        if (enqueue_valid[3]) begin
+            enqueue_rr_ptr_d = enqueue_rob_id[3] + rob_id_t'(1);
+        end else if (enqueue_valid[2]) begin
+            enqueue_rr_ptr_d = enqueue_rob_id[2] + rob_id_t'(1);
+        end else if (enqueue_valid[1]) begin
+            enqueue_rr_ptr_d = enqueue_rob_id[1] + rob_id_t'(1);
+        end else if (enqueue_valid[0]) begin
+            enqueue_rr_ptr_d = enqueue_rob_id[0] + rob_id_t'(1);
         end
     end
 
@@ -328,63 +493,86 @@ module ppe_issue_table #(
     // READY-only candidate windows and irrevocable D2 selection
     //--------------------------------------------------------------------------
 
-    logic queue_update;
-
-    always_comb begin : ready_queue_update
-        int selected_in_class;
-        int remaining_count;
-        int append_position;
-        int source_position;
-
-        ready_q_id_d    = '0;
-        ready_q_count_d = '0;
-        queue_update    = (|select_valid_i) || (|enqueue_valid);
+    always_comb begin : ready_queue_event_decode
+        ready_pop_count       = '0;
+        ready_push_count      = '0;
+        ready_write_en        = '0;
+        ready_write_seq_tag   = '0;
+        enqueue_rank_in_class = '0;
+        enqueue_write_position = '0;
 
         for (int class_idx = 0;
              class_idx < DELAY_CLASS_NUM;
              class_idx++) begin
-            selected_in_class = 0;
-
             for (int fe_idx = 0; fe_idx < FE_NUM; fe_idx++) begin
                 rob_id_t select_rob_id;
 
                 select_rob_id = rob_id_t'(
                     select_seq_tag_i[fe_idx][ROB_ID_W-1:0]);
                 if (select_valid_i[fe_idx]
-                    && (issue_entry_q[select_rob_id].delay
+                    && (issue_delay_q[select_rob_id]
                         == DELAY_W'(class_idx))) begin
-                    selected_in_class = selected_in_class + 1;
+                    ready_pop_count[class_idx] =
+                        ready_pop_count[class_idx]
+                        + ENQUEUE_COUNT_W'(1);
                 end
             end
 
-            remaining_count = int'(ready_q_count_q[class_idx])
-                              - selected_in_class;
-
-            for (int queue_pos = 0;
-                 queue_pos < ISSUE_DEPTH;
-                 queue_pos++) begin
-                source_position = queue_pos + selected_in_class;
-                if ((queue_pos < remaining_count)
-                    && (source_position < ISSUE_DEPTH)) begin
-                    ready_q_id_d[class_idx][queue_pos] =
-                        ready_q_id_q[class_idx][source_position];
-                end
-            end
-
-            append_position = remaining_count;
             for (int enqueue_idx = 0;
                  enqueue_idx < READY_ENQUEUE_WIDTH;
                  enqueue_idx++) begin
                 if (enqueue_valid[enqueue_idx]
-                    && (enqueue_delay[enqueue_idx] == DELAY_W'(class_idx))
-                    && (append_position < ISSUE_DEPTH)) begin
-                    ready_q_id_d[class_idx][append_position] =
-                        enqueue_rob_id[enqueue_idx];
-                    append_position = append_position + 1;
+                    && (enqueue_delay[enqueue_idx] == DELAY_W'(class_idx))) begin
+                    ready_push_count[class_idx] =
+                        ready_push_count[class_idx]
+                        + ENQUEUE_COUNT_W'(1);
+                end
+            end
+        end
+
+        for (int enqueue_idx = 0;
+             enqueue_idx < READY_ENQUEUE_WIDTH;
+             enqueue_idx++) begin
+            for (int prior_idx = 0;
+                 prior_idx < enqueue_idx;
+                 prior_idx++) begin
+                if (enqueue_valid[prior_idx]
+                    && enqueue_valid[enqueue_idx]
+                    && (enqueue_delay[prior_idx]
+                        == enqueue_delay[enqueue_idx])) begin
+                    enqueue_rank_in_class[enqueue_idx] =
+                        enqueue_rank_in_class[enqueue_idx]
+                        + ENQUEUE_COUNT_W'(1);
                 end
             end
 
-            ready_q_count_d[class_idx] = QUEUE_COUNT_W'(append_position);
+            if (enqueue_valid[enqueue_idx]) begin
+                enqueue_write_position[enqueue_idx] =
+                    ready_q_tail_q[enqueue_delay[enqueue_idx]]
+                    + rob_id_t'(enqueue_rank_in_class[enqueue_idx]);
+            end
+        end
+
+        for (int class_idx = 0;
+             class_idx < DELAY_CLASS_NUM;
+             class_idx++) begin
+            for (int queue_pos = 0;
+                 queue_pos < ISSUE_DEPTH;
+                 queue_pos++) begin
+                for (int enqueue_idx = 0;
+                     enqueue_idx < READY_ENQUEUE_WIDTH;
+                     enqueue_idx++) begin
+                    if (enqueue_valid[enqueue_idx]
+                        && (enqueue_delay[enqueue_idx]
+                            == DELAY_W'(class_idx))
+                        && (enqueue_write_position[enqueue_idx]
+                            == rob_id_t'(queue_pos))) begin
+                        ready_write_en[class_idx][queue_pos] = 1'b1;
+                        ready_write_seq_tag[class_idx][queue_pos] =
+                            enqueue_seq_tag[enqueue_idx];
+                    end
+                end
+            end
         end
     end
 
@@ -398,16 +586,15 @@ module ppe_issue_table #(
             for (int window_idx = 0;
                  window_idx < CAND_WINDOW_DEPTH;
                  window_idx++) begin
-                if ((QUEUE_COUNT_W'(window_idx)
-                     < ready_q_count_q[class_idx])
-                    && (issue_entry_q[
-                        ready_q_id_q[class_idx][window_idx]].state
-                        == ISSUE_READY)
-                    && queued_q[ready_q_id_q[class_idx][window_idx]]) begin
+                rob_id_t read_position;
+
+                read_position = ready_q_head_q[class_idx]
+                                + rob_id_t'(window_idx);
+                if (QUEUE_COUNT_W'(window_idx)
+                    < ready_q_count_q[class_idx]) begin
                     candidate_valid_o[class_idx][window_idx] = 1'b1;
                     candidate_seq_tag_o[class_idx][window_idx] =
-                        issue_entry_q[
-                            ready_q_id_q[class_idx][window_idx]].seq_tag;
+                        ready_q_seq_tag_q[class_idx][read_position];
                 end
             end
         end
@@ -432,16 +619,16 @@ module ppe_issue_table #(
                 selected_seq_tag_q[fe_idx][ROB_ID_W-1:0]);
             if (selected_valid_q[fe_idx]) begin
                 issue_packet_o[fe_idx] =
-                    issue_entry_q[selected_rob_id].packet;
+                    issue_packet_q[selected_rob_id];
                 issue_delay_o[fe_idx] =
-                    issue_entry_q[selected_rob_id].delay;
+                    issue_delay_q[selected_rob_id];
                 issue_dep_required_o[fe_idx] =
-                    issue_entry_q[selected_rob_id].dep_required;
+                    issue_dep_required_q[selected_rob_id];
 
-                if (issue_entry_q[selected_rob_id].dep_required) begin
+                if (issue_dep_required_q[selected_rob_id]) begin
                     dep_gather_valid_o[fe_idx] = 1'b1;
                     dep_gather_target_seq_tag_o[fe_idx] =
-                        issue_entry_q[selected_rob_id].target_seq_tag;
+                        issue_target_seq_tag_q[selected_rob_id];
                 end
             end
         end
@@ -478,7 +665,7 @@ module ppe_issue_table #(
             for (int entry_idx = 0;
                  entry_idx < ISSUE_DEPTH;
                  entry_idx++) begin
-                issue_entry_q[entry_idx].state <= ISSUE_FREE;
+                issue_state_q[entry_idx] <= ISSUE_FREE;
             end
         end else begin
             // The prior cycle's irrevocable selections enter their FEs now.
@@ -488,7 +675,7 @@ module ppe_issue_table #(
                 selected_rob_id = rob_id_t'(
                     selected_seq_tag_q[fe_idx][ROB_ID_W-1:0]);
                 if (selected_valid_q[fe_idx]) begin
-                    issue_entry_q[selected_rob_id].state <= ISSUE_FREE;
+                    issue_state_q[selected_rob_id] <= ISSUE_FREE;
                     queued_q[selected_rob_id] <= 1'b0;
                 end
             end
@@ -498,7 +685,7 @@ module ppe_issue_table #(
                  entry_idx < ISSUE_DEPTH;
                  entry_idx++) begin
                 if (wake_hit[entry_idx]) begin
-                    issue_entry_q[entry_idx].state <= ISSUE_READY;
+                    issue_state_q[entry_idx] <= ISSUE_READY;
                 end
             end
 
@@ -509,7 +696,7 @@ module ppe_issue_table #(
                 select_rob_id = rob_id_t'(
                     select_seq_tag_i[fe_idx][ROB_ID_W-1:0]);
                 if (select_valid_i[fe_idx]) begin
-                    issue_entry_q[select_rob_id].state <= ISSUE_SELECTED;
+                    issue_state_q[select_rob_id] <= ISSUE_SELECTED;
                     queued_q[select_rob_id] <= 1'b0;
                 end
             end
@@ -531,25 +718,35 @@ module ppe_issue_table #(
                 if (issue_alloc_valid_i[lane_idx]) begin
                     if (!alloc_dep_required_i[lane_idx]
                         || dep_status_available_i[lane_idx]) begin
-                        issue_entry_q[alloc_rob_id].state <= ISSUE_READY;
+                        issue_state_q[alloc_rob_id] <= ISSUE_READY;
                     end else begin
-                        issue_entry_q[alloc_rob_id].state <= ISSUE_WAIT_DEP;
+                        issue_state_q[alloc_rob_id] <= ISSUE_WAIT_DEP;
                     end
 
-                    issue_entry_q[alloc_rob_id].seq_tag <=
+                    issue_seq_tag_q[alloc_rob_id] <=
                         alloc_seq_tag_i[lane_idx];
-                    issue_entry_q[alloc_rob_id].target_seq_tag <=
+                    issue_target_seq_tag_q[alloc_rob_id] <=
                         alloc_target_seq_tag_i[lane_idx];
-                    issue_entry_q[alloc_rob_id].delay <=
+                    issue_delay_q[alloc_rob_id] <=
                         alloc_delay_i[lane_idx];
-                    issue_entry_q[alloc_rob_id].dep_required <=
+                    issue_dep_required_q[alloc_rob_id] <=
                         alloc_dep_required_i[lane_idx];
-                    issue_entry_q[alloc_rob_id].packet <=
-                        alloc_packet_i[lane_idx];
                     queued_q[alloc_rob_id] <= enqueue_hit[alloc_rob_id];
                 end
             end
 
+        end
+    end
+
+    // Payload is physically independent from scheduler metadata. It is not
+    // reset and changes only when a newly accepted packet owns the entry.
+    always_ff @(posedge clk_i) begin : issue_payload_update
+        for (int entry_idx = 0;
+             entry_idx < ISSUE_DEPTH;
+             entry_idx++) begin
+            if (packet_write_en[entry_idx]) begin
+                issue_packet_q[entry_idx] <= packet_write_data[entry_idx];
+            end
         end
     end
 
@@ -570,16 +767,54 @@ module ppe_issue_table #(
 
     always_ff @(posedge clk_i or negedge rst_ni) begin : ready_queue_state_update
         if (!rst_ni) begin
+            ready_q_head_q   <= '0;
+            ready_q_tail_q   <= '0;
             ready_q_count_q  <= '0;
             enqueue_rr_ptr_q <= '0;
         end else begin
-            if (queue_update) begin
-                ready_q_id_q    <= ready_q_id_d;
-                ready_q_count_q <= ready_q_count_d;
+            for (int class_idx = 0;
+                 class_idx < DELAY_CLASS_NUM;
+                 class_idx++) begin
+                if (ready_pop_count[class_idx] != '0) begin
+                    ready_q_head_q[class_idx] <=
+                        ready_q_head_q[class_idx]
+                        + rob_id_t'(ready_pop_count[class_idx]);
+                end
+
+                if (ready_push_count[class_idx] != '0) begin
+                    ready_q_tail_q[class_idx] <=
+                        ready_q_tail_q[class_idx]
+                        + rob_id_t'(ready_push_count[class_idx]);
+                end
+
+                if ((ready_pop_count[class_idx] != '0)
+                    || (ready_push_count[class_idx] != '0)) begin
+                    ready_q_count_q[class_idx] <=
+                        ready_q_count_q[class_idx]
+                        - QUEUE_COUNT_W'(ready_pop_count[class_idx])
+                        + QUEUE_COUNT_W'(ready_push_count[class_idx]);
+                end
             end
 
             if (|enqueue_valid) begin
                 enqueue_rr_ptr_q <= enqueue_rr_ptr_d;
+            end
+        end
+    end
+
+    // FIFO contents use slot-local write enables. Existing tags hold while
+    // head/tail move, avoiding the former full-array relocation network.
+    always_ff @(posedge clk_i) begin : ready_queue_tag_update
+        for (int class_idx = 0;
+             class_idx < DELAY_CLASS_NUM;
+             class_idx++) begin
+            for (int queue_pos = 0;
+                 queue_pos < ISSUE_DEPTH;
+                 queue_pos++) begin
+                if (ready_write_en[class_idx][queue_pos]) begin
+                    ready_q_seq_tag_q[class_idx][queue_pos] <=
+                        ready_write_seq_tag[class_idx][queue_pos];
+                end
             end
         end
     end
