@@ -18,15 +18,24 @@ case "${DUT}" in
         FILELIST=${FILELIST:-./script/filelist_sv.f}
         TB_TOP=${TB_TOP:-tb_top_sv}
         RTL_FILELIST=${RTL_FILELIST:-./rtl-sv/filelist.f}
+        RTL_TOP=${RTL_TOP:-ppe_top_sv}
+        ;;
+    single_fe)
+        BUILD_NAME=${BUILD_NAME:-single_fe_regression}
+        FILELIST=${FILELIST:-./script/filelist_single_fe.f}
+        TB_TOP=${TB_TOP:-tb_top_single_fe}
+        RTL_FILELIST=${RTL_FILELIST:-./rtl-sv/filelist_single_fe.f}
+        RTL_TOP=${RTL_TOP:-ppe_single_fe_inorder}
         ;;
     legacy)
         BUILD_NAME=${BUILD_NAME:-legacy_regression}
         FILELIST=${FILELIST:-./script/filelist.f}
         TB_TOP=${TB_TOP:-tb_top}
         RTL_FILELIST=${RTL_FILELIST:-./script/rtl_filelist.f}
+        RTL_TOP=${RTL_TOP:-ppe_top}
         ;;
     *)
-        echo "DUT must be 'sv' or 'legacy'" >&2
+        echo "DUT must be 'sv', 'single_fe', or 'legacy'" >&2
         exit 2
         ;;
 esac
@@ -151,7 +160,11 @@ run_performance() {
     local seed
 
     for seed in ${PERF_SEEDS}; do
-        run_uvm performance ppe_p0_perf_test "${seed}"
+        if [[ "${DUT}" == "single_fe" ]]; then
+            run_uvm performance ppe_single_fe_p0_perf_test "${seed}"
+        else
+            run_uvm performance ppe_p0_perf_test "${seed}"
+        fi
         for case_name in "${PERFORMANCE_CASES[@]}"; do
             run_uvm performance ppe_perf_test "${seed}" "${case_name}"
         done
@@ -161,9 +174,9 @@ run_performance() {
 
 cd "${ROOT_DIR}"
 echo "Building ${DUT} regression image: ${BUILD_NAME}" | tee -a "${SUMMARY_LOG}"
-if [[ "${DUT}" == "sv" ]]; then
+if [[ "${DUT}" == "sv" || "${DUT}" == "single_fe" ]]; then
     lint_cmd=("${VERILATOR}" --lint-only --Wall -Wno-fatal
-              --top-module ppe_top_sv -f "${RTL_FILELIST}")
+              --top-module "${RTL_TOP}" -f "${RTL_FILELIST}")
 else
     lint_cmd=("${MAKE_CMD}" lint RTL_FILELIST="${RTL_FILELIST}")
 fi

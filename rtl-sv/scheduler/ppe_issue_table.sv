@@ -3,105 +3,71 @@
 
 //------------------------------------------------------------------------------
 // File        : ppe_issue_table.sv
-// Project     : Packet Processing Engine (PPE)
 // Block       : Scheduler / Issue Table
 //
 // Description :
-//   Owns packets accepted by ingress until they are issued to an FE. Entries
-//   are indexed directly by ROB ID and store one packet copy, sequence metadata,
-//   delay, dependency state, and unified issue state. READY-queue membership is
-//   maintained as separate bookkeeping rather than part of the entry payload.
+//   Tracks ROB-indexed pre-issue metadata, dependency readiness, and membership
+//   in an eight-slot sparse candidate window. READY entries that are not
+//   visible candidates are admitted through four interleaved local banks.
 //
-//   This block also owns READY discovery and four delay-class tag FIFOs. It
-//   exposes only registered FIFO head windows to the combinational candidate
-//   selector; packet-width data is read later through the D3 issue bundle.
-//
-//   Dependency result data is never stored here. This block directly drives
-//   ROB status/gather queries and compares FE completion tags for wakeup.
+//   Selection is irrevocable. D2B captures complete narrow issue metadata; D3
+//   emits that registered bundle and releases the entry after FE acceptance.
+//   Packet and dependency-result data remain owned by the ROB.
 //
 // Governing documents:
 //   - doc/ppe_feature_description.txt, Sections 4 through 7
-//   - doc/hld.txt, Sections 3.2, 3.3, 4.1 through 4.3, and 5.1
-//   - doc/lld.txt, Sections 3.1, 3.3, 3.6, 5.1 through 5.4, and 7 through 9
-//
-// Clock/reset :
-//   State is clocked by clk_i. rst_ni is the shared active-low internal reset.
-//   Reset clears entry state, queued bits, queue counts, and control pointers;
-//   packet and metadata arrays need not be reset while their entry is FREE.
-//
-// Implementation status:
-//   Entry state, dependency control, READY FIFOs, candidate windows,
-//   irrevocable selection, D3 issue, and automatic release are implemented.
+//   - doc/hld.txt, Sections 3.3, 4.2, 4.3, and 5.1
+//   - doc/lld.txt, Sections 3.1, 3.3, 5.3, 5.4, and 7 through 9
 //------------------------------------------------------------------------------
 
-module ppe_issue_table #(
-    parameter int PACKET_W = ppe_types_pkg::DEFAULT_PACKET_W
-) (
-    // Clock and reset
+module ppe_issue_table (
     input  logic                                           clk_i,
     input  logic                                           rst_ni,
 
-    // Accepted D0 allocation event. The ROB has already accepted every valid
-    // lane; the physical issue index is derived from the complete sequence tag.
     input  logic [ppe_types_pkg::N-1:0]                    issue_alloc_valid_i,
     input  logic [ppe_types_pkg::N-1:0]
                  [ppe_types_pkg::SEQ_W-1:0]                alloc_seq_tag_i,
     input  logic [ppe_types_pkg::N-1:0]
                  [ppe_types_pkg::SEQ_W-1:0]                alloc_target_seq_tag_i,
-    input  logic [ppe_types_pkg::N-1:0][PACKET_W-1:0]      alloc_packet_i,
     input  logic [ppe_types_pkg::N-1:0]
                  [ppe_types_pkg::DELAY_W-1:0]              alloc_delay_i,
     input  logic [ppe_types_pkg::N-1:0]                    alloc_dep_required_i,
 
-    // D0 status-only dependency query directly connected to ppe_rob.
     output logic [ppe_types_pkg::N-1:0]                    dep_status_valid_o,
     output logic [ppe_types_pkg::N-1:0]
                  [ppe_types_pkg::SEQ_W-1:0]                dep_status_target_seq_tag_o,
     input  logic [ppe_types_pkg::N-1:0]                    dep_status_available_i,
 
-    // Completion tags used to wake every matching ISSUE_WAIT_DEP entry. The
-    // target ROB ID prefilter is derived from the complete tag locally.
     input  logic [ppe_types_pkg::FE_NUM-1:0]               completion_valid_i,
     input  logic [ppe_types_pkg::FE_NUM-1:0]
                  [ppe_types_pkg::SEQ_W-1:0]                completion_seq_tag_i,
 
-    // Registered delay-class FIFO head windows. Class index equals desc_delay;
-    // window slot zero is the oldest queued READY entry in that class.
-    output logic [ppe_types_pkg::DELAY_CLASS_NUM-1:0]
-                 [ppe_types_pkg::CAND_WINDOW_DEPTH-1:0]    candidate_valid_o,
-    output logic [ppe_types_pkg::DELAY_CLASS_NUM-1:0]
-                 [ppe_types_pkg::CAND_WINDOW_DEPTH-1:0]
+    output logic [ppe_types_pkg::CAND_WINDOW_DEPTH-1:0]    candidate_valid_o,
+    output logic [ppe_types_pkg::CAND_WINDOW_DEPTH-1:0]
                  [ppe_types_pkg::SEQ_W-1:0]                candidate_seq_tag_o,
+    output logic [ppe_types_pkg::CAND_WINDOW_DEPTH-1:0]
+                 [ppe_types_pkg::DELAY_W-1:0]              candidate_delay_o,
 
-    // Irrevocable D2 selections indexed by destination FE. ppe_fe_scheduler may
-    // assert a selection only after dependency and return-slot legality checks;
-    // the local entry index is derived from select_seq_tag_i low bits.
     input  logic [ppe_types_pkg::FE_NUM-1:0]               select_valid_i,
     input  logic [ppe_types_pkg::FE_NUM-1:0]
-                 [ppe_types_pkg::SEQ_W-1:0]                select_seq_tag_i,
+                 [ppe_types_pkg::CAND_WINDOW_DEPTH-1:0]
+                                                             select_candidate_onehot_i,
 
-    // D3 authoritative dependency-data gather directly connected to ppe_rob.
     output logic [ppe_types_pkg::FE_NUM-1:0]               dep_gather_valid_o,
     output logic [ppe_types_pkg::FE_NUM-1:0]
                  [ppe_types_pkg::SEQ_W-1:0]                dep_gather_target_seq_tag_o,
-    input  logic [ppe_types_pkg::FE_NUM-1:0]               dep_gather_data_valid_i,
-    input  logic [ppe_types_pkg::FE_NUM-1:0][PACKET_W-1:0] dep_gather_data_i,
 
-    // Registered-control D3 issue bundle indexed by FE. Selection is
-    // irrevocable, so issue_valid does not depend on gather data_valid.
     output logic [ppe_types_pkg::FE_NUM-1:0]               issue_valid_o,
-    output logic [ppe_types_pkg::FE_NUM-1:0][PACKET_W-1:0] issue_packet_o,
+    output logic [ppe_types_pkg::FE_NUM-1:0]
+                 [ppe_types_pkg::SEQ_W-1:0]                issue_seq_tag_o,
     output logic [ppe_types_pkg::FE_NUM-1:0]
                  [ppe_types_pkg::DELAY_W-1:0]              issue_delay_o,
     output logic [ppe_types_pkg::FE_NUM-1:0]               issue_dep_required_o,
-    output logic [ppe_types_pkg::FE_NUM-1:0][PACKET_W-1:0] issue_dep_data_o
+    output logic [ppe_types_pkg::FE_NUM-1:0]
+                 [ppe_types_pkg::SEQ_W-1:0]                issue_target_seq_tag_o
 );
 
     import ppe_types_pkg::*;
-
-    //--------------------------------------------------------------------------
-    // Local parameters and unified entry-state encoding
-    //--------------------------------------------------------------------------
 
     typedef enum logic [1:0] {
         ISSUE_FREE,
@@ -110,710 +76,713 @@ module ppe_issue_table #(
         ISSUE_SELECTED
     } issue_state_e;
 
-    localparam int QUEUE_COUNT_W = $clog2(ISSUE_DEPTH + 1);
-    localparam int ENQUEUE_COUNT_W = $clog2(READY_ENQUEUE_WIDTH + 1);
-    localparam int PREFIX_STAGE_NUM = $clog2(ISSUE_DEPTH);
-    localparam int ROTATE_INDEX_W = $clog2(2 * ISSUE_DEPTH);
+    localparam int CAND_ID_W       = $clog2(CAND_WINDOW_DEPTH);
+    localparam int ADMIT_BANKS     = READY_ENQUEUE_WIDTH;
+    localparam int ADMIT_BANK_W    = $clog2(ADMIT_BANKS);
+    localparam int ADMIT_ROWS      = ISSUE_DEPTH / ADMIT_BANKS;
+    localparam int ADMIT_ROW_W     = $clog2(ADMIT_ROWS);
 
-    function automatic logic [ENQUEUE_COUNT_W-1:0] saturated_count_add(
-        input logic [ENQUEUE_COUNT_W-1:0] lhs,
-        input logic [ENQUEUE_COUNT_W-1:0] rhs
+    typedef logic [CAND_ID_W-1:0]       cand_id_t;
+    typedef logic [ADMIT_BANK_W-1:0]    admit_bank_id_t;
+    typedef logic [ADMIT_ROW_W-1:0]     admit_row_id_t;
+    typedef struct packed {
+        logic [2:0]      count;
+        logic [3:0]      valid;
+        logic [3:0][1:0] slot_id;
+    } free_half_map_t;
+
+    function automatic free_half_map_t compact_free_half(
+        input logic [3:0] free_mask
     );
-        logic [ENQUEUE_COUNT_W:0] sum;
-        begin
-            sum = {1'b0, lhs} + {1'b0, rhs};
-            if (sum[ENQUEUE_COUNT_W]
-                || (sum[ENQUEUE_COUNT_W-1:0]
-                    > ENQUEUE_COUNT_W'(READY_ENQUEUE_WIDTH))) begin
-                saturated_count_add =
-                    ENQUEUE_COUNT_W'(READY_ENQUEUE_WIDTH);
-            end else begin
-                saturated_count_add = ENQUEUE_COUNT_W'(sum);
+        free_half_map_t result;
+
+        result = '0;
+        case (free_mask)
+            4'b0001: begin
+                result.count      = 3'd1;
+                result.slot_id[0] = 2'd0;
             end
-        end
+            4'b0010: begin
+                result.count      = 3'd1;
+                result.slot_id[0] = 2'd1;
+            end
+            4'b0011: begin
+                result.count      = 3'd2;
+                result.slot_id[0] = 2'd0;
+                result.slot_id[1] = 2'd1;
+            end
+            4'b0100: begin
+                result.count      = 3'd1;
+                result.slot_id[0] = 2'd2;
+            end
+            4'b0101: begin
+                result.count      = 3'd2;
+                result.slot_id[0] = 2'd0;
+                result.slot_id[1] = 2'd2;
+            end
+            4'b0110: begin
+                result.count      = 3'd2;
+                result.slot_id[0] = 2'd1;
+                result.slot_id[1] = 2'd2;
+            end
+            4'b0111: begin
+                result.count      = 3'd3;
+                result.slot_id[0] = 2'd0;
+                result.slot_id[1] = 2'd1;
+                result.slot_id[2] = 2'd2;
+            end
+            4'b1000: begin
+                result.count      = 3'd1;
+                result.slot_id[0] = 2'd3;
+            end
+            4'b1001: begin
+                result.count      = 3'd2;
+                result.slot_id[0] = 2'd0;
+                result.slot_id[1] = 2'd3;
+            end
+            4'b1010: begin
+                result.count      = 3'd2;
+                result.slot_id[0] = 2'd1;
+                result.slot_id[1] = 2'd3;
+            end
+            4'b1011: begin
+                result.count      = 3'd3;
+                result.slot_id[0] = 2'd0;
+                result.slot_id[1] = 2'd1;
+                result.slot_id[2] = 2'd3;
+            end
+            4'b1100: begin
+                result.count      = 3'd2;
+                result.slot_id[0] = 2'd2;
+                result.slot_id[1] = 2'd3;
+            end
+            4'b1101: begin
+                result.count      = 3'd3;
+                result.slot_id[0] = 2'd0;
+                result.slot_id[1] = 2'd2;
+                result.slot_id[2] = 2'd3;
+            end
+            4'b1110: begin
+                result.count      = 3'd3;
+                result.slot_id[0] = 2'd1;
+                result.slot_id[1] = 2'd2;
+                result.slot_id[2] = 2'd3;
+            end
+            4'b1111: begin
+                result.count      = 3'd4;
+                result.slot_id[0] = 2'd0;
+                result.slot_id[1] = 2'd1;
+                result.slot_id[2] = 2'd2;
+                result.slot_id[3] = 2'd3;
+            end
+            default: result = '0;
+        endcase
+        case (result.count)
+            3'd1: result.valid = 4'b0001;
+            3'd2: result.valid = 4'b0011;
+            3'd3: result.valid = 4'b0111;
+            3'd4: result.valid = 4'b1111;
+            default: result.valid = '0;
+        endcase
+        return result;
     endfunction
 
+    issue_state_e                 issue_state_q          [ISSUE_DEPTH];
+    seq_tag_t                     issue_seq_tag_q        [ISSUE_DEPTH];
+    seq_tag_t                     issue_target_seq_tag_q [ISSUE_DEPTH];
+    delay_t                       issue_delay_q          [ISSUE_DEPTH];
+    logic                         issue_dep_required_q   [ISSUE_DEPTH];
 
-    //--------------------------------------------------------------------------
-    // Issue-entry payload and metadata storage
-    //--------------------------------------------------------------------------
-
-    issue_state_e issue_state_q [ISSUE_DEPTH];
-    logic [ISSUE_DEPTH-1:0][SEQ_W-1:0]    issue_seq_tag_q;
-    logic [ISSUE_DEPTH-1:0][SEQ_W-1:0]    issue_target_seq_tag_q;
-    logic [ISSUE_DEPTH-1:0][DELAY_W-1:0]  issue_delay_q;
-    logic [ISSUE_DEPTH-1:0]               issue_dep_required_q;
-    logic [ISSUE_DEPTH-1:0][PACKET_W-1:0] issue_packet_q;
-    logic [ISSUE_DEPTH-1:0]               queued_q;
-
-    logic [ISSUE_DEPTH-1:0]               packet_write_en;
-    logic [ISSUE_DEPTH-1:0][PACKET_W-1:0] packet_write_data;
-
-    logic [DELAY_CLASS_NUM-1:0][ISSUE_DEPTH-1:0]
-          [SEQ_W-1:0] ready_q_seq_tag_q;
-    logic [DELAY_CLASS_NUM-1:0][ROB_ID_W-1:0] ready_q_head_q;
-    logic [DELAY_CLASS_NUM-1:0][ROB_ID_W-1:0] ready_q_tail_q;
-    logic [DELAY_CLASS_NUM-1:0][QUEUE_COUNT_W-1:0]
-          ready_q_count_q;
-
-    logic [DELAY_CLASS_NUM-1:0][ENQUEUE_COUNT_W-1:0]
-          ready_pop_count;
-    logic [DELAY_CLASS_NUM-1:0][ENQUEUE_COUNT_W-1:0]
-          ready_push_count;
-    logic [DELAY_CLASS_NUM-1:0][ISSUE_DEPTH-1:0]
-          ready_write_en;
-    logic [DELAY_CLASS_NUM-1:0][ISSUE_DEPTH-1:0][SEQ_W-1:0]
-          ready_write_seq_tag;
-    logic [READY_ENQUEUE_WIDTH-1:0][ENQUEUE_COUNT_W-1:0]
-          enqueue_rank_in_class;
-    logic [READY_ENQUEUE_WIDTH-1:0][ROB_ID_W-1:0]
-          enqueue_write_position;
-
-    rob_id_t enqueue_rr_ptr_q;
-    rob_id_t enqueue_rr_ptr_d;
+    logic [ISSUE_DEPTH-1:0]       candidate_present_q;
+    logic [ISSUE_DEPTH-1:0]       candidate_present_d;
+    logic [CAND_WINDOW_DEPTH-1:0] candidate_valid_q;
+    logic [CAND_WINDOW_DEPTH-1:0] candidate_valid_d;
+    seq_tag_t                     candidate_seq_tag_q    [CAND_WINDOW_DEPTH];
+    seq_tag_t                     candidate_seq_tag_d    [CAND_WINDOW_DEPTH];
+    delay_t                       candidate_delay_q      [CAND_WINDOW_DEPTH];
+    delay_t                       candidate_delay_d      [CAND_WINDOW_DEPTH];
+    logic [READY_ENQUEUE_WIDTH-1:0] refill_plan_valid_q;
+    logic [READY_ENQUEUE_WIDTH-1:0] refill_plan_valid_d;
+    seq_tag_t                       refill_plan_seq_tag_q[READY_ENQUEUE_WIDTH];
+    seq_tag_t                       refill_plan_seq_tag_d[READY_ENQUEUE_WIDTH];
+    delay_t                         refill_plan_delay_q[READY_ENQUEUE_WIDTH];
+    delay_t                         refill_plan_delay_d[READY_ENQUEUE_WIDTH];
+    admit_row_id_t                ready_admit_row_rr_q [ADMIT_BANKS];
+    admit_row_id_t                ready_admit_row_rr_d [ADMIT_BANKS];
+    admit_bank_id_t               ready_admit_bank_rr_q;
+    admit_bank_id_t               ready_admit_bank_rr_d;
 
     logic [FE_NUM-1:0]            selected_valid_q;
-    logic [FE_NUM-1:0][SEQ_W-1:0] selected_seq_tag_q;
+    seq_tag_t                     selected_seq_tag_q       [FE_NUM];
+    seq_tag_t                     selected_target_seq_tag_q[FE_NUM];
+    delay_t                       selected_delay_q         [FE_NUM];
+    logic [FE_NUM-1:0]            selected_dep_required_q;
+
+    logic [ISSUE_DEPTH-1:0]       wake_hit;
+
+    logic [CAND_WINDOW_DEPTH-1:0] candidate_remove;
+    logic [ISSUE_DEPTH-1:0]       select_entry_hit;
+    logic [ISSUE_DEPTH-1:0]       admit_entry_hit;
+    logic [ISSUE_DEPTH-1:0]       eligible_ready;
+    logic [ISSUE_DEPTH-1:0]       candidate_present_after_remove;
+    logic [ISSUE_DEPTH-1:0]       refill_plan_entry_hit;
+    logic [CAND_WINDOW_DEPTH-1:0] candidate_free;
+    free_half_map_t               free_half_map[2];
+    logic [READY_ENQUEUE_WIDTH-1:0] free_slot_valid;
+    cand_id_t                     free_slot_id[READY_ENQUEUE_WIDTH];
+    seq_tag_t                     select_seq_tag [FE_NUM];
+    rob_id_t                      select_entry_id[FE_NUM];
+
+    logic [ADMIT_BANKS-1:0]       bank_winner_valid;
+    seq_tag_t                     bank_winner_seq_tag[ADMIT_BANKS];
+    delay_t                       bank_winner_delay[ADMIT_BANKS];
+    logic [ADMIT_BANKS-1:0]       rotated_bank_valid;
+    admit_bank_id_t               rotated_bank_num[ADMIT_BANKS];
+    logic [ADMIT_BANKS-1:0]       compact_bank_valid;
+    admit_bank_id_t               compact_bank_num[ADMIT_BANKS];
+    logic [READY_ENQUEUE_WIDTH-1:0] admit_valid;
+    seq_tag_t                       admit_seq_tag [READY_ENQUEUE_WIDTH];
+    delay_t                         admit_delay   [READY_ENQUEUE_WIDTH];
 
     //--------------------------------------------------------------------------
-    // D0 status-query generation and completion wakeup detection
+    // Dependency initialization and bounded completion wakeup
     //--------------------------------------------------------------------------
-
-    logic [ISSUE_DEPTH-1:0] wake_hit;
 
     always_comb begin : dependency_status_request
         dep_status_valid_o          = '0;
         dep_status_target_seq_tag_o = '0;
 
-        for (int lane_idx = 0; lane_idx < N; lane_idx++) begin
-            if (issue_alloc_valid_i[lane_idx]
-                && alloc_dep_required_i[lane_idx]) begin
-                dep_status_valid_o[lane_idx] = 1'b1;
-                dep_status_target_seq_tag_o[lane_idx] =
-                    alloc_target_seq_tag_i[lane_idx];
+        for (int lane = 0; lane < N; lane++) begin
+            dep_status_valid_o[lane] =
+                issue_alloc_valid_i[lane] && alloc_dep_required_i[lane];
+            if (dep_status_valid_o[lane]) begin
+                dep_status_target_seq_tag_o[lane] =
+                    alloc_target_seq_tag_i[lane];
             end
         end
     end
 
-    always_comb begin : completion_wakeup_detect
+    always_comb begin : completion_wakeup_scan
         wake_hit = '0;
 
-        for (int entry_idx = 0;
-             entry_idx < ISSUE_DEPTH;
-             entry_idx++) begin
-            if (issue_state_q[entry_idx] == ISSUE_WAIT_DEP) begin
-                for (int comp_idx = 0;
-                     comp_idx < FE_NUM;
-                     comp_idx++) begin
-                    if (completion_valid_i[comp_idx]
-                        && (issue_target_seq_tag_q[entry_idx]
-                            [ROB_ID_W-1:0]
-                            == completion_seq_tag_i[comp_idx]
-                               [ROB_ID_W-1:0])
-                        && (issue_target_seq_tag_q[entry_idx]
-                            == completion_seq_tag_i[comp_idx])) begin
-                        wake_hit[entry_idx] = 1'b1;
+        for (int entry = 0; entry < ISSUE_DEPTH; entry++) begin
+            for (int fe = 0; fe < FE_NUM; fe++) begin
+                if (completion_valid_i[fe]
+                    && (issue_state_q[entry] == ISSUE_WAIT_DEP)
+                    && (issue_target_seq_tag_q[entry]
+                        == completion_seq_tag_i[fe])) begin
+                    wake_hit[entry] = 1'b1;
+                end
+            end
+        end
+    end
+
+    //--------------------------------------------------------------------------
+    // Candidate removal and READY discovery
+    //--------------------------------------------------------------------------
+
+    always_comb begin : candidate_removal_decode
+        candidate_remove              = '0;
+        select_entry_hit              = '0;
+        candidate_present_after_remove = candidate_present_q;
+
+        for (int fe = 0; fe < FE_NUM; fe++) begin
+            select_seq_tag[fe]  = '0;
+            select_entry_id[fe] = '0;
+            if (select_valid_i[fe]) begin
+                candidate_remove |= select_candidate_onehot_i[fe];
+                for (int slot = 0; slot < CAND_WINDOW_DEPTH; slot++) begin
+                    if (select_candidate_onehot_i[fe][slot]) begin
+                        select_seq_tag[fe] = candidate_seq_tag_q[slot];
+                        select_entry_id[fe] =
+                            candidate_seq_tag_q[slot][ROB_ID_W-1:0];
                     end
                 end
             end
         end
-    end
 
-    //--------------------------------------------------------------------------
-    // READY discovery, queued tracking, and delay-class FIFO state
-    //--------------------------------------------------------------------------
-
-    logic [ISSUE_DEPTH-1:0] alloc_hit;
-    logic [ISSUE_DEPTH-1:0] alloc_entry_ready;
-    logic [ISSUE_DEPTH-1:0][SEQ_W-1:0] alloc_seq_tag_by_id;
-    logic [ISSUE_DEPTH-1:0][DELAY_W-1:0] alloc_delay_by_id;
-
-    logic [ISSUE_DEPTH-1:0] existing_ready_unqueued;
-    logic [ISSUE_DEPTH-1:0] new_ready_allocation;
-
-    logic [READY_ENQUEUE_WIDTH-1:0]               enqueue_valid;
-    logic [READY_ENQUEUE_WIDTH-1:0][ROB_ID_W-1:0] enqueue_rob_id;
-    logic [READY_ENQUEUE_WIDTH-1:0][SEQ_W-1:0]    enqueue_seq_tag;
-    logic [READY_ENQUEUE_WIDTH-1:0][DELAY_W-1:0]  enqueue_delay;
-    logic [ISSUE_DEPTH-1:0]                       enqueue_hit;
-
-    logic [ISSUE_DEPTH-1:0] rotated_existing_ready;
-    logic [ISSUE_DEPTH-1:0] rotated_new_ready;
-    logic [(2*ISSUE_DEPTH)-1:0] doubled_existing_ready;
-    logic [(2*ISSUE_DEPTH)-1:0] doubled_new_ready;
-    logic [ROTATE_INDEX_W-1:0] rotation_base;
-
-    logic [PREFIX_STAGE_NUM:0][ISSUE_DEPTH-1:0]
-          [ENQUEUE_COUNT_W-1:0] existing_prefix_count;
-    logic [PREFIX_STAGE_NUM:0][ISSUE_DEPTH-1:0]
-          [ENQUEUE_COUNT_W-1:0] new_prefix_count;
-    logic [ISSUE_DEPTH-1:0][ENQUEUE_COUNT_W-1:0]
-          existing_rank_before;
-    logic [ISSUE_DEPTH-1:0][ENQUEUE_COUNT_W-1:0]
-          new_rank_before;
-    logic [ENQUEUE_COUNT_W-1:0] existing_selected_count;
-    logic [ISSUE_DEPTH-1:0][ENQUEUE_COUNT_W-1:0]
-          new_combined_rank;
-
-    logic [READY_ENQUEUE_WIDTH-1:0][ISSUE_DEPTH-1:0]
-          existing_select_onehot;
-    logic [READY_ENQUEUE_WIDTH-1:0][ISSUE_DEPTH-1:0]
-          new_select_onehot;
-    logic [READY_ENQUEUE_WIDTH-1:0][ISSUE_DEPTH-1:0]
-          enqueue_select_onehot;
-    logic [READY_ENQUEUE_WIDTH-1:0] enqueue_from_allocation;
-    logic [READY_ENQUEUE_WIDTH-1:0][ROB_ID_W-1:0]
-          enqueue_rotated_offset;
-
-    always_comb begin : allocation_ready_decode
-        alloc_hit         = '0;
-        alloc_entry_ready = '0;
-        alloc_seq_tag_by_id = '0;
-        alloc_delay_by_id = '0;
-        packet_write_en   = '0;
-        packet_write_data = '0;
-
-        for (int lane_idx = 0; lane_idx < N; lane_idx++) begin
-            rob_id_t alloc_rob_id;
-
-            alloc_rob_id = rob_id_t'(
-                alloc_seq_tag_i[lane_idx][ROB_ID_W-1:0]);
-            if (issue_alloc_valid_i[lane_idx]) begin
-                alloc_hit[alloc_rob_id] = 1'b1;
-                alloc_seq_tag_by_id[alloc_rob_id] =
-                    alloc_seq_tag_i[lane_idx];
-                alloc_delay_by_id[alloc_rob_id] =
-                    alloc_delay_i[lane_idx];
-                alloc_entry_ready[alloc_rob_id] =
-                    !alloc_dep_required_i[lane_idx]
-                    || dep_status_available_i[lane_idx];
-                packet_write_en[alloc_rob_id] = 1'b1;
-                packet_write_data[alloc_rob_id] = alloc_packet_i[lane_idx];
-            end
-        end
-    end
-
-    always_comb begin : ready_source_detect
-        existing_ready_unqueued = '0;
-        new_ready_allocation    = '0;
-
-        for (int entry_idx = 0;
-             entry_idx < ISSUE_DEPTH;
-             entry_idx++) begin
-            // Allocation replaces the old identity at the same physical ID,
-            // so the old entry must not be discovered on this edge.
-            if (!alloc_hit[entry_idx]) begin
-                existing_ready_unqueued[entry_idx] =
-                    ((issue_state_q[entry_idx] == ISSUE_READY)
-                     && !queued_q[entry_idx])
-                    || wake_hit[entry_idx];
-            end
-
-            new_ready_allocation[entry_idx] =
-                alloc_hit[entry_idx] && alloc_entry_ready[entry_idx];
-        end
-    end
-
-    // Existing READY entries and same-edge wakeups have priority over new D0
-    // allocations. Rotate both event maps once, then use fixed-depth saturated
-    // prefix trees to assign ranks zero through three without a serial scan.
-    always_comb begin : ready_event_rotation
-        doubled_existing_ready = {
-            existing_ready_unqueued, existing_ready_unqueued
-        };
-        doubled_new_ready = {
-            new_ready_allocation, new_ready_allocation
-        };
-        rotation_base = ROTATE_INDEX_W'(enqueue_rr_ptr_q);
-        rotated_existing_ready =
-            doubled_existing_ready[rotation_base +: ISSUE_DEPTH];
-        rotated_new_ready =
-            doubled_new_ready[rotation_base +: ISSUE_DEPTH];
-    end
-
-    always_comb begin : ready_prefix_select
-        existing_prefix_count   = '0;
-        new_prefix_count        = '0;
-        existing_rank_before    = '0;
-        new_rank_before         = '0;
-        existing_selected_count = '0;
-        new_combined_rank       = '0;
-        existing_select_onehot  = '0;
-        new_select_onehot       = '0;
-        enqueue_select_onehot   = '0;
-
-        for (int prefix_entry = 0;
-             prefix_entry < ISSUE_DEPTH;
-             prefix_entry++) begin
-            existing_prefix_count[0][prefix_entry] =
-                ENQUEUE_COUNT_W'(rotated_existing_ready[prefix_entry]);
-            new_prefix_count[0][prefix_entry] =
-                ENQUEUE_COUNT_W'(rotated_new_ready[prefix_entry]);
-        end
-
-        for (int prefix_stage = 1;
-             prefix_stage <= PREFIX_STAGE_NUM;
-             prefix_stage++) begin
-            for (int prefix_entry = 0;
-                 prefix_entry < ISSUE_DEPTH;
-                 prefix_entry++) begin
-                if (prefix_entry < (1 << (prefix_stage - 1))) begin
-                    existing_prefix_count[prefix_stage][prefix_entry] =
-                        existing_prefix_count[prefix_stage-1][prefix_entry];
-                    new_prefix_count[prefix_stage][prefix_entry] =
-                        new_prefix_count[prefix_stage-1][prefix_entry];
-                end else begin
-                    existing_prefix_count[prefix_stage][prefix_entry] =
-                        saturated_count_add(
-                            existing_prefix_count[prefix_stage-1]
-                                                 [prefix_entry],
-                            existing_prefix_count[prefix_stage-1]
-                                                 [prefix_entry
-                                                  - (1 << (prefix_stage - 1))]);
-                    new_prefix_count[prefix_stage][prefix_entry] =
-                        saturated_count_add(
-                            new_prefix_count[prefix_stage-1][prefix_entry],
-                            new_prefix_count[prefix_stage-1]
-                                            [prefix_entry
-                                             - (1 << (prefix_stage - 1))]);
+        for (int entry = 0; entry < ISSUE_DEPTH; entry++) begin
+            for (int fe = 0; fe < FE_NUM; fe++) begin
+                if (select_valid_i[fe]
+                    && (select_entry_id[fe] == rob_id_t'(entry))) begin
+                    select_entry_hit[entry] = 1'b1;
                 end
             end
         end
-
-        existing_selected_count =
-            existing_prefix_count[PREFIX_STAGE_NUM][ISSUE_DEPTH-1];
-
-        for (int prefix_entry = 0;
-             prefix_entry < ISSUE_DEPTH;
-             prefix_entry++) begin
-            if (prefix_entry == 0) begin
-                existing_rank_before[prefix_entry] = '0;
-                new_rank_before[prefix_entry] = '0;
-            end else begin
-                existing_rank_before[prefix_entry] =
-                    existing_prefix_count[PREFIX_STAGE_NUM]
-                                         [prefix_entry-1];
-                new_rank_before[prefix_entry] =
-                    new_prefix_count[PREFIX_STAGE_NUM][prefix_entry-1];
-            end
-
-            new_combined_rank[prefix_entry] = saturated_count_add(
-                existing_selected_count, new_rank_before[prefix_entry]);
-
-            for (int enqueue_rank = 0;
-                 enqueue_rank < READY_ENQUEUE_WIDTH;
-                 enqueue_rank++) begin
-                existing_select_onehot[enqueue_rank][prefix_entry] =
-                    rotated_existing_ready[prefix_entry]
-                    && (existing_rank_before[prefix_entry]
-                        == ENQUEUE_COUNT_W'(enqueue_rank));
-                new_select_onehot[enqueue_rank][prefix_entry] =
-                    rotated_new_ready[prefix_entry]
-                    && (new_combined_rank[prefix_entry]
-                        == ENQUEUE_COUNT_W'(enqueue_rank));
-                enqueue_select_onehot[enqueue_rank][prefix_entry] =
-                    existing_select_onehot[enqueue_rank][prefix_entry]
-                    || new_select_onehot[enqueue_rank][prefix_entry];
-            end
-        end
+        candidate_present_after_remove =
+            candidate_present_q & ~select_entry_hit;
     end
 
-    generate
-        for (genvar enqueue_rank = 0;
-             enqueue_rank < READY_ENQUEUE_WIDTH;
-             enqueue_rank++) begin : ready_offset_encode
-            assign enqueue_from_allocation[enqueue_rank] =
-                |new_select_onehot[enqueue_rank];
-            assign enqueue_rotated_offset[enqueue_rank][0] =
-                |(enqueue_select_onehot[enqueue_rank] & 32'haaaa_aaaa);
-            assign enqueue_rotated_offset[enqueue_rank][1] =
-                |(enqueue_select_onehot[enqueue_rank] & 32'hcccc_cccc);
-            assign enqueue_rotated_offset[enqueue_rank][2] =
-                |(enqueue_select_onehot[enqueue_rank] & 32'hf0f0_f0f0);
-            assign enqueue_rotated_offset[enqueue_rank][3] =
-                |(enqueue_select_onehot[enqueue_rank] & 32'hff00_ff00);
-            assign enqueue_rotated_offset[enqueue_rank][4] =
-                |(enqueue_select_onehot[enqueue_rank] & 32'hffff_0000);
+    always_comb begin : candidate_free_compact
+        candidate_free = ~candidate_valid_q;
+        free_half_map[0] = compact_free_half(candidate_free[3:0]);
+        free_half_map[1] = compact_free_half(candidate_free[7:4]);
+        free_slot_valid  = '0;
+        for (int rank = 0; rank < READY_ENQUEUE_WIDTH; rank++) begin
+            free_slot_id[rank] = '0;
         end
-    endgenerate
 
-    always_comb begin : ready_discovery_encode
-        enqueue_valid    = '0;
-        enqueue_rob_id   = '0;
-        enqueue_seq_tag  = '0;
-        enqueue_delay    = '0;
-        enqueue_rr_ptr_d = enqueue_rr_ptr_q;
-
-        for (int enqueue_idx = 0;
-             enqueue_idx < READY_ENQUEUE_WIDTH;
-             enqueue_idx++) begin
-            enqueue_valid[enqueue_idx] =
-                |enqueue_select_onehot[enqueue_idx];
-            enqueue_rob_id[enqueue_idx] =
-                enqueue_rr_ptr_q + enqueue_rotated_offset[enqueue_idx];
-
-            if (enqueue_valid[enqueue_idx]) begin
-                if (enqueue_from_allocation[enqueue_idx]) begin
-                    enqueue_seq_tag[enqueue_idx] =
-                        alloc_seq_tag_by_id[enqueue_rob_id[enqueue_idx]];
-                    enqueue_delay[enqueue_idx] =
-                        alloc_delay_by_id[enqueue_rob_id[enqueue_idx]];
-                end else begin
-                    enqueue_seq_tag[enqueue_idx] =
-                        issue_seq_tag_q[enqueue_rob_id[enqueue_idx]];
-                    enqueue_delay[enqueue_idx] =
-                        issue_delay_q[enqueue_rob_id[enqueue_idx]];
+        case (free_half_map[0].count)
+            3'd0: begin
+                free_slot_valid = free_half_map[1].valid;
+                for (int rank = 0; rank < READY_ENQUEUE_WIDTH; rank++) begin
+                    free_slot_id[rank] =
+                        {1'b1, free_half_map[1].slot_id[rank]};
                 end
             end
-        end
-
-        if (enqueue_valid[3]) begin
-            enqueue_rr_ptr_d = enqueue_rob_id[3] + rob_id_t'(1);
-        end else if (enqueue_valid[2]) begin
-            enqueue_rr_ptr_d = enqueue_rob_id[2] + rob_id_t'(1);
-        end else if (enqueue_valid[1]) begin
-            enqueue_rr_ptr_d = enqueue_rob_id[1] + rob_id_t'(1);
-        end else if (enqueue_valid[0]) begin
-            enqueue_rr_ptr_d = enqueue_rob_id[0] + rob_id_t'(1);
-        end
+            3'd1: begin
+                free_slot_valid = {free_half_map[1].valid[2:0], 1'b1};
+                free_slot_id[0] = {1'b0, free_half_map[0].slot_id[0]};
+                for (int rank = 1; rank < READY_ENQUEUE_WIDTH; rank++) begin
+                    free_slot_id[rank] =
+                        {1'b1, free_half_map[1].slot_id[rank - 1]};
+                end
+            end
+            3'd2: begin
+                free_slot_valid = {free_half_map[1].valid[1:0], 2'b11};
+                free_slot_id[0] = {1'b0, free_half_map[0].slot_id[0]};
+                free_slot_id[1] = {1'b0, free_half_map[0].slot_id[1]};
+                free_slot_id[2] = {1'b1, free_half_map[1].slot_id[0]};
+                free_slot_id[3] = {1'b1, free_half_map[1].slot_id[1]};
+            end
+            3'd3: begin
+                free_slot_valid = {free_half_map[1].valid[0], 3'b111};
+                free_slot_id[0] = {1'b0, free_half_map[0].slot_id[0]};
+                free_slot_id[1] = {1'b0, free_half_map[0].slot_id[1]};
+                free_slot_id[2] = {1'b0, free_half_map[0].slot_id[2]};
+                free_slot_id[3] = {1'b1, free_half_map[1].slot_id[0]};
+            end
+            default: begin
+                free_slot_valid = 4'b1111;
+                for (int rank = 0; rank < READY_ENQUEUE_WIDTH; rank++) begin
+                    free_slot_id[rank] =
+                        {1'b0, free_half_map[0].slot_id[rank]};
+                end
+            end
+        endcase
     end
 
-    always_comb begin : enqueue_membership_decode
-        enqueue_hit = '0;
-        for (int enqueue_idx = 0;
-             enqueue_idx < READY_ENQUEUE_WIDTH;
-             enqueue_idx++) begin
-            if (enqueue_valid[enqueue_idx]) begin
-                enqueue_hit[enqueue_rob_id[enqueue_idx]] = 1'b1;
+    always_comb begin : ready_eligibility
+        eligible_ready        = '0;
+        refill_plan_entry_hit = '0;
+
+        for (int entry = 0; entry < ISSUE_DEPTH; entry++) begin
+            for (int rank = 0; rank < READY_ENQUEUE_WIDTH; rank++) begin
+                if (refill_plan_valid_q[rank]
+                    && (refill_plan_seq_tag_q[rank][ROB_ID_W-1:0]
+                        == rob_id_t'(entry))) begin
+                    refill_plan_entry_hit[entry] = 1'b1;
+                end
+            end
+            if (!candidate_present_q[entry]
+                && !refill_plan_entry_hit[entry]) begin
+                eligible_ready[entry] =
+                    (issue_state_q[entry] == ISSUE_READY)
+                    || wake_hit[entry];
             end
         end
     end
 
     //--------------------------------------------------------------------------
-    // READY-only candidate windows and irrevocable D2 selection
+    // Four-bank READY admission
     //--------------------------------------------------------------------------
 
-    always_comb begin : ready_queue_event_decode
-        ready_pop_count       = '0;
-        ready_push_count      = '0;
-        ready_write_en        = '0;
-        ready_write_seq_tag   = '0;
-        enqueue_rank_in_class = '0;
-        enqueue_write_position = '0;
+    always_comb begin : ready_bank_nomination
+        bank_winner_valid = '0;
 
-        for (int class_idx = 0;
-             class_idx < DELAY_CLASS_NUM;
-             class_idx++) begin
-            for (int fe_idx = 0; fe_idx < FE_NUM; fe_idx++) begin
-                rob_id_t select_rob_id;
+        for (int bank = 0; bank < ADMIT_BANKS; bank++) begin
+            logic found;
 
-                select_rob_id = rob_id_t'(
-                    select_seq_tag_i[fe_idx][ROB_ID_W-1:0]);
-                if (select_valid_i[fe_idx]
-                    && (issue_delay_q[select_rob_id]
-                        == DELAY_W'(class_idx))) begin
-                    ready_pop_count[class_idx] =
-                        ready_pop_count[class_idx]
-                        + ENQUEUE_COUNT_W'(1);
-                end
-            end
+            bank_winner_seq_tag[bank] = '0;
+            bank_winner_delay[bank]   = '0;
+            found = 1'b0;
+            for (int offset = 0; offset < ADMIT_ROWS; offset++) begin
+                admit_row_id_t scan_row;
+                rob_id_t scan_id;
 
-            for (int enqueue_idx = 0;
-                 enqueue_idx < READY_ENQUEUE_WIDTH;
-                 enqueue_idx++) begin
-                if (enqueue_valid[enqueue_idx]
-                    && (enqueue_delay[enqueue_idx] == DELAY_W'(class_idx))) begin
-                    ready_push_count[class_idx] =
-                        ready_push_count[class_idx]
-                        + ENQUEUE_COUNT_W'(1);
-                end
-            end
-        end
-
-        for (int enqueue_idx = 0;
-             enqueue_idx < READY_ENQUEUE_WIDTH;
-             enqueue_idx++) begin
-            for (int prior_idx = 0;
-                 prior_idx < enqueue_idx;
-                 prior_idx++) begin
-                if (enqueue_valid[prior_idx]
-                    && enqueue_valid[enqueue_idx]
-                    && (enqueue_delay[prior_idx]
-                        == enqueue_delay[enqueue_idx])) begin
-                    enqueue_rank_in_class[enqueue_idx] =
-                        enqueue_rank_in_class[enqueue_idx]
-                        + ENQUEUE_COUNT_W'(1);
-                end
-            end
-
-            if (enqueue_valid[enqueue_idx]) begin
-                enqueue_write_position[enqueue_idx] =
-                    ready_q_tail_q[enqueue_delay[enqueue_idx]]
-                    + rob_id_t'(enqueue_rank_in_class[enqueue_idx]);
-            end
-        end
-
-        for (int class_idx = 0;
-             class_idx < DELAY_CLASS_NUM;
-             class_idx++) begin
-            for (int queue_pos = 0;
-                 queue_pos < ISSUE_DEPTH;
-                 queue_pos++) begin
-                for (int enqueue_idx = 0;
-                     enqueue_idx < READY_ENQUEUE_WIDTH;
-                     enqueue_idx++) begin
-                    if (enqueue_valid[enqueue_idx]
-                        && (enqueue_delay[enqueue_idx]
-                            == DELAY_W'(class_idx))
-                        && (enqueue_write_position[enqueue_idx]
-                            == rob_id_t'(queue_pos))) begin
-                        ready_write_en[class_idx][queue_pos] = 1'b1;
-                        ready_write_seq_tag[class_idx][queue_pos] =
-                            enqueue_seq_tag[enqueue_idx];
-                    end
+                scan_row = ready_admit_row_rr_q[bank]
+                    + admit_row_id_t'(offset);
+                scan_id = {scan_row, admit_bank_id_t'(bank)};
+                if (!found
+                    && eligible_ready[scan_id]) begin
+                    bank_winner_valid[bank] = 1'b1;
+                    bank_winner_seq_tag[bank] =
+                        issue_seq_tag_q[scan_id];
+                    bank_winner_delay[bank] =
+                        issue_delay_q[scan_id];
+                    found                   = 1'b1;
                 end
             end
         end
     end
 
-    always_comb begin : candidate_window_read
-        candidate_valid_o   = '0;
-        candidate_seq_tag_o = '0;
+    always_comb begin : ready_admission_select
+        admit_valid           = '0;
+        ready_admit_bank_rr_d =
+            ready_admit_bank_rr_q + admit_bank_id_t'(1);
+        for (int rank = 0; rank < READY_ENQUEUE_WIDTH; rank++) begin
+            admit_seq_tag[rank] = '0;
+            admit_delay[rank]   = '0;
+        end
+        for (int bank = 0; bank < ADMIT_BANKS; bank++) begin
+            ready_admit_row_rr_d[bank] =
+                ready_admit_row_rr_q[bank] + admit_row_id_t'(1);
+        end
 
-        for (int class_idx = 0;
-             class_idx < DELAY_CLASS_NUM;
-             class_idx++) begin
-            for (int window_idx = 0;
-                 window_idx < CAND_WINDOW_DEPTH;
-                 window_idx++) begin
-                rob_id_t read_position;
+        rotated_bank_valid = '0;
+        for (int offset = 0; offset < ADMIT_BANKS; offset++) begin
+            rotated_bank_num[offset] = '0;
+        end
+        case (ready_admit_bank_rr_q)
+            2'd0: begin
+                rotated_bank_valid  = bank_winner_valid;
+                rotated_bank_num[0] = 2'd0;
+                rotated_bank_num[1] = 2'd1;
+                rotated_bank_num[2] = 2'd2;
+                rotated_bank_num[3] = 2'd3;
+            end
+            2'd1: begin
+                rotated_bank_valid = {
+                    bank_winner_valid[0],
+                    bank_winner_valid[3:1]
+                };
+                rotated_bank_num[0] = 2'd1;
+                rotated_bank_num[1] = 2'd2;
+                rotated_bank_num[2] = 2'd3;
+                rotated_bank_num[3] = 2'd0;
+            end
+            2'd2: begin
+                rotated_bank_valid = {
+                    bank_winner_valid[1:0],
+                    bank_winner_valid[3:2]
+                };
+                rotated_bank_num[0] = 2'd2;
+                rotated_bank_num[1] = 2'd3;
+                rotated_bank_num[2] = 2'd0;
+                rotated_bank_num[3] = 2'd1;
+            end
+            default: begin
+                rotated_bank_valid = {
+                    bank_winner_valid[2:0],
+                    bank_winner_valid[3]
+                };
+                rotated_bank_num[0] = 2'd3;
+                rotated_bank_num[1] = 2'd0;
+                rotated_bank_num[2] = 2'd1;
+                rotated_bank_num[3] = 2'd2;
+            end
+        endcase
 
-                read_position = ready_q_head_q[class_idx]
-                                + rob_id_t'(window_idx);
-                if (QUEUE_COUNT_W'(window_idx)
-                    < ready_q_count_q[class_idx]) begin
-                    candidate_valid_o[class_idx][window_idx] = 1'b1;
-                    candidate_seq_tag_o[class_idx][window_idx] =
-                        ready_q_seq_tag_q[class_idx][read_position];
+        compact_bank_valid = '0;
+        for (int rank = 0; rank < ADMIT_BANKS; rank++) begin
+            compact_bank_num[rank] = '0;
+        end
+        case (rotated_bank_valid)
+            4'b0001: begin
+                compact_bank_valid  = 4'b0001;
+                compact_bank_num[0] = rotated_bank_num[0];
+            end
+            4'b0010: begin
+                compact_bank_valid  = 4'b0001;
+                compact_bank_num[0] = rotated_bank_num[1];
+            end
+            4'b0011: begin
+                compact_bank_valid  = 4'b0011;
+                compact_bank_num[0] = rotated_bank_num[0];
+                compact_bank_num[1] = rotated_bank_num[1];
+            end
+            4'b0100: begin
+                compact_bank_valid  = 4'b0001;
+                compact_bank_num[0] = rotated_bank_num[2];
+            end
+            4'b0101: begin
+                compact_bank_valid  = 4'b0011;
+                compact_bank_num[0] = rotated_bank_num[0];
+                compact_bank_num[1] = rotated_bank_num[2];
+            end
+            4'b0110: begin
+                compact_bank_valid  = 4'b0011;
+                compact_bank_num[0] = rotated_bank_num[1];
+                compact_bank_num[1] = rotated_bank_num[2];
+            end
+            4'b0111: begin
+                compact_bank_valid  = 4'b0111;
+                compact_bank_num[0] = rotated_bank_num[0];
+                compact_bank_num[1] = rotated_bank_num[1];
+                compact_bank_num[2] = rotated_bank_num[2];
+            end
+            4'b1000: begin
+                compact_bank_valid  = 4'b0001;
+                compact_bank_num[0] = rotated_bank_num[3];
+            end
+            4'b1001: begin
+                compact_bank_valid  = 4'b0011;
+                compact_bank_num[0] = rotated_bank_num[0];
+                compact_bank_num[1] = rotated_bank_num[3];
+            end
+            4'b1010: begin
+                compact_bank_valid  = 4'b0011;
+                compact_bank_num[0] = rotated_bank_num[1];
+                compact_bank_num[1] = rotated_bank_num[3];
+            end
+            4'b1011: begin
+                compact_bank_valid  = 4'b0111;
+                compact_bank_num[0] = rotated_bank_num[0];
+                compact_bank_num[1] = rotated_bank_num[1];
+                compact_bank_num[2] = rotated_bank_num[3];
+            end
+            4'b1100: begin
+                compact_bank_valid  = 4'b0011;
+                compact_bank_num[0] = rotated_bank_num[2];
+                compact_bank_num[1] = rotated_bank_num[3];
+            end
+            4'b1101: begin
+                compact_bank_valid  = 4'b0111;
+                compact_bank_num[0] = rotated_bank_num[0];
+                compact_bank_num[1] = rotated_bank_num[2];
+                compact_bank_num[2] = rotated_bank_num[3];
+            end
+            4'b1110: begin
+                compact_bank_valid  = 4'b0111;
+                compact_bank_num[0] = rotated_bank_num[1];
+                compact_bank_num[1] = rotated_bank_num[2];
+                compact_bank_num[2] = rotated_bank_num[3];
+            end
+            4'b1111: begin
+                compact_bank_valid  = 4'b1111;
+                for (int rank = 0; rank < ADMIT_BANKS; rank++) begin
+                    compact_bank_num[rank] = rotated_bank_num[rank];
                 end
+            end
+            default: compact_bank_valid = '0;
+        endcase
+
+        for (int rank = 0; rank < READY_ENQUEUE_WIDTH; rank++) begin
+            if (compact_bank_valid[rank]) begin
+                admit_valid[rank]   = 1'b1;
+                admit_seq_tag[rank] =
+                    bank_winner_seq_tag[compact_bank_num[rank]];
+                admit_delay[rank] =
+                    bank_winner_delay[compact_bank_num[rank]];
             end
         end
     end
 
+    always_comb begin : refill_stage_next
+        refill_plan_valid_d = admit_valid;
+        for (int rank = 0; rank < READY_ENQUEUE_WIDTH; rank++) begin
+            refill_plan_seq_tag_d[rank] = admit_seq_tag[rank];
+            refill_plan_delay_d[rank]   = admit_delay[rank];
+        end
+    end
+
+    always_comb begin : candidate_window_next
+        candidate_valid_d   = candidate_valid_q;
+        candidate_present_d = candidate_present_after_remove;
+        admit_entry_hit      = '0;
+
+        for (int slot = 0; slot < CAND_WINDOW_DEPTH; slot++) begin
+            candidate_seq_tag_d[slot] = candidate_seq_tag_q[slot];
+            candidate_delay_d[slot]   = candidate_delay_q[slot];
+            if (candidate_remove[slot]) begin
+                candidate_valid_d[slot] = 1'b0;
+            end
+        end
+
+        for (int slot = 0; slot < CAND_WINDOW_DEPTH; slot++) begin
+            for (int rank = 0; rank < READY_ENQUEUE_WIDTH; rank++) begin
+                if (free_slot_valid[rank]
+                    && refill_plan_valid_q[rank]
+                    && (free_slot_id[rank] == cand_id_t'(slot))) begin
+                    candidate_valid_d[slot]   = 1'b1;
+                    candidate_seq_tag_d[slot] =
+                        refill_plan_seq_tag_q[rank];
+                    candidate_delay_d[slot] =
+                        refill_plan_delay_q[rank];
+                end
+            end
+        end
+        for (int entry = 0; entry < ISSUE_DEPTH; entry++) begin
+            for (int rank = 0; rank < READY_ENQUEUE_WIDTH; rank++) begin
+                if (free_slot_valid[rank]
+                    && refill_plan_valid_q[rank]
+                    && (refill_plan_seq_tag_q[rank][ROB_ID_W-1:0]
+                        == rob_id_t'(entry))) begin
+                    admit_entry_hit[entry] = 1'b1;
+                end
+            end
+        end
+        candidate_present_d |= admit_entry_hit;
+    end
+
     //--------------------------------------------------------------------------
-    // Per-FE selected-tag pipeline, D3 issue bundle, and automatic release
+    // Candidate and D3 registered-metadata outputs
     //--------------------------------------------------------------------------
 
-    always_comb begin : issue_bundle_read
+    always_comb begin : interface_outputs
+        candidate_valid_o           = candidate_valid_q;
+        candidate_seq_tag_o         = '0;
+        candidate_delay_o           = '0;
         dep_gather_valid_o          = '0;
         dep_gather_target_seq_tag_o = '0;
         issue_valid_o               = selected_valid_q;
-        issue_packet_o              = '0;
+        issue_seq_tag_o             = '0;
         issue_delay_o               = '0;
         issue_dep_required_o        = '0;
+        issue_target_seq_tag_o      = '0;
 
-        for (int fe_idx = 0; fe_idx < FE_NUM; fe_idx++) begin
-            rob_id_t selected_rob_id;
+        for (int slot = 0; slot < CAND_WINDOW_DEPTH; slot++) begin
+            if (candidate_valid_q[slot]) begin
+                candidate_seq_tag_o[slot] = candidate_seq_tag_q[slot];
+                candidate_delay_o[slot]   = candidate_delay_q[slot];
+            end
+            for (int rank = 0; rank < READY_ENQUEUE_WIDTH; rank++) begin
+                if (!candidate_valid_q[slot]
+                    && free_slot_valid[rank]
+                    && refill_plan_valid_q[rank]
+                    && (free_slot_id[rank] == cand_id_t'(slot))) begin
+                    candidate_valid_o[slot]   = 1'b1;
+                    candidate_seq_tag_o[slot] =
+                        refill_plan_seq_tag_q[rank];
+                    candidate_delay_o[slot] =
+                        refill_plan_delay_q[rank];
+                end
+            end
+        end
 
-            selected_rob_id = rob_id_t'(
-                selected_seq_tag_q[fe_idx][ROB_ID_W-1:0]);
-            if (selected_valid_q[fe_idx]) begin
-                issue_packet_o[fe_idx] =
-                    issue_packet_q[selected_rob_id];
-                issue_delay_o[fe_idx] =
-                    issue_delay_q[selected_rob_id];
-                issue_dep_required_o[fe_idx] =
-                    issue_dep_required_q[selected_rob_id];
-
-                if (issue_dep_required_q[selected_rob_id]) begin
-                    dep_gather_valid_o[fe_idx] = 1'b1;
-                    dep_gather_target_seq_tag_o[fe_idx] =
-                        issue_target_seq_tag_q[selected_rob_id];
+        for (int fe = 0; fe < FE_NUM; fe++) begin
+            if (selected_valid_q[fe]) begin
+                issue_seq_tag_o[fe]        = selected_seq_tag_q[fe];
+                issue_delay_o[fe]          = selected_delay_q[fe];
+                issue_dep_required_o[fe]   =
+                    selected_dep_required_q[fe];
+                issue_target_seq_tag_o[fe] =
+                    selected_target_seq_tag_q[fe];
+                dep_gather_valid_o[fe] =
+                    selected_dep_required_q[fe];
+                if (selected_dep_required_q[fe]) begin
+                    dep_gather_target_seq_tag_o[fe] =
+                        selected_target_seq_tag_q[fe];
                 end
             end
         end
     end
 
-    // Keep gather-response adaptation separate from request generation. This
-    // makes the unidirectional request/response dependency explicit and avoids
-    // presenting the integrated design as a combinational feedback process.
-    always_comb begin : dependency_data_adapt
-        issue_dep_data_o = '0;
-
-        for (int fe_idx = 0; fe_idx < FE_NUM; fe_idx++) begin
-            // data_valid is a legal-operation invariant, not a release or
-            // rollback condition for an irrevocable selection.
-            if (selected_valid_q[fe_idx]
-                && issue_dep_required_o[fe_idx]
-                && dep_gather_data_valid_i[fe_idx]) begin
-                issue_dep_data_o[fe_idx] = dep_gather_data_i[fe_idx];
-            end
-        end
-    end
-
     //--------------------------------------------------------------------------
-    // Concurrent next-state merge and sequential state update
+    // Sequential state ownership
     //--------------------------------------------------------------------------
 
-    // Effective entry priority is D3 release, completion wakeup, D2 select,
-    // queue-membership update, then D0 allocation. Allocation therefore owns
-    // the final identity and state of a same-edge reused physical entry.
-    always_ff @(posedge clk_i or negedge rst_ni) begin : issue_entry_update
+    always_ff @(posedge clk_i or negedge rst_ni) begin : issue_entry_state
         if (!rst_ni) begin
-            queued_q <= '0;
-
-            for (int entry_idx = 0;
-                 entry_idx < ISSUE_DEPTH;
-                 entry_idx++) begin
-                issue_state_q[entry_idx] <= ISSUE_FREE;
+            for (int entry = 0; entry < ISSUE_DEPTH; entry++) begin
+                issue_state_q[entry] <= ISSUE_FREE;
             end
         end else begin
-            // The prior cycle's irrevocable selections enter their FEs now.
-            for (int fe_idx = 0; fe_idx < FE_NUM; fe_idx++) begin
-                rob_id_t selected_rob_id;
-
-                selected_rob_id = rob_id_t'(
-                    selected_seq_tag_q[fe_idx][ROB_ID_W-1:0]);
-                if (selected_valid_q[fe_idx]) begin
-                    issue_state_q[selected_rob_id] <= ISSUE_FREE;
-                    queued_q[selected_rob_id] <= 1'b0;
+            for (int fe = 0; fe < FE_NUM; fe++) begin
+                if (selected_valid_q[fe]) begin
+                    issue_state_q[
+                        selected_seq_tag_q[fe][ROB_ID_W-1:0]] <= ISSUE_FREE;
                 end
             end
 
-            // Completion wakeup changes only small dependency/control fields.
-            for (int entry_idx = 0;
-                 entry_idx < ISSUE_DEPTH;
-                 entry_idx++) begin
-                if (wake_hit[entry_idx]) begin
-                    issue_state_q[entry_idx] <= ISSUE_READY;
+            for (int entry = 0; entry < ISSUE_DEPTH; entry++) begin
+                if (wake_hit[entry]) begin
+                    issue_state_q[entry] <= ISSUE_READY;
                 end
             end
 
-            // FE-scheduler selections are final and remove READY IDs from queues.
-            for (int fe_idx = 0; fe_idx < FE_NUM; fe_idx++) begin
-                rob_id_t select_rob_id;
-
-                select_rob_id = rob_id_t'(
-                    select_seq_tag_i[fe_idx][ROB_ID_W-1:0]);
-                if (select_valid_i[fe_idx]) begin
-                    issue_state_q[select_rob_id] <= ISSUE_SELECTED;
-                    queued_q[select_rob_id] <= 1'b0;
+            for (int fe = 0; fe < FE_NUM; fe++) begin
+                if (select_valid_i[fe]) begin
+                    issue_state_q[select_entry_id[fe]] <= ISSUE_SELECTED;
                 end
             end
 
-            for (int enqueue_idx = 0;
-                 enqueue_idx < READY_ENQUEUE_WIDTH;
-                 enqueue_idx++) begin
-                if (enqueue_valid[enqueue_idx]) begin
-                    queued_q[enqueue_rob_id[enqueue_idx]] <= 1'b1;
+            for (int lane = 0; lane < N; lane++) begin
+                if (issue_alloc_valid_i[lane]) begin
+                    rob_id_t allocation_id;
+
+                    allocation_id =
+                        alloc_seq_tag_i[lane][ROB_ID_W-1:0];
+                    issue_seq_tag_q[allocation_id] <=
+                        alloc_seq_tag_i[lane];
+                    issue_target_seq_tag_q[allocation_id] <=
+                        alloc_target_seq_tag_i[lane];
+                    issue_delay_q[allocation_id] <=
+                        alloc_delay_i[lane];
+                    issue_dep_required_q[allocation_id] <=
+                        alloc_dep_required_i[lane];
+                    issue_state_q[allocation_id] <=
+                        (!alloc_dep_required_i[lane]
+                         || dep_status_available_i[lane])
+                        ? ISSUE_READY : ISSUE_WAIT_DEP;
                 end
-            end
-
-            // D0 allocation is the final writer for a reused issue entry.
-            for (int lane_idx = 0; lane_idx < N; lane_idx++) begin
-                rob_id_t alloc_rob_id;
-
-                alloc_rob_id = rob_id_t'(
-                    alloc_seq_tag_i[lane_idx][ROB_ID_W-1:0]);
-                if (issue_alloc_valid_i[lane_idx]) begin
-                    if (!alloc_dep_required_i[lane_idx]
-                        || dep_status_available_i[lane_idx]) begin
-                        issue_state_q[alloc_rob_id] <= ISSUE_READY;
-                    end else begin
-                        issue_state_q[alloc_rob_id] <= ISSUE_WAIT_DEP;
-                    end
-
-                    issue_seq_tag_q[alloc_rob_id] <=
-                        alloc_seq_tag_i[lane_idx];
-                    issue_target_seq_tag_q[alloc_rob_id] <=
-                        alloc_target_seq_tag_i[lane_idx];
-                    issue_delay_q[alloc_rob_id] <=
-                        alloc_delay_i[lane_idx];
-                    issue_dep_required_q[alloc_rob_id] <=
-                        alloc_dep_required_i[lane_idx];
-                    queued_q[alloc_rob_id] <= enqueue_hit[alloc_rob_id];
-                end
-            end
-
-        end
-    end
-
-    // Payload is physically independent from scheduler metadata. It is not
-    // reset and changes only when a newly accepted packet owns the entry.
-    always_ff @(posedge clk_i) begin : issue_payload_update
-        for (int entry_idx = 0;
-             entry_idx < ISSUE_DEPTH;
-             entry_idx++) begin
-            if (packet_write_en[entry_idx]) begin
-                issue_packet_q[entry_idx] <= packet_write_data[entry_idx];
             end
         end
     end
 
-    // Per-FE selected-tag registers are consumed and refilled every cycle,
-    // allowing one new selection per FE without bubbles.
-    always_ff @(posedge clk_i or negedge rst_ni) begin : selected_pipe_update
+    always_ff @(posedge clk_i or negedge rst_ni) begin : selected_metadata
         if (!rst_ni) begin
             selected_valid_q <= '0;
         end else begin
             selected_valid_q <= select_valid_i;
-            for (int fe_idx = 0; fe_idx < FE_NUM; fe_idx++) begin
-                if (select_valid_i[fe_idx]) begin
-                    selected_seq_tag_q[fe_idx] <= select_seq_tag_i[fe_idx];
+            for (int fe = 0; fe < FE_NUM; fe++) begin
+                if (select_valid_i[fe]) begin
+                    rob_id_t selected_id;
+
+                    selected_id = select_entry_id[fe];
+                    selected_seq_tag_q[fe] <= select_seq_tag[fe];
+                    selected_target_seq_tag_q[fe] <=
+                        issue_target_seq_tag_q[selected_id];
+                    selected_delay_q[fe] <= issue_delay_q[selected_id];
+                    selected_dep_required_q[fe] <=
+                        issue_dep_required_q[selected_id];
                 end
             end
         end
     end
 
-    always_ff @(posedge clk_i or negedge rst_ni) begin : ready_queue_state_update
+    always_ff @(posedge clk_i or negedge rst_ni) begin : candidate_state
         if (!rst_ni) begin
-            ready_q_head_q   <= '0;
-            ready_q_tail_q   <= '0;
-            ready_q_count_q  <= '0;
-            enqueue_rr_ptr_q <= '0;
-        end else begin
-            for (int class_idx = 0;
-                 class_idx < DELAY_CLASS_NUM;
-                 class_idx++) begin
-                if (ready_pop_count[class_idx] != '0) begin
-                    ready_q_head_q[class_idx] <=
-                        ready_q_head_q[class_idx]
-                        + rob_id_t'(ready_pop_count[class_idx]);
-                end
-
-                if (ready_push_count[class_idx] != '0) begin
-                    ready_q_tail_q[class_idx] <=
-                        ready_q_tail_q[class_idx]
-                        + rob_id_t'(ready_push_count[class_idx]);
-                end
-
-                if ((ready_pop_count[class_idx] != '0)
-                    || (ready_push_count[class_idx] != '0)) begin
-                    ready_q_count_q[class_idx] <=
-                        ready_q_count_q[class_idx]
-                        - QUEUE_COUNT_W'(ready_pop_count[class_idx])
-                        + QUEUE_COUNT_W'(ready_push_count[class_idx]);
-                end
+            candidate_valid_q      <= '0;
+            candidate_present_q    <= '0;
+            ready_admit_bank_rr_q  <= '0;
+            for (int bank = 0; bank < ADMIT_BANKS; bank++) begin
+                ready_admit_row_rr_q[bank] <= '0;
             end
-
-            if (|enqueue_valid) begin
-                enqueue_rr_ptr_q <= enqueue_rr_ptr_d;
+        end else begin
+            candidate_valid_q      <= candidate_valid_d;
+            candidate_present_q    <= candidate_present_d;
+            ready_admit_bank_rr_q  <= ready_admit_bank_rr_d;
+            for (int bank = 0; bank < ADMIT_BANKS; bank++) begin
+                ready_admit_row_rr_q[bank] <= ready_admit_row_rr_d[bank];
+            end
+            for (int slot = 0; slot < CAND_WINDOW_DEPTH; slot++) begin
+                if (candidate_valid_d[slot]
+                    && (!candidate_valid_q[slot]
+                        || candidate_remove[slot]
+                        || (candidate_seq_tag_d[slot]
+                            != candidate_seq_tag_q[slot]))) begin
+                    candidate_seq_tag_q[slot] <= candidate_seq_tag_d[slot];
+                    candidate_delay_q[slot]   <= candidate_delay_d[slot];
+                end
             end
         end
     end
 
-    // FIFO contents use slot-local write enables. Existing tags hold while
-    // head/tail move, avoiding the former full-array relocation network.
-    always_ff @(posedge clk_i) begin : ready_queue_tag_update
-        for (int class_idx = 0;
-             class_idx < DELAY_CLASS_NUM;
-             class_idx++) begin
-            for (int queue_pos = 0;
-                 queue_pos < ISSUE_DEPTH;
-                 queue_pos++) begin
-                if (ready_write_en[class_idx][queue_pos]) begin
-                    ready_q_seq_tag_q[class_idx][queue_pos] <=
-                        ready_write_seq_tag[class_idx][queue_pos];
+    always_ff @(posedge clk_i or negedge rst_ni) begin : refill_plan_state
+        if (!rst_ni) begin
+            refill_plan_valid_q <= '0;
+        end else begin
+            refill_plan_valid_q <= refill_plan_valid_d;
+            for (int slot = 0; slot < READY_ENQUEUE_WIDTH; slot++) begin
+                if (refill_plan_valid_d[slot]
+                    && (!refill_plan_valid_q[slot]
+                        || (refill_plan_seq_tag_d[slot]
+                            != refill_plan_seq_tag_q[slot]))) begin
+                    refill_plan_seq_tag_q[slot] <=
+                        refill_plan_seq_tag_d[slot];
+                    refill_plan_delay_q[slot] <=
+                        refill_plan_delay_d[slot];
                 end
             end
         end

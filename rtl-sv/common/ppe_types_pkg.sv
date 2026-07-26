@@ -13,11 +13,8 @@ package ppe_types_pkg;
     localparam int ISSUE_WIDTH          = FE_NUM;
     localparam int RESULT_BANKS         = MAX_DEP + 1;
     localparam int DELAY_W              = 2;
-    localparam int DELAY_CLASS_NUM      = 1 << DELAY_W;
-    // D2A looks beyond the current pending prefix so back-to-back four-wide
-    // grants from one delay class remain visible to the matcher.
     localparam int CAND_WINDOW_DEPTH    = 8;
-    localparam int RETURN_SLOT_NUM      = 8;
+    localparam int RETURN_FUTURE_DEPTH  = 6;
     localparam int READY_ENQUEUE_WIDTH  = N;
     localparam int DEFAULT_PACKET_W     = 128;
     localparam int DEFAULT_DESC_W       = 5;

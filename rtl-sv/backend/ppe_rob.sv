@@ -40,6 +40,7 @@ module ppe_rob #(
     input  logic [ppe_types_pkg::N-1:0]                    alloc_req_valid_i,
     input  logic [ppe_types_pkg::N-1:0]
                  [ppe_types_pkg::SEQ_W-1:0]                alloc_seq_tag_i,
+    input  logic [ppe_types_pkg::N-1:0][PACKET_W-1:0]      alloc_packet_i,
     output logic                                           alloc_ready_o,
 
     // D0 dependency-status queries. "available" means that result data can be
@@ -57,6 +58,15 @@ module ppe_rob #(
     output logic [ppe_types_pkg::ISSUE_WIDTH-1:0]          dep_gather_data_valid_o,
     output logic [ppe_types_pkg::ISSUE_WIDTH-1:0]
                  [PACKET_W-1:0]                            dep_gather_data_o,
+
+    // D3 source-packet read. A valid response denotes the original allocation
+    // packet; result_valid distinguishes it from an overwritten FE result.
+    input  logic [ppe_types_pkg::ISSUE_WIDTH-1:0]          issue_read_valid_i,
+    input  logic [ppe_types_pkg::ISSUE_WIDTH-1:0]
+                 [ppe_types_pkg::SEQ_W-1:0]                issue_read_seq_tag_i,
+    output logic [ppe_types_pkg::ISSUE_WIDTH-1:0]          issue_read_data_valid_o,
+    output logic [ppe_types_pkg::ISSUE_WIDTH-1:0]
+                 [PACKET_W-1:0]                            issue_read_data_o,
 
     // Tagged FE completions. There is no ready; every protocol-valid return
     // must be captured in its asserted cycle.
@@ -131,7 +141,6 @@ module ppe_rob #(
     lane_count_t retire_count;
 
     logic [OCCUPANCY_W-1:0] free_count;
-    logic [OCCUPANCY_W-1:0] available_count;
 
     logic [FE_NUM-1:0] wb_commit;
     logic [FE_NUM-1:0][ROB_ID_W-1:0] wb_rob_id;
@@ -142,8 +151,18 @@ module ppe_rob #(
     logic [N-1:0]               alloc_fire;
 
     logic [ROB_DEPTH-1:0][FE_NUM-1:0]      wb_entry_commit;
-    logic [ROB_DEPTH-1:0]                  wb_entry_write_en;
-    logic [ROB_DEPTH-1:0][PACKET_W-1:0]    wb_entry_write_data;
+    logic [ROB_DEPTH-1:0]                  data_entry_write_en;
+    logic [ROB_DEPTH-1:0][PACKET_W-1:0]    data_entry_write_data;
+
+    logic [DATA_BANK_NUM-1:0]               alloc_data_valid_q;
+    logic [DATA_BANK_NUM-1:0][DATA_ROW_W-1:0]
+                                                alloc_data_row_q;
+    logic [DATA_BANK_NUM-1:0][PACKET_W-1:0] alloc_data_q;
+    logic [DATA_BANK_NUM-1:0]               alloc_data_capture_valid;
+    logic [DATA_BANK_NUM-1:0][DATA_ROW_W-1:0]
+                                                alloc_data_capture_row;
+    logic [DATA_BANK_NUM-1:0][PACKET_W-1:0]
+                                                alloc_data_capture;
 
     logic [RESULT_BANKS-1:0]               history_write_en;
     logic [RESULT_BANKS-1:0][SEQ_W-1:0]    history_write_seq_tag;
@@ -191,6 +210,28 @@ module ppe_rob #(
         alloc_count = alloc_ready_o ? request_count : '0;
     end
 
+    // Allocation tags are dense, so a batch contains at most one destination
+    // in each low-bit data bank. Capture one local write per bank for A1.
+    always_comb begin : allocation_data_capture
+        alloc_data_capture_valid = '0;
+        alloc_data_capture_row   = '0;
+        alloc_data_capture       = '0;
+
+        for (int alloc_idx = 0; alloc_idx < N; alloc_idx++) begin
+            data_bank_t alloc_bank;
+
+            alloc_bank = data_bank_t'(
+                alloc_rob_id[alloc_idx][DATA_BANK_W-1:0]);
+            if (alloc_fire[alloc_idx]) begin
+                alloc_data_capture_valid[alloc_bank] = 1'b1;
+                alloc_data_capture_row[alloc_bank] =
+                    data_row_t'(alloc_rob_id[alloc_idx]
+                                [ROB_ID_W-1:DATA_BANK_W]);
+                alloc_data_capture[alloc_bank] = alloc_packet_i[alloc_idx];
+            end
+        end
+    end
+
     //--------------------------------------------------------------------------
     // Writeback qualification and completion-bypass event generation
     //--------------------------------------------------------------------------
@@ -199,8 +240,8 @@ module ppe_rob #(
         wb_commit          = '0;
         wb_rob_id          = '0;
         wb_entry_commit    = '0;
-        wb_entry_write_en  = '0;
-        wb_entry_write_data = '0;
+        data_entry_write_en   = '0;
+        data_entry_write_data = '0;
 
         for (int wb_idx = 0; wb_idx < FE_NUM; wb_idx++) begin
             wb_rob_id[wb_idx] = rob_id_t'(
@@ -225,8 +266,8 @@ module ppe_rob #(
              entry_idx++) begin
             for (int wb_idx = 0; wb_idx < FE_NUM; wb_idx++) begin
                 if (wb_entry_commit[entry_idx][wb_idx]) begin
-                    wb_entry_write_en[entry_idx] = 1'b1;
-                    wb_entry_write_data[entry_idx] = wb_data_i[wb_idx];
+                    data_entry_write_en[entry_idx] = 1'b1;
+                    data_entry_write_data[entry_idx] = wb_data_i[wb_idx];
                 end
             end
         end
@@ -327,15 +368,38 @@ module ppe_rob #(
     //--------------------------------------------------------------------------
 
     always_comb begin : allocation_capacity
-        free_count      = OCCUPANCY_W'(ROB_DEPTH) - occupancy_q;
-        available_count = free_count + OCCUPANCY_W'(retire_count);
+        free_count = OCCUPANCY_W'(ROB_DEPTH) - occupancy_q;
 
-        // This is an internal request-dependent permission, not a PPE output.
-        // The ingress request is zero while its FIFO is empty or in reset, so
-        // reset need not be broadcast into this combinational capacity path.
+        // Do not borrow slots from the current retirement prefix. Released
+        // credits become visible through occupancy_q in the following cycle,
+        // removing retirement scan logic from the allocation write path.
         alloc_ready_o = (request_count != '0)
-                        && (available_count
-                            >= OCCUPANCY_W'(request_count));
+                        && (free_count >= OCCUPANCY_W'(request_count));
+
+    end
+
+    //--------------------------------------------------------------------------
+    // D3 original-packet read
+    //--------------------------------------------------------------------------
+
+    always_comb begin : issue_source_read
+        issue_read_data_valid_o = '0;
+        issue_read_data_o       = '0;
+
+        for (int read_idx = 0; read_idx < ISSUE_WIDTH; read_idx++) begin
+            rob_id_t source_rob_id;
+
+            source_rob_id = rob_id_t'(
+                issue_read_seq_tag_i[read_idx][ROB_ID_W-1:0]);
+            if (issue_read_valid_i[read_idx]
+                && rob_valid_q[source_rob_id]
+                && (rob_seq_tag_q[source_rob_id]
+                    == issue_read_seq_tag_i[read_idx])
+                && !rob_result_valid_q[source_rob_id]) begin
+                issue_read_data_valid_o[read_idx] = 1'b1;
+                issue_read_data_o[read_idx] = rob_data_read(source_rob_id);
+            end
+        end
     end
 
     //--------------------------------------------------------------------------
@@ -441,21 +505,9 @@ module ppe_rob #(
                     end
                 end
 
-                // 2) Retirement bypass using pre-edge ROB contents.
-                for (int retire_idx = 0;
-                     retire_idx < N;
-                     retire_idx++) begin
-                    if (!source_resolved
-                        && retire_valid_o[retire_idx]
-                        && (retire_seq_tag[retire_idx]
-                            == dep_status_target_seq_tag_i[query_idx])) begin
-                        source_resolved = 1'b1;
-                        dep_status_available_o[query_idx] = 1'b1;
-                    end
-                end
-
-                // 3) Active ROB. A pending full-tag match is authoritative and
-                // must stop the search before retired history.
+                // 2) Active ROB. A retirement-prefix entry is still active
+                // before the sampling edge, so this path also implements the
+                // retirement-bypass value without a duplicate head compare.
                 if (!source_resolved
                     && dep_status_active_match[query_idx]) begin
                     source_resolved = 1'b1;
@@ -463,7 +515,7 @@ module ppe_rob #(
                         dep_status_active_available[query_idx];
                 end
 
-                // 4) Retired history.
+                // 3) Retired history.
                 if (!source_resolved
                     && dep_status_history_match[query_idx]) begin
                     dep_status_available_o[query_idx] = 1'b1;
@@ -504,22 +556,8 @@ module ppe_rob #(
                     end
                 end
 
-                // 2) Retirement bypass.
-                for (int retire_idx = 0;
-                     retire_idx < N;
-                     retire_idx++) begin
-                    if (!source_resolved
-                        && retire_valid_o[retire_idx]
-                        && (retire_seq_tag[retire_idx]
-                            == dep_gather_target_seq_tag_i[query_idx])) begin
-                        source_resolved = 1'b1;
-                        dep_gather_data_valid_o[query_idx] = 1'b1;
-                        dep_gather_data_o[query_idx] =
-                            retire_data_o[retire_idx];
-                    end
-                end
-
-                // 3) Active ROB, including the authoritative pending case.
+                // 2) Active ROB, including the authoritative pending case and
+                // the pre-edge value of an entry retiring on this edge.
                 if (!source_resolved
                     && dep_gather_active_match[query_idx]) begin
                     source_resolved = 1'b1;
@@ -531,7 +569,7 @@ module ppe_rob #(
                     end
                 end
 
-                // 4) Retired history.
+                // 3) Retired history.
                 if (!source_resolved
                     && dep_gather_history_match[query_idx]) begin
                     dep_gather_data_valid_o[query_idx] = 1'b1;
@@ -578,19 +616,54 @@ module ppe_rob #(
         end
     end
 
-    // Wide active-result data has an entry-local write enable and is not reset.
-    always_ff @(posedge clk_i) begin : rob_result_data_update
+    // A0 captures allocation payload by data bank. The A1 write is safely
+    // complete before the earliest D3 source read for the new entry.
+    always_ff @(posedge clk_i or negedge rst_ni) begin : alloc_data_control
+        if (!rst_ni) begin
+            alloc_data_valid_q <= '0;
+        end else begin
+            alloc_data_valid_q <= alloc_data_capture_valid;
+            for (int bank_idx = 0;
+                 bank_idx < DATA_BANK_NUM;
+                 bank_idx++) begin
+                if (alloc_data_capture_valid[bank_idx]) begin
+                    alloc_data_row_q[bank_idx] <=
+                        alloc_data_capture_row[bank_idx];
+                end
+            end
+        end
+    end
+
+    always_ff @(posedge clk_i) begin : alloc_data_payload
+        for (int bank_idx = 0;
+             bank_idx < DATA_BANK_NUM;
+             bank_idx++) begin
+            if (alloc_data_capture_valid[bank_idx]) begin
+                alloc_data_q[bank_idx] <= alloc_data_capture[bank_idx];
+            end
+        end
+    end
+
+    // Unified original/result data has bank-local allocation input and
+    // entry-local completion write enable. Wide data is not reset.
+    always_ff @(posedge clk_i) begin : rob_data_update
         for (int bank_idx = 0;
              bank_idx < DATA_BANK_NUM;
              bank_idx++) begin
             for (int row_idx = 0;
                  row_idx < DATA_ROW_NUM;
                  row_idx++) begin
-                if (wb_entry_write_en[
+                if (data_entry_write_en[
                         (row_idx * DATA_BANK_NUM) + bank_idx]) begin
                     rob_data_q[bank_idx][row_idx] <=
-                        wb_entry_write_data[
+                        data_entry_write_data[
                             (row_idx * DATA_BANK_NUM) + bank_idx];
+                end
+                if (alloc_data_valid_q[bank_idx]
+                    && (alloc_data_row_q[bank_idx]
+                        == data_row_t'(row_idx))) begin
+                    rob_data_q[bank_idx][row_idx] <=
+                        alloc_data_q[bank_idx];
                 end
             end
         end

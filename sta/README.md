@@ -1,5 +1,18 @@
 # PPE STA Microbenchmarks
 
+For equal packet counts, the optimization score ratio is:
+
+```text
+performance_ratio = base_time / candidate_time
+score_ratio = performance_ratio^2
+            * sqrt(base_area / candidate_area)
+            * sqrt(base_power / candidate_power)
+```
+
+`script/calc_score_ratio.sh` evaluates the formula from measured cycle counts,
+frequencies, areas, and powers. Power values must come from equivalent activity
+and analysis conditions.
+
 `rtl/ppe_single_grant_ref.sv` is a standalone, fixed-dimension timing reference
 for one scheduler grant decision. It is deliberately excluded from production
 RTL and UVM filelists.

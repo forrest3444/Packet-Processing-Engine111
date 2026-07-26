@@ -23,29 +23,14 @@ module ppe_top_sv #(
     input  logic                    clk,
     input  logic                    rst_n,
 
-    input  logic                    in_valid0,
-    input  logic [PACKET_W-1:0]     in_packet0,
-    input  logic [DESC_W-1:0]       in_desc0,
-    input  logic                    in_valid1,
-    input  logic [PACKET_W-1:0]     in_packet1,
-    input  logic [DESC_W-1:0]       in_desc1,
-    input  logic                    in_valid2,
-    input  logic [PACKET_W-1:0]     in_packet2,
-    input  logic [DESC_W-1:0]       in_desc2,
-    input  logic                    in_valid3,
-    input  logic [PACKET_W-1:0]     in_packet3,
-    input  logic [DESC_W-1:0]       in_desc3,
+    input  logic [ppe_types_pkg::N-1:0]                 in_valid,
+    input  logic [ppe_types_pkg::N-1:0][PACKET_W-1:0]   in_packet,
+    input  logic [ppe_types_pkg::N-1:0][DESC_W-1:0]     in_desc,
 
     output logic                    bkps,
 
-    output logic                    out_valid0,
-    output logic [PACKET_W-1:0]     out_packet0,
-    output logic                    out_valid1,
-    output logic [PACKET_W-1:0]     out_packet1,
-    output logic                    out_valid2,
-    output logic [PACKET_W-1:0]     out_packet2,
-    output logic                    out_valid3,
-    output logic [PACKET_W-1:0]     out_packet3
+    output logic [ppe_types_pkg::N-1:0]                 out_valid,
+    output logic [ppe_types_pkg::N-1:0][PACKET_W-1:0]   out_packet
 );
 
     import ppe_types_pkg::*;
@@ -74,10 +59,6 @@ module ppe_top_sv #(
     // Internal point-to-point interconnects intentionally omit _i/_o suffixes;
     // direction is expressed only at each owning module boundary.
 
-    logic [N-1:0]                 in_valid;
-    logic [N-1:0][PACKET_W-1:0]   in_packet;
-    logic [N-1:0][DESC_W-1:0]     in_desc;
-
     logic [N-1:0]                 alloc_req_valid;
     logic [N-1:0][SEQ_W-1:0]      alloc_seq_tag;
     logic                         alloc_ready;
@@ -86,10 +67,6 @@ module ppe_top_sv #(
     logic [N-1:0][PACKET_W-1:0]   alloc_packet;
     logic [N-1:0][DELAY_W-1:0]    alloc_delay;
     logic [N-1:0]                 alloc_dep_required;
-
-    assign in_valid  = {in_valid3, in_valid2, in_valid1, in_valid0};
-    assign in_packet = {in_packet3, in_packet2, in_packet1, in_packet0};
-    assign in_desc   = {in_desc3, in_desc2, in_desc1, in_desc0};
 
     ppe_ingress #(
         .PACKET_W (PACKET_W),
@@ -119,13 +96,13 @@ module ppe_top_sv #(
     logic [N-1:0][SEQ_W-1:0]         dep_status_target_seq_tag;
     logic [N-1:0]                    dep_status_available;
 
-    logic [DELAY_CLASS_NUM-1:0]
-          [CAND_WINDOW_DEPTH-1:0]                 candidate_valid;
-    logic [DELAY_CLASS_NUM-1:0]
-          [CAND_WINDOW_DEPTH-1:0][SEQ_W-1:0]      candidate_seq_tag;
+    logic [CAND_WINDOW_DEPTH-1:0]                 candidate_valid;
+    logic [CAND_WINDOW_DEPTH-1:0][SEQ_W-1:0]      candidate_seq_tag;
+    logic [CAND_WINDOW_DEPTH-1:0][DELAY_W-1:0]    candidate_delay;
 
     logic [FE_NUM-1:0]               select_valid;
-    logic [FE_NUM-1:0][SEQ_W-1:0]    select_seq_tag;
+    logic [FE_NUM-1:0][CAND_WINDOW_DEPTH-1:0]
+                                       select_candidate_onehot;
     logic [FE_NUM-1:0]               completion_valid;
     logic [FE_NUM-1:0][SEQ_W-1:0]    completion_seq_tag;
 
@@ -135,23 +112,25 @@ module ppe_top_sv #(
     logic [FE_NUM-1:0][PACKET_W-1:0] dep_gather_data;
 
     logic [FE_NUM-1:0]               issue_valid;
+    logic [FE_NUM-1:0][SEQ_W-1:0]    issue_seq_tag;
     logic [FE_NUM-1:0][PACKET_W-1:0] issue_packet;
+    logic [FE_NUM-1:0]               issue_packet_valid;
     logic [FE_NUM-1:0][DELAY_W-1:0]  issue_delay;
     logic [FE_NUM-1:0]               issue_dep_required;
+    logic [FE_NUM-1:0][SEQ_W-1:0]    issue_target_seq_tag;
     logic [FE_NUM-1:0][PACKET_W-1:0] issue_dep_data;
 
     logic [FE_NUM-1:0]               fe_out_valid;
     logic [FE_NUM-1:0][PACKET_W-1:0] fe_out_data;
 
-    ppe_issue_table #(
-        .PACKET_W (PACKET_W)
-    ) u_issue_table (
+    assign issue_dep_data = dep_gather_data;
+
+    ppe_issue_table u_issue_table (
         .clk_i                       (clk),
         .rst_ni                      (internal_rst_n),
         .issue_alloc_valid_i         (issue_alloc_valid),
         .alloc_seq_tag_i             (alloc_seq_tag),
         .alloc_target_seq_tag_i      (alloc_target_seq_tag),
-        .alloc_packet_i              (alloc_packet),
         .alloc_delay_i               (alloc_delay),
         .alloc_dep_required_i        (alloc_dep_required),
         .dep_status_valid_o          (dep_status_valid),
@@ -161,17 +140,16 @@ module ppe_top_sv #(
         .completion_seq_tag_i        (completion_seq_tag),
         .candidate_valid_o           (candidate_valid),
         .candidate_seq_tag_o         (candidate_seq_tag),
+        .candidate_delay_o           (candidate_delay),
         .select_valid_i              (select_valid),
-        .select_seq_tag_i            (select_seq_tag),
+        .select_candidate_onehot_i   (select_candidate_onehot),
         .dep_gather_valid_o          (dep_gather_valid),
         .dep_gather_target_seq_tag_o (dep_gather_target_seq_tag),
-        .dep_gather_data_valid_i     (dep_gather_data_valid),
-        .dep_gather_data_i           (dep_gather_data),
         .issue_valid_o               (issue_valid),
-        .issue_packet_o              (issue_packet),
+        .issue_seq_tag_o             (issue_seq_tag),
         .issue_delay_o               (issue_delay),
         .issue_dep_required_o        (issue_dep_required),
-        .issue_dep_data_o            (issue_dep_data)
+        .issue_target_seq_tag_o      (issue_target_seq_tag)
     );
 
     ppe_fe_scheduler u_fe_scheduler (
@@ -179,8 +157,9 @@ module ppe_top_sv #(
         .rst_ni               (internal_rst_n),
         .candidate_valid_i    (candidate_valid),
         .candidate_seq_tag_i  (candidate_seq_tag),
+        .candidate_delay_i    (candidate_delay),
         .select_valid_o       (select_valid),
-        .select_seq_tag_o     (select_seq_tag),
+        .select_candidate_onehot_o(select_candidate_onehot),
         .fe_out_valid_i       (fe_out_valid),
         .completion_valid_o   (completion_valid),
         .completion_seq_tag_o (completion_seq_tag)
@@ -221,6 +200,7 @@ module ppe_top_sv #(
         .rst_ni                      (internal_rst_n),
         .alloc_req_valid_i           (alloc_req_valid),
         .alloc_seq_tag_i             (alloc_seq_tag),
+        .alloc_packet_i              (alloc_packet),
         .alloc_ready_o               (alloc_ready),
         .dep_status_valid_i          (dep_status_valid),
         .dep_status_target_seq_tag_i (dep_status_target_seq_tag),
@@ -229,6 +209,10 @@ module ppe_top_sv #(
         .dep_gather_target_seq_tag_i (dep_gather_target_seq_tag),
         .dep_gather_data_valid_o     (dep_gather_data_valid),
         .dep_gather_data_o           (dep_gather_data),
+        .issue_read_valid_i          (issue_valid),
+        .issue_read_seq_tag_i        (issue_seq_tag),
+        .issue_read_data_valid_o     (issue_packet_valid),
+        .issue_read_data_o           (issue_packet),
         .wb_valid_i                  (completion_valid),
         .wb_seq_tag_i                (completion_seq_tag),
         .wb_data_i                   (fe_out_data),
@@ -240,9 +224,6 @@ module ppe_top_sv #(
     // Registered physical output mapping and external-lane adaptation
     //--------------------------------------------------------------------------
 
-    logic [N-1:0]               out_valid;
-    logic [N-1:0][PACKET_W-1:0] out_packet;
-
     ppe_retire_output #(
         .PACKET_W (PACKET_W)
     ) u_retire_output (
@@ -253,15 +234,6 @@ module ppe_top_sv #(
         .out_valid_o    (out_valid),
         .out_packet_o   (out_packet)
     );
-
-    assign out_valid0  = out_valid[0];
-    assign out_packet0 = out_packet[0];
-    assign out_valid1  = out_valid[1];
-    assign out_packet1 = out_packet[1];
-    assign out_valid2  = out_valid[2];
-    assign out_packet2 = out_packet[2];
-    assign out_valid3  = out_valid[3];
-    assign out_packet3 = out_packet[3];
 
 endmodule : ppe_top_sv
 

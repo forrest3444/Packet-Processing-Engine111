@@ -43,27 +43,17 @@ module tb_top_sv;
     ) dut (
         .clk         (clk),
         .rst_n       (rst_n),
-        .in_valid0   (pif.in_valid0),
-        .in_packet0  (pif.in_packet0),
-        .in_desc0    (pif.in_desc0),
-        .in_valid1   (pif.in_valid1),
-        .in_packet1  (pif.in_packet1),
-        .in_desc1    (pif.in_desc1),
-        .in_valid2   (pif.in_valid2),
-        .in_packet2  (pif.in_packet2),
-        .in_desc2    (pif.in_desc2),
-        .in_valid3   (pif.in_valid3),
-        .in_packet3  (pif.in_packet3),
-        .in_desc3    (pif.in_desc3),
+        .in_valid    ({pif.in_valid3, pif.in_valid2,
+                       pif.in_valid1, pif.in_valid0}),
+        .in_packet   ({pif.in_packet3, pif.in_packet2,
+                       pif.in_packet1, pif.in_packet0}),
+        .in_desc     ({pif.in_desc3, pif.in_desc2,
+                       pif.in_desc1, pif.in_desc0}),
         .bkps        (pif.bkps),
-        .out_valid0  (pif.out_valid0),
-        .out_packet0 (pif.out_packet0),
-        .out_valid1  (pif.out_valid1),
-        .out_packet1 (pif.out_packet1),
-        .out_valid2  (pif.out_valid2),
-        .out_packet2 (pif.out_packet2),
-        .out_valid3  (pif.out_valid3),
-        .out_packet3 (pif.out_packet3)
+        .out_valid   ({pif.out_valid3, pif.out_valid2,
+                       pif.out_valid1, pif.out_valid0}),
+        .out_packet  ({pif.out_packet3, pif.out_packet2,
+                       pif.out_packet1, pif.out_packet0})
     );
 
     // Preserve the standalone FE contract test already present in the UVM
@@ -121,22 +111,17 @@ module tb_top_sv;
         endcase
     end
 
-    // Verification-only calendar consistency. A protocol-valid FE return must
-    // exactly coincide with the scheduler's current reserved return slot.
+    // Verification-only return-table consistency. A protocol-valid FE return
+    // must exactly coincide with the scheduler's current relative slot zero.
     always @(posedge clk) begin
         if (dut.internal_rst_n) begin
             for (int unsigned fe_idx = 0; fe_idx < 4; fe_idx++) begin
                 if (dut.fe_out_valid[fe_idx] !==
-                    dut.u_fe_scheduler.return_slot_valid_q[fe_idx]
-                                                    [dut.u_fe_scheduler
-                                                        .schedule_phase_q]) begin
+                    dut.u_fe_scheduler.future_valid_q[fe_idx][0]) begin
                     `uvm_error("FE_CALENDAR", $sformatf(
-                        "FE%0d return valid=%0b calendar=%0b phase=%0d",
+                        "FE%0d return valid=%0b future_slot0=%0b",
                         fe_idx, dut.fe_out_valid[fe_idx],
-                        dut.u_fe_scheduler.return_slot_valid_q[fe_idx]
-                                                       [dut.u_fe_scheduler
-                                                           .schedule_phase_q],
-                        dut.u_fe_scheduler.schedule_phase_q))
+                        dut.u_fe_scheduler.future_valid_q[fe_idx][0]))
                 end
             end
         end

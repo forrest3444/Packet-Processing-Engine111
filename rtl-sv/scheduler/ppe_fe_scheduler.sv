@@ -4,63 +4,36 @@
 //------------------------------------------------------------------------------
 // File        : ppe_fe_scheduler.sv
 // Project     : Packet Processing Engine (PPE)
-// Block       : Scheduler / FE Scheduler
+// Block       : Scheduler / FE Matcher
 //
 // Description :
-//   Owns candidate-to-FE matching and all state required to make an
-//   irrevocable scheduling decision: the per-FE return calendar, shared
-//   schedule phase, and class/FE round-robin positions. READY head windows are
-//   supplied by ppe_issue_table as complete sequence tags.
-//
-//   Matching is split across D2A and D2B. D2A captures an irrevocable pending
-//   grant; D2B exposes that registered grant to Issue Table and commits its FE
-//   return-slot reservation. At the current calendar phase, the saved tag is
-//   associated with the corresponding FE return and emitted as a completion
-//   event for Issue Table wakeup and ROB writeback. FE result data bypasses this
-//   block and connects directly to the ROB datapath.
+//   Pipelines candidate preselection, a fixed 4x4 single-round FE match, and
+//   return-slot commit. The registered grant is irrevocable and is associated
+//   with the FE result through a six-entry relative future table.
 //
 // Governing documents:
 //   - doc/ppe_feature_description.txt, Sections 2.2, 6, and 7
-//   - doc/hld.txt, Sections 3.3 and 4.3 through 4.4
+//   - doc/hld.txt, Sections 3.3, 5.1, and 6.2
 //   - doc/lld.txt, Sections 3.3 through 3.5, 5.4, 5.6, and 8
-//
-// Clock/reset :
-//   State is clocked by clk_i. rst_ni is the shared active-low internal reset.
-//   Reset clears grant and calendar valid bits, schedule phase, and fairness
-//   state; payload-like tag storage is not reset while its valid bit is clear.
-//
-// Implementation status:
-//   Two-stage matching, return-calendar management, completion association,
-//   forced-oldest multi-grant selection, reservation, and fairness updates are
-//   implemented.
 //------------------------------------------------------------------------------
 
 module ppe_fe_scheduler (
-    // Clock and reset
     input  logic                                           clk_i,
     input  logic                                           rst_ni,
 
-    // READY-only FIFO head windows. Within each class, valid candidates form a
-    // contiguous prefix and window slot zero is the oldest queued entry.
-    input  logic [ppe_types_pkg::DELAY_CLASS_NUM-1:0]
-                 [ppe_types_pkg::CAND_WINDOW_DEPTH-1:0]    candidate_valid_i,
-    input  logic [ppe_types_pkg::DELAY_CLASS_NUM-1:0]
-                 [ppe_types_pkg::CAND_WINDOW_DEPTH-1:0]
+    input  logic [ppe_types_pkg::CAND_WINDOW_DEPTH-1:0]    candidate_valid_i,
+    input  logic [ppe_types_pkg::CAND_WINDOW_DEPTH-1:0]
                  [ppe_types_pkg::SEQ_W-1:0]                candidate_seq_tag_i,
+    input  logic [ppe_types_pkg::CAND_WINDOW_DEPTH-1:0]
+                 [ppe_types_pkg::DELAY_W-1:0]              candidate_delay_i,
 
-    // Registered irrevocable selections indexed by destination FE. The
-    // corresponding return-calendar reservation commits on the same edge on
-    // which the Issue Table observes this D2B event.
     output logic [ppe_types_pkg::FE_NUM-1:0]               select_valid_o,
     output logic [ppe_types_pkg::FE_NUM-1:0]
-                 [ppe_types_pkg::SEQ_W-1:0]                select_seq_tag_o,
+                 [ppe_types_pkg::CAND_WINDOW_DEPTH-1:0]
+                                                             select_candidate_onehot_o,
 
-    // Physical FE return-valid signals. Result data does not traverse this
-    // control block and is connected directly from each FE to ppe_rob.
     input  logic [ppe_types_pkg::FE_NUM-1:0]               fe_out_valid_i,
 
-    // Calendar-qualified completion identity. These outputs jointly drive
-    // Issue Table wakeup and ROB writeback tag association.
     output logic [ppe_types_pkg::FE_NUM-1:0]               completion_valid_o,
     output logic [ppe_types_pkg::FE_NUM-1:0]
                  [ppe_types_pkg::SEQ_W-1:0]                completion_seq_tag_o
@@ -68,570 +41,459 @@ module ppe_fe_scheduler (
 
     import ppe_types_pkg::*;
 
-    //--------------------------------------------------------------------------
-    // Local parameters, types, and helper functions
-    //--------------------------------------------------------------------------
+    localparam int SHORTLIST_DEPTH = FE_NUM;
+    localparam int FE_ID_W         = $clog2(FE_NUM);
+    localparam int CAND_ID_W       = $clog2(CAND_WINDOW_DEPTH);
 
-    localparam int RETURN_SLOT_W =
-        (RETURN_SLOT_NUM > 1) ? $clog2(RETURN_SLOT_NUM) : 1;
-    localparam int CLASS_ID_W =
-        (DELAY_CLASS_NUM > 1) ? $clog2(DELAY_CLASS_NUM) : 1;
-    localparam int FE_ID_W =
-        (FE_NUM > 1) ? $clog2(FE_NUM) : 1;
-    localparam int GRANT_COUNT_W = $clog2(FE_NUM + 1);
+    typedef logic [FE_ID_W-1:0] fe_id_t;
+    typedef logic [CAND_ID_W-1:0] cand_id_t;
 
-    typedef logic [RETURN_SLOT_W-1:0] slot_id_t;
-    typedef logic [CLASS_ID_W-1:0]    class_id_t;
-    typedef logic [FE_ID_W-1:0]       fe_id_t;
+    logic [SHORTLIST_DEPTH-1:0]                         shortlist_valid;
+    cand_id_t [SHORTLIST_DEPTH-1:0]                    shortlist_candidate_id;
+    logic [SHORTLIST_DEPTH-1:0][SEQ_W-1:0]             shortlist_seq_tag;
+    logic [SHORTLIST_DEPTH-1:0][DELAY_W-1:0]           shortlist_delay;
 
-    function automatic class_id_t next_class_id(input class_id_t current_id);
-        begin
-            if (int'(current_id) == (DELAY_CLASS_NUM - 1)) begin
-                next_class_id = '0;
-            end else begin
-                next_class_id = class_id_t'(current_id + CLASS_ID_W'(1));
-            end
-        end
+    logic [FE_NUM-1:0]                                  grant_valid_q;
+    logic [FE_NUM-1:0]                                  grant_valid_d;
+    logic [FE_NUM-1:0][SEQ_W-1:0]                      grant_seq_tag_q;
+    logic [FE_NUM-1:0][SEQ_W-1:0]                      grant_seq_tag_d;
+    cand_id_t [FE_NUM-1:0]                             grant_candidate_id_q;
+    cand_id_t [FE_NUM-1:0]                             grant_candidate_id_d;
+    logic [FE_NUM-1:0][DELAY_W-1:0]                    grant_delay_q;
+    logic [FE_NUM-1:0][DELAY_W-1:0]                    grant_delay_d;
+
+    logic [FE_NUM-1:0][RETURN_FUTURE_DEPTH-1:0]        future_valid_q;
+    logic [FE_NUM-1:0][RETURN_FUTURE_DEPTH-1:0]
+         [SEQ_W-1:0]                                   future_seq_tag_q;
+
+    fe_id_t fe_rr_ptr_q;
+    fe_id_t fe_rr_ptr_d;
+    logic   candidate_bank_rr_ptr_q;
+    logic   candidate_bank_rr_ptr_d;
+
+    function automatic fe_id_t add_fe_offset(
+        input fe_id_t base,
+        input fe_id_t offset
+    );
+        add_fe_offset = base + offset;
     endfunction
 
-    function automatic fe_id_t next_fe_id(input fe_id_t current_id);
-        begin
-            if (int'(current_id) == (FE_NUM - 1)) begin
-                next_fe_id = '0;
-            end else begin
-                next_fe_id = fe_id_t'(current_id + FE_ID_W'(1));
-            end
-        end
-    endfunction
-
-    function automatic slot_id_t next_slot_id(input slot_id_t current_id);
-        begin
-            if (int'(current_id) == (RETURN_SLOT_NUM - 1)) begin
-                next_slot_id = '0;
-            end else begin
-                next_slot_id = slot_id_t'(
-                    current_id + RETURN_SLOT_W'(1));
-            end
-        end
-    endfunction
-
-    // Explicit case selection keeps the calendar lookup as a fixed 8:1 mux
-    // instead of a procedural variable array access in the D2A cone.
-    function automatic logic calendar_slot_valid(
-        input logic [RETURN_SLOT_NUM-1:0] slot_valid,
-        input slot_id_t                   slot_id
+    function automatic logic [FE_NUM-1:0] first_fe_onehot(
+        input logic [FE_NUM-1:0] available,
+        input fe_id_t           base
     );
         begin
-            case (slot_id)
-                3'd0: calendar_slot_valid = slot_valid[0];
-                3'd1: calendar_slot_valid = slot_valid[1];
-                3'd2: calendar_slot_valid = slot_valid[2];
-                3'd3: calendar_slot_valid = slot_valid[3];
-                3'd4: calendar_slot_valid = slot_valid[4];
-                3'd5: calendar_slot_valid = slot_valid[5];
-                3'd6: calendar_slot_valid = slot_valid[6];
-                3'd7: calendar_slot_valid = slot_valid[7];
-                default: calendar_slot_valid = 1'b1;
+            first_fe_onehot = '0;
+            unique case (base)
+                2'd0: begin
+                    if      (available[0]) first_fe_onehot[0] = 1'b1;
+                    else if (available[1]) first_fe_onehot[1] = 1'b1;
+                    else if (available[2]) first_fe_onehot[2] = 1'b1;
+                    else if (available[3]) first_fe_onehot[3] = 1'b1;
+                end
+                2'd1: begin
+                    if      (available[1]) first_fe_onehot[1] = 1'b1;
+                    else if (available[2]) first_fe_onehot[2] = 1'b1;
+                    else if (available[3]) first_fe_onehot[3] = 1'b1;
+                    else if (available[0]) first_fe_onehot[0] = 1'b1;
+                end
+                2'd2: begin
+                    if      (available[2]) first_fe_onehot[2] = 1'b1;
+                    else if (available[3]) first_fe_onehot[3] = 1'b1;
+                    else if (available[0]) first_fe_onehot[0] = 1'b1;
+                    else if (available[1]) first_fe_onehot[1] = 1'b1;
+                end
+                default: begin
+                    if      (available[3]) first_fe_onehot[3] = 1'b1;
+                    else if (available[0]) first_fe_onehot[0] = 1'b1;
+                    else if (available[1]) first_fe_onehot[1] = 1'b1;
+                    else if (available[2]) first_fe_onehot[2] = 1'b1;
+                end
             endcase
         end
     endfunction
 
-    function automatic logic candidate_valid_at_rank(
-        input logic [FE_NUM-1:0] candidates,
-        input logic [GRANT_COUNT_W-1:0] rank
+    function automatic logic [15:0] compact_onehot4(
+        input logic [3:0] valid
     );
         begin
-            case (rank)
-                3'd0: candidate_valid_at_rank = candidates[0];
-                3'd1: candidate_valid_at_rank = candidates[1];
-                3'd2: candidate_valid_at_rank = candidates[2];
-                3'd3: candidate_valid_at_rank = candidates[3];
-                default: candidate_valid_at_rank = 1'b0;
+            unique case (valid)
+                4'h0: compact_onehot4 = {4'h0, 4'h0, 4'h0, 4'h0};
+                4'h1: compact_onehot4 = {4'h0, 4'h0, 4'h0, 4'h1};
+                4'h2: compact_onehot4 = {4'h0, 4'h0, 4'h0, 4'h2};
+                4'h3: compact_onehot4 = {4'h0, 4'h0, 4'h2, 4'h1};
+                4'h4: compact_onehot4 = {4'h0, 4'h0, 4'h0, 4'h4};
+                4'h5: compact_onehot4 = {4'h0, 4'h0, 4'h4, 4'h1};
+                4'h6: compact_onehot4 = {4'h0, 4'h0, 4'h4, 4'h2};
+                4'h7: compact_onehot4 = {4'h0, 4'h4, 4'h2, 4'h1};
+                4'h8: compact_onehot4 = {4'h0, 4'h0, 4'h0, 4'h8};
+                4'h9: compact_onehot4 = {4'h0, 4'h0, 4'h8, 4'h1};
+                4'ha: compact_onehot4 = {4'h0, 4'h0, 4'h8, 4'h2};
+                4'hb: compact_onehot4 = {4'h0, 4'h8, 4'h2, 4'h1};
+                4'hc: compact_onehot4 = {4'h0, 4'h0, 4'h8, 4'h4};
+                4'hd: compact_onehot4 = {4'h0, 4'h8, 4'h4, 4'h1};
+                4'he: compact_onehot4 = {4'h0, 4'h8, 4'h4, 4'h2};
+                default:
+                    compact_onehot4 = {4'h8, 4'h4, 4'h2, 4'h1};
             endcase
         end
     endfunction
 
-    function automatic seq_tag_t candidate_tag_at_rank(
-        input logic [FE_NUM-1:0][SEQ_W-1:0] candidates,
-        input logic [GRANT_COUNT_W-1:0]     rank
+    function automatic logic target_is_free(
+        input fe_id_t fe,
+        input delay_t delay
     );
+        logic pending_conflict;
         begin
-            case (rank)
-                3'd0: candidate_tag_at_rank = candidates[0];
-                3'd1: candidate_tag_at_rank = candidates[1];
-                3'd2: candidate_tag_at_rank = candidates[2];
-                3'd3: candidate_tag_at_rank = candidates[3];
-                default: candidate_tag_at_rank = '0;
+            pending_conflict = 1'b0;
+            unique case (delay)
+                delay_t'(0): begin
+                    pending_conflict = grant_valid_q[fe]
+                        && (grant_delay_q[fe] == delay_t'(1));
+                    target_is_free = !future_valid_q[fe][3]
+                        && !pending_conflict;
+                end
+                delay_t'(1): begin
+                    pending_conflict = grant_valid_q[fe]
+                        && (grant_delay_q[fe] == delay_t'(2));
+                    target_is_free = !future_valid_q[fe][4]
+                        && !pending_conflict;
+                end
+                delay_t'(2): begin
+                    pending_conflict = grant_valid_q[fe]
+                        && (grant_delay_q[fe] == delay_t'(3));
+                    target_is_free = !future_valid_q[fe][5]
+                        && !pending_conflict;
+                end
+                default: target_is_free = 1'b1;
             endcase
         end
     endfunction
 
     //--------------------------------------------------------------------------
-    // Return-calendar, schedule-phase, and fairness state
+    // D2A0: two-bank compacting 8-to-4 shortlist
     //--------------------------------------------------------------------------
 
-    logic [FE_NUM-1:0][RETURN_SLOT_NUM-1:0] return_slot_valid_q;
-    logic [FE_NUM-1:0][RETURN_SLOT_NUM-1:0][SEQ_W-1:0]
-          return_slot_seq_tag_q;
+    always_comb begin : d2a0_shortlist
+        logic [CAND_WINDOW_DEPTH-1:0] pending_mask;
+        logic [CAND_WINDOW_DEPTH-1:0] candidate_available;
+        logic [1:0][3:0][3:0]        bank_local_onehot;
+        logic [1:0][3:0]             bank_valid;
+        cand_id_t [1:0][3:0]           bank_candidate_id;
+        logic [1:0][3:0][SEQ_W-1:0]  bank_seq_tag;
+        logic [1:0][3:0][DELAY_W-1:0]
+                                            bank_delay;
+        logic [3:0]                   primary_valid;
+        cand_id_t [3:0]                primary_candidate_id;
+        logic [3:0][SEQ_W-1:0]        primary_seq_tag;
+        logic [3:0][DELAY_W-1:0]      primary_delay;
+        logic [3:0]                   secondary_valid;
+        cand_id_t [3:0]                secondary_candidate_id;
+        logic [3:0][SEQ_W-1:0]        secondary_seq_tag;
+        logic [3:0][DELAY_W-1:0]      secondary_delay;
 
-    slot_id_t  schedule_phase_q;
-    class_id_t class_rr_ptr_q;
-    fe_id_t    fe_rr_ptr_q;
+        pending_mask                  = '0;
+        candidate_available           = '0;
+        bank_local_onehot              = '0;
+        bank_valid                     = '0;
+        bank_candidate_id              = '0;
+        bank_seq_tag                   = '0;
+        bank_delay                     = '0;
+        primary_valid                  = '0;
+        primary_candidate_id           = '0;
+        primary_seq_tag                = '0;
+        primary_delay                  = '0;
+        secondary_valid                = '0;
+        secondary_candidate_id         = '0;
+        secondary_seq_tag              = '0;
+        secondary_delay                = '0;
+        shortlist_valid               = '0;
+        shortlist_candidate_id        = '0;
+        shortlist_seq_tag             = '0;
+        shortlist_delay               = '0;
 
-    logic [DELAY_CLASS_NUM-1:0][FE_NUM-1:0] fe_legal;
-    logic [DELAY_CLASS_NUM-1:0][RETURN_SLOT_W-1:0]
-          target_slot_by_class;
-    logic [DELAY_CLASS_NUM-1:0][GRANT_COUNT_W-1:0]
-          pending_count_by_class;
+        for (int fe = 0; fe < FE_NUM; fe++) begin
+            if (grant_valid_q[fe]) begin
+                pending_mask[grant_candidate_id_q[fe]] = 1'b1;
+            end
+        end
 
-    logic [DELAY_CLASS_NUM-1:0][FE_NUM-1:0]
-          visible_candidate_valid;
-    logic [DELAY_CLASS_NUM-1:0][FE_NUM-1:0][SEQ_W-1:0]
-          visible_candidate_seq_tag;
-    logic [DELAY_CLASS_NUM-1:0][FE_NUM-1:0]
-          normalized_candidate_valid;
-    logic [DELAY_CLASS_NUM-1:0][FE_NUM-1:0][SEQ_W-1:0]
-          normalized_candidate_seq_tag;
-    logic [DELAY_CLASS_NUM-1:0][FE_NUM-1:0]
-          class_rotated_fe_legal;
-    logic [DELAY_CLASS_NUM-1:0][FE_NUM-1:0]
-          normalized_fe_legal;
-    class_id_t normalized_physical_class [DELAY_CLASS_NUM-1:0];
-    slot_id_t  normalized_target_slot [DELAY_CLASS_NUM-1:0];
+        candidate_available = candidate_valid_i & ~pending_mask;
+        bank_local_onehot[0] = compact_onehot4(candidate_available[3:0]);
+        bank_local_onehot[1] = compact_onehot4(candidate_available[7:4]);
 
-    logic [FE_NUM-1:0][DELAY_CLASS_NUM-1:0] normalized_request;
-    logic [FE_NUM-1:0][DELAY_CLASS_NUM-1:0] normalized_nomination;
-    logic [FE_NUM-1:0][DELAY_CLASS_NUM-1:0] normalized_accept;
-    logic [FE_NUM-1:0][DELAY_CLASS_NUM-1:0][GRANT_COUNT_W-1:0]
-          nomination_rank;
-    logic [FE_NUM-1:0][DELAY_CLASS_NUM-1:0][SEQ_W-1:0]
-          nominated_seq_tag;
-
-    logic [FE_NUM-1:0]                    normalized_grant_valid;
-    logic [FE_NUM-1:0][SEQ_W-1:0]         normalized_grant_seq_tag;
-    logic [FE_NUM-1:0][CLASS_ID_W-1:0]    normalized_grant_class;
-    logic [FE_NUM-1:0][RETURN_SLOT_W-1:0] normalized_grant_target_slot;
-
-    logic [FE_NUM-1:0]                    grant_valid_q;
-    logic [FE_NUM-1:0][SEQ_W-1:0]         grant_seq_tag_q;
-    logic [FE_NUM-1:0][CLASS_ID_W-1:0]    grant_class_q;
-    logic [FE_NUM-1:0][RETURN_SLOT_W-1:0] grant_target_slot_q;
-
-    logic [FE_NUM-1:0]                    grant_valid_d;
-    logic [FE_NUM-1:0][SEQ_W-1:0]         grant_seq_tag_d;
-    logic [FE_NUM-1:0][CLASS_ID_W-1:0]    grant_class_d;
-    logic [FE_NUM-1:0][RETURN_SLOT_W-1:0] grant_target_slot_d;
-    logic                                 grant_any_d;
-    class_id_t                            class_rr_next_d;
-    fe_id_t                               fe_rr_next_d;
-
-    // D2B presents only registered D2A decisions to the Issue Table.
-    always_comb begin : d2b_select_output
-        select_valid_o   = grant_valid_q;
-        select_seq_tag_o = grant_seq_tag_q;
-    end
-
-    always_comb begin : return_slot_legality
-        slot_id_t predicted_commit_phase;
-
-        target_slot_by_class = '0;
-        pending_count_by_class = '0;
-        predicted_commit_phase = next_slot_id(schedule_phase_q);
-
-        target_slot_by_class[0] = slot_id_t'(predicted_commit_phase + 3'd2);
-        target_slot_by_class[1] = slot_id_t'(predicted_commit_phase + 3'd3);
-        target_slot_by_class[2] = slot_id_t'(predicted_commit_phase + 3'd4);
-        target_slot_by_class[3] = slot_id_t'(predicted_commit_phase + 3'd5);
-
-        pending_count_by_class[0] =
-            GRANT_COUNT_W'(grant_valid_q[0] && (grant_class_q[0] == 2'd0))
-            + GRANT_COUNT_W'(grant_valid_q[1] && (grant_class_q[1] == 2'd0))
-            + GRANT_COUNT_W'(grant_valid_q[2] && (grant_class_q[2] == 2'd0))
-            + GRANT_COUNT_W'(grant_valid_q[3] && (grant_class_q[3] == 2'd0));
-        pending_count_by_class[1] =
-            GRANT_COUNT_W'(grant_valid_q[0] && (grant_class_q[0] == 2'd1))
-            + GRANT_COUNT_W'(grant_valid_q[1] && (grant_class_q[1] == 2'd1))
-            + GRANT_COUNT_W'(grant_valid_q[2] && (grant_class_q[2] == 2'd1))
-            + GRANT_COUNT_W'(grant_valid_q[3] && (grant_class_q[3] == 2'd1));
-        pending_count_by_class[2] =
-            GRANT_COUNT_W'(grant_valid_q[0] && (grant_class_q[0] == 2'd2))
-            + GRANT_COUNT_W'(grant_valid_q[1] && (grant_class_q[1] == 2'd2))
-            + GRANT_COUNT_W'(grant_valid_q[2] && (grant_class_q[2] == 2'd2))
-            + GRANT_COUNT_W'(grant_valid_q[3] && (grant_class_q[3] == 2'd2));
-        pending_count_by_class[3] =
-            GRANT_COUNT_W'(grant_valid_q[0] && (grant_class_q[0] == 2'd3))
-            + GRANT_COUNT_W'(grant_valid_q[1] && (grant_class_q[1] == 2'd3))
-            + GRANT_COUNT_W'(grant_valid_q[2] && (grant_class_q[2] == 2'd3))
-            + GRANT_COUNT_W'(grant_valid_q[3] && (grant_class_q[3] == 2'd3));
-
-    end
-
-    // Each generated bit has constant class and FE indices. A compare against
-    // the pending slot replaces the previous variable-index bitmap write.
-    generate
-        for (genvar legal_class = 0;
-             legal_class < DELAY_CLASS_NUM;
-             legal_class++) begin : class_legality
-            for (genvar legal_fe = 0;
-                 legal_fe < FE_NUM;
-                 legal_fe++) begin : fe_legality
-                always_comb begin
-                    fe_legal[legal_class][legal_fe] =
-                        !calendar_slot_valid(
-                            return_slot_valid_q[legal_fe],
-                            target_slot_by_class[legal_class])
-                        && !(grant_valid_q[legal_fe]
-                             && (grant_target_slot_q[legal_fe]
-                                 == target_slot_by_class[legal_class]));
+        for (int bank = 0; bank < 2; bank++) begin
+            for (int lane = 0; lane < 4; lane++) begin
+                bank_valid[bank][lane] =
+                    |bank_local_onehot[bank][lane];
+                for (int slot = 0; slot < 4; slot++) begin
+                    if (bank_local_onehot[bank][lane][slot]) begin
+                        bank_candidate_id[bank][lane] =
+                            cand_id_t'(bank*4 + slot);
+                    end
+                    bank_seq_tag[bank][lane] |=
+                        candidate_seq_tag_i[bank*4 + slot]
+                        & {SEQ_W{bank_local_onehot[bank][lane][slot]}};
+                    bank_delay[bank][lane] |=
+                        candidate_delay_i[bank*4 + slot]
+                        & {DELAY_W{bank_local_onehot[bank][lane][slot]}};
                 end
             end
         end
-    endgenerate
 
-    //--------------------------------------------------------------------------
-    // Candidate legality and multi-grant matching
-    //--------------------------------------------------------------------------
+        if (!candidate_bank_rr_ptr_q) begin
+            primary_valid            = bank_valid[0];
+            primary_candidate_id     = bank_candidate_id[0];
+            primary_seq_tag          = bank_seq_tag[0];
+            primary_delay            = bank_delay[0];
+            secondary_valid            = bank_valid[1];
+            secondary_candidate_id     = bank_candidate_id[1];
+            secondary_seq_tag          = bank_seq_tag[1];
+            secondary_delay            = bank_delay[1];
+        end else begin
+            primary_valid            = bank_valid[1];
+            primary_candidate_id     = bank_candidate_id[1];
+            primary_seq_tag          = bank_seq_tag[1];
+            primary_delay            = bank_delay[1];
+            secondary_valid            = bank_valid[0];
+            secondary_candidate_id     = bank_candidate_id[0];
+            secondary_seq_tag          = bank_seq_tag[0];
+            secondary_delay            = bank_delay[0];
+        end
 
-    // Explicit five-way shifts remove the pending-prefix variable index from
-    // candidate selection. Only four candidates beyond the prefix can be used.
-    always_comb begin : pending_prefix_shift
-        visible_candidate_valid   = '0;
-        visible_candidate_seq_tag = '0;
-
-        case (pending_count_by_class[0])
-            3'd0: begin visible_candidate_valid[0] = candidate_valid_i[0][3:0]; visible_candidate_seq_tag[0] = candidate_seq_tag_i[0][3:0]; end
-            3'd1: begin visible_candidate_valid[0] = candidate_valid_i[0][4:1]; visible_candidate_seq_tag[0] = candidate_seq_tag_i[0][4:1]; end
-            3'd2: begin visible_candidate_valid[0] = candidate_valid_i[0][5:2]; visible_candidate_seq_tag[0] = candidate_seq_tag_i[0][5:2]; end
-            3'd3: begin visible_candidate_valid[0] = candidate_valid_i[0][6:3]; visible_candidate_seq_tag[0] = candidate_seq_tag_i[0][6:3]; end
-            3'd4: begin visible_candidate_valid[0] = candidate_valid_i[0][7:4]; visible_candidate_seq_tag[0] = candidate_seq_tag_i[0][7:4]; end
-            default: begin visible_candidate_valid[0] = '0; visible_candidate_seq_tag[0] = '0; end
-        endcase
-        case (pending_count_by_class[1])
-            3'd0: begin visible_candidate_valid[1] = candidate_valid_i[1][3:0]; visible_candidate_seq_tag[1] = candidate_seq_tag_i[1][3:0]; end
-            3'd1: begin visible_candidate_valid[1] = candidate_valid_i[1][4:1]; visible_candidate_seq_tag[1] = candidate_seq_tag_i[1][4:1]; end
-            3'd2: begin visible_candidate_valid[1] = candidate_valid_i[1][5:2]; visible_candidate_seq_tag[1] = candidate_seq_tag_i[1][5:2]; end
-            3'd3: begin visible_candidate_valid[1] = candidate_valid_i[1][6:3]; visible_candidate_seq_tag[1] = candidate_seq_tag_i[1][6:3]; end
-            3'd4: begin visible_candidate_valid[1] = candidate_valid_i[1][7:4]; visible_candidate_seq_tag[1] = candidate_seq_tag_i[1][7:4]; end
-            default: begin visible_candidate_valid[1] = '0; visible_candidate_seq_tag[1] = '0; end
-        endcase
-        case (pending_count_by_class[2])
-            3'd0: begin visible_candidate_valid[2] = candidate_valid_i[2][3:0]; visible_candidate_seq_tag[2] = candidate_seq_tag_i[2][3:0]; end
-            3'd1: begin visible_candidate_valid[2] = candidate_valid_i[2][4:1]; visible_candidate_seq_tag[2] = candidate_seq_tag_i[2][4:1]; end
-            3'd2: begin visible_candidate_valid[2] = candidate_valid_i[2][5:2]; visible_candidate_seq_tag[2] = candidate_seq_tag_i[2][5:2]; end
-            3'd3: begin visible_candidate_valid[2] = candidate_valid_i[2][6:3]; visible_candidate_seq_tag[2] = candidate_seq_tag_i[2][6:3]; end
-            3'd4: begin visible_candidate_valid[2] = candidate_valid_i[2][7:4]; visible_candidate_seq_tag[2] = candidate_seq_tag_i[2][7:4]; end
-            default: begin visible_candidate_valid[2] = '0; visible_candidate_seq_tag[2] = '0; end
-        endcase
-        case (pending_count_by_class[3])
-            3'd0: begin visible_candidate_valid[3] = candidate_valid_i[3][3:0]; visible_candidate_seq_tag[3] = candidate_seq_tag_i[3][3:0]; end
-            3'd1: begin visible_candidate_valid[3] = candidate_valid_i[3][4:1]; visible_candidate_seq_tag[3] = candidate_seq_tag_i[3][4:1]; end
-            3'd2: begin visible_candidate_valid[3] = candidate_valid_i[3][5:2]; visible_candidate_seq_tag[3] = candidate_seq_tag_i[3][5:2]; end
-            3'd3: begin visible_candidate_valid[3] = candidate_valid_i[3][6:3]; visible_candidate_seq_tag[3] = candidate_seq_tag_i[3][6:3]; end
-            3'd4: begin visible_candidate_valid[3] = candidate_valid_i[3][7:4]; visible_candidate_seq_tag[3] = candidate_seq_tag_i[3][7:4]; end
-            default: begin visible_candidate_valid[3] = '0; visible_candidate_seq_tag[3] = '0; end
-        endcase
-    end
-
-    // Rotate class and FE dimensions at the network boundary. The core below
-    // therefore contains only constant-index wiring and fixed priority gates.
-    always_comb begin : rr_normalization
-        normalized_candidate_valid   = '0;
-        normalized_candidate_seq_tag = '0;
-        class_rotated_fe_legal        = '0;
-        normalized_fe_legal           = '0;
-
-        case (class_rr_ptr_q)
-            2'd0: begin
-                normalized_candidate_valid = visible_candidate_valid;
-                normalized_candidate_seq_tag = visible_candidate_seq_tag;
-                class_rotated_fe_legal = fe_legal;
-                normalized_physical_class[0] = 2'd0; normalized_physical_class[1] = 2'd1; normalized_physical_class[2] = 2'd2; normalized_physical_class[3] = 2'd3;
-                normalized_target_slot[0] = target_slot_by_class[0]; normalized_target_slot[1] = target_slot_by_class[1]; normalized_target_slot[2] = target_slot_by_class[2]; normalized_target_slot[3] = target_slot_by_class[3];
+        // Each compacted bank is a dense valid prefix. Decode that prefix
+        // directly instead of rebuilding its length with an adder tree.
+        unique case (primary_valid)
+            4'b0000: begin
+                shortlist_valid            = secondary_valid;
+                shortlist_candidate_id     = secondary_candidate_id;
+                shortlist_seq_tag          = secondary_seq_tag;
+                shortlist_delay            = secondary_delay;
             end
-            2'd1: begin
-                normalized_candidate_valid[0] = visible_candidate_valid[1]; normalized_candidate_valid[1] = visible_candidate_valid[2]; normalized_candidate_valid[2] = visible_candidate_valid[3]; normalized_candidate_valid[3] = visible_candidate_valid[0];
-                normalized_candidate_seq_tag[0] = visible_candidate_seq_tag[1]; normalized_candidate_seq_tag[1] = visible_candidate_seq_tag[2]; normalized_candidate_seq_tag[2] = visible_candidate_seq_tag[3]; normalized_candidate_seq_tag[3] = visible_candidate_seq_tag[0];
-                class_rotated_fe_legal[0] = fe_legal[1]; class_rotated_fe_legal[1] = fe_legal[2]; class_rotated_fe_legal[2] = fe_legal[3]; class_rotated_fe_legal[3] = fe_legal[0];
-                normalized_physical_class[0] = 2'd1; normalized_physical_class[1] = 2'd2; normalized_physical_class[2] = 2'd3; normalized_physical_class[3] = 2'd0;
-                normalized_target_slot[0] = target_slot_by_class[1]; normalized_target_slot[1] = target_slot_by_class[2]; normalized_target_slot[2] = target_slot_by_class[3]; normalized_target_slot[3] = target_slot_by_class[0];
+            4'b0001: begin
+                shortlist_valid[0]            = primary_valid[0];
+                shortlist_candidate_id[0] = primary_candidate_id[0];
+                shortlist_seq_tag[0]          = primary_seq_tag[0];
+                shortlist_delay[0]            = primary_delay[0];
+                for (int lane = 1; lane < 4; lane++) begin
+                    shortlist_valid[lane] = secondary_valid[lane-1];
+                    shortlist_candidate_id[lane] =
+                        secondary_candidate_id[lane-1];
+                    shortlist_seq_tag[lane] = secondary_seq_tag[lane-1];
+                    shortlist_delay[lane] = secondary_delay[lane-1];
+                end
             end
-            2'd2: begin
-                normalized_candidate_valid[0] = visible_candidate_valid[2]; normalized_candidate_valid[1] = visible_candidate_valid[3]; normalized_candidate_valid[2] = visible_candidate_valid[0]; normalized_candidate_valid[3] = visible_candidate_valid[1];
-                normalized_candidate_seq_tag[0] = visible_candidate_seq_tag[2]; normalized_candidate_seq_tag[1] = visible_candidate_seq_tag[3]; normalized_candidate_seq_tag[2] = visible_candidate_seq_tag[0]; normalized_candidate_seq_tag[3] = visible_candidate_seq_tag[1];
-                class_rotated_fe_legal[0] = fe_legal[2]; class_rotated_fe_legal[1] = fe_legal[3]; class_rotated_fe_legal[2] = fe_legal[0]; class_rotated_fe_legal[3] = fe_legal[1];
-                normalized_physical_class[0] = 2'd2; normalized_physical_class[1] = 2'd3; normalized_physical_class[2] = 2'd0; normalized_physical_class[3] = 2'd1;
-                normalized_target_slot[0] = target_slot_by_class[2]; normalized_target_slot[1] = target_slot_by_class[3]; normalized_target_slot[2] = target_slot_by_class[0]; normalized_target_slot[3] = target_slot_by_class[1];
+            4'b0011: begin
+                for (int lane = 0; lane < 2; lane++) begin
+                    shortlist_valid[lane] = primary_valid[lane];
+                    shortlist_candidate_id[lane] =
+                        primary_candidate_id[lane];
+                    shortlist_seq_tag[lane] = primary_seq_tag[lane];
+                    shortlist_delay[lane] = primary_delay[lane];
+                    shortlist_valid[lane+2] = secondary_valid[lane];
+                    shortlist_candidate_id[lane+2] =
+                        secondary_candidate_id[lane];
+                    shortlist_seq_tag[lane+2] = secondary_seq_tag[lane];
+                    shortlist_delay[lane+2] = secondary_delay[lane];
+                end
+            end
+            4'b0111: begin
+                for (int lane = 0; lane < 3; lane++) begin
+                    shortlist_valid[lane] = primary_valid[lane];
+                    shortlist_candidate_id[lane] =
+                        primary_candidate_id[lane];
+                    shortlist_seq_tag[lane] = primary_seq_tag[lane];
+                    shortlist_delay[lane] = primary_delay[lane];
+                end
+                shortlist_valid[3] = secondary_valid[0];
+                shortlist_candidate_id[3] = secondary_candidate_id[0];
+                shortlist_seq_tag[3] = secondary_seq_tag[0];
+                shortlist_delay[3] = secondary_delay[0];
+            end
+            4'b1111: begin
+                shortlist_valid            = primary_valid;
+                shortlist_candidate_id     = primary_candidate_id;
+                shortlist_seq_tag          = primary_seq_tag;
+                shortlist_delay            = primary_delay;
             end
             default: begin
-                normalized_candidate_valid[0] = visible_candidate_valid[3]; normalized_candidate_valid[1] = visible_candidate_valid[0]; normalized_candidate_valid[2] = visible_candidate_valid[1]; normalized_candidate_valid[3] = visible_candidate_valid[2];
-                normalized_candidate_seq_tag[0] = visible_candidate_seq_tag[3]; normalized_candidate_seq_tag[1] = visible_candidate_seq_tag[0]; normalized_candidate_seq_tag[2] = visible_candidate_seq_tag[1]; normalized_candidate_seq_tag[3] = visible_candidate_seq_tag[2];
-                class_rotated_fe_legal[0] = fe_legal[3]; class_rotated_fe_legal[1] = fe_legal[0]; class_rotated_fe_legal[2] = fe_legal[1]; class_rotated_fe_legal[3] = fe_legal[2];
-                normalized_physical_class[0] = 2'd3; normalized_physical_class[1] = 2'd0; normalized_physical_class[2] = 2'd1; normalized_physical_class[3] = 2'd2;
-                normalized_target_slot[0] = target_slot_by_class[3]; normalized_target_slot[1] = target_slot_by_class[0]; normalized_target_slot[2] = target_slot_by_class[1]; normalized_target_slot[3] = target_slot_by_class[2];
-            end
-        endcase
-
-        case (fe_rr_ptr_q)
-            2'd0: normalized_fe_legal = class_rotated_fe_legal;
-            2'd1: begin
-                normalized_fe_legal[0] = {class_rotated_fe_legal[0][0], class_rotated_fe_legal[0][3:1]};
-                normalized_fe_legal[1] = {class_rotated_fe_legal[1][0], class_rotated_fe_legal[1][3:1]};
-                normalized_fe_legal[2] = {class_rotated_fe_legal[2][0], class_rotated_fe_legal[2][3:1]};
-                normalized_fe_legal[3] = {class_rotated_fe_legal[3][0], class_rotated_fe_legal[3][3:1]};
-            end
-            2'd2: begin
-                normalized_fe_legal[0] = {class_rotated_fe_legal[0][1:0], class_rotated_fe_legal[0][3:2]};
-                normalized_fe_legal[1] = {class_rotated_fe_legal[1][1:0], class_rotated_fe_legal[1][3:2]};
-                normalized_fe_legal[2] = {class_rotated_fe_legal[2][1:0], class_rotated_fe_legal[2][3:2]};
-                normalized_fe_legal[3] = {class_rotated_fe_legal[3][1:0], class_rotated_fe_legal[3][3:2]};
-            end
-            default: begin
-                normalized_fe_legal[0] = {class_rotated_fe_legal[0][2:0], class_rotated_fe_legal[0][3]};
-                normalized_fe_legal[1] = {class_rotated_fe_legal[1][2:0], class_rotated_fe_legal[1][3]};
-                normalized_fe_legal[2] = {class_rotated_fe_legal[2][2:0], class_rotated_fe_legal[2][3]};
-                normalized_fe_legal[3] = {class_rotated_fe_legal[3][2:0], class_rotated_fe_legal[3][3]};
+                shortlist_valid            = '0;
+                shortlist_candidate_id     = '0;
+                shortlist_seq_tag          = '0;
+                shortlist_delay            = '0;
             end
         endcase
     end
 
-    always_comb begin : fixed_request_nomination
-        normalized_nomination = '0;
+    //--------------------------------------------------------------------------
+    // D2A1: fixed 4x4 single-round match
+    //--------------------------------------------------------------------------
 
-        normalized_nomination[0][0] = normalized_request[0][0];
-        normalized_nomination[0][1] = !normalized_request[0][0] && normalized_request[0][1];
-        normalized_nomination[0][2] = !(|normalized_request[0][1:0]) && normalized_request[0][2];
-        normalized_nomination[0][3] = !(|normalized_request[0][2:0]) && normalized_request[0][3];
+    always_comb begin : d2a1_match
+        logic [SHORTLIST_DEPTH-1:0][FE_NUM-1:0] legal;
+        logic [SHORTLIST_DEPTH-1:0][FE_NUM-1:0] request_round0;
+        logic [SHORTLIST_DEPTH-1:0][FE_NUM-1:0] accept_round0;
+        logic [SHORTLIST_DEPTH-1:0][FE_NUM-1:0] accepted;
+        fe_id_t                                 preference_base;
 
-        normalized_nomination[1][1] = normalized_request[1][1];
-        normalized_nomination[1][2] = !normalized_request[1][1] && normalized_request[1][2];
-        normalized_nomination[1][3] = !(|normalized_request[1][2:1]) && normalized_request[1][3];
-        normalized_nomination[1][0] = !(|normalized_request[1][3:1]) && normalized_request[1][0];
+        legal            = '0;
+        request_round0   = '0;
+        accept_round0    = '0;
+        accepted         = '0;
+        grant_valid_d    = '0;
+        grant_seq_tag_d  = '0;
+        grant_candidate_id_d = '0;
+        grant_delay_d    = '0;
+        fe_rr_ptr_d      = fe_rr_ptr_q;
+        candidate_bank_rr_ptr_d = ~candidate_bank_rr_ptr_q;
+        preference_base  = '0;
 
-        normalized_nomination[2][2] = normalized_request[2][2];
-        normalized_nomination[2][3] = !normalized_request[2][2] && normalized_request[2][3];
-        normalized_nomination[2][0] = !(normalized_request[2][2] || normalized_request[2][3]) && normalized_request[2][0];
-        normalized_nomination[2][1] = !(normalized_request[2][2] || normalized_request[2][3] || normalized_request[2][0]) && normalized_request[2][1];
+        for (int candidate = 0;
+             candidate < SHORTLIST_DEPTH;
+             candidate++) begin
+            for (int fe = 0; fe < FE_NUM; fe++) begin
+                legal[candidate][fe] = shortlist_valid[candidate]
+                    && target_is_free(fe_id_t'(fe),
+                                      shortlist_delay[candidate]);
+            end
+            preference_base = add_fe_offset(
+                fe_rr_ptr_q, fe_id_t'(candidate));
+            request_round0[candidate] =
+                first_fe_onehot(legal[candidate], preference_base);
+        end
 
-        normalized_nomination[3][3] = normalized_request[3][3];
-        normalized_nomination[3][0] = !normalized_request[3][3] && normalized_request[3][0];
-        normalized_nomination[3][1] = !(normalized_request[3][3] || normalized_request[3][0]) && normalized_request[3][1];
-        normalized_nomination[3][2] = !(normalized_request[3][3] || normalized_request[3][0] || normalized_request[3][1]) && normalized_request[3][2];
-    end
-
-    generate
-        for (genvar request_fe = 0;
-             request_fe < FE_NUM;
-             request_fe++) begin : fe_request
-            for (genvar request_class = 0;
-                 request_class < DELAY_CLASS_NUM;
-                 request_class++) begin : class_request
-                always_comb begin
-                    normalized_request[request_fe][request_class] =
-                        normalized_candidate_valid[request_class][0]
-                        && normalized_fe_legal[request_class][request_fe];
+        for (int candidate = 0;
+             candidate < SHORTLIST_DEPTH;
+             candidate++) begin
+            for (int fe = 0; fe < FE_NUM; fe++) begin
+                accept_round0[candidate][fe] =
+                    request_round0[candidate][fe];
+                for (int prior = 0;
+                     prior < SHORTLIST_DEPTH;
+                     prior++) begin
+                    if (prior < candidate) begin
+                        accept_round0[candidate][fe] &=
+                            !request_round0[prior][fe];
+                    end
                 end
             end
         end
-    endgenerate
 
-    generate
-        for (genvar class_gen = 0; class_gen < DELAY_CLASS_NUM; class_gen++) begin : class_rank_network
-            always_comb begin
-                nomination_rank[0][class_gen] = '0;
-                nomination_rank[1][class_gen] = GRANT_COUNT_W'(normalized_nomination[0][class_gen]);
-                nomination_rank[2][class_gen] = GRANT_COUNT_W'(normalized_nomination[0][class_gen]) + GRANT_COUNT_W'(normalized_nomination[1][class_gen]);
-                nomination_rank[3][class_gen] = GRANT_COUNT_W'(normalized_nomination[0][class_gen]) + GRANT_COUNT_W'(normalized_nomination[1][class_gen]) + GRANT_COUNT_W'(normalized_nomination[2][class_gen]);
-
-                normalized_accept[0][class_gen] =
-                    normalized_nomination[0][class_gen]
-                    && candidate_valid_at_rank(
-                        normalized_candidate_valid[class_gen],
-                        nomination_rank[0][class_gen]);
-                normalized_accept[1][class_gen] =
-                    normalized_nomination[1][class_gen]
-                    && candidate_valid_at_rank(
-                        normalized_candidate_valid[class_gen],
-                        nomination_rank[1][class_gen]);
-                normalized_accept[2][class_gen] =
-                    normalized_nomination[2][class_gen]
-                    && candidate_valid_at_rank(
-                        normalized_candidate_valid[class_gen],
-                        nomination_rank[2][class_gen]);
-                normalized_accept[3][class_gen] =
-                    normalized_nomination[3][class_gen]
-                    && candidate_valid_at_rank(
-                        normalized_candidate_valid[class_gen],
-                        nomination_rank[3][class_gen]);
-
-                nominated_seq_tag[0][class_gen] =
-                    candidate_tag_at_rank(
-                        normalized_candidate_seq_tag[class_gen],
-                        nomination_rank[0][class_gen]);
-                nominated_seq_tag[1][class_gen] =
-                    candidate_tag_at_rank(
-                        normalized_candidate_seq_tag[class_gen],
-                        nomination_rank[1][class_gen]);
-                nominated_seq_tag[2][class_gen] =
-                    candidate_tag_at_rank(
-                        normalized_candidate_seq_tag[class_gen],
-                        nomination_rank[2][class_gen]);
-                nominated_seq_tag[3][class_gen] =
-                    candidate_tag_at_rank(
-                        normalized_candidate_seq_tag[class_gen],
-                        nomination_rank[3][class_gen]);
+        accepted = accept_round0;
+        for (int fe = 0; fe < FE_NUM; fe++) begin
+            for (int candidate = 0;
+                 candidate < SHORTLIST_DEPTH;
+                 candidate++) begin
+                grant_valid_d[fe] |= accepted[candidate][fe];
+                grant_seq_tag_d[fe] |=
+                    shortlist_seq_tag[candidate]
+                    & {SEQ_W{accepted[candidate][fe]}};
+                grant_candidate_id_d[fe] |=
+                    shortlist_candidate_id[candidate]
+                    & {CAND_ID_W{accepted[candidate][fe]}};
+                grant_delay_d[fe] |=
+                    shortlist_delay[candidate]
+                    & {DELAY_W{accepted[candidate][fe]}};
             end
         end
-    endgenerate
 
-    generate
-        for (genvar fe_gen = 0; fe_gen < FE_NUM; fe_gen++) begin : normalized_grant_encode
-            always_comb begin
-                normalized_grant_valid[fe_gen]       = 1'b0;
-                normalized_grant_seq_tag[fe_gen]     = '0;
-                normalized_grant_class[fe_gen]       = '0;
-                normalized_grant_target_slot[fe_gen] = '0;
-
-                case (1'b1)
-                    normalized_accept[fe_gen][0]: begin
-                        normalized_grant_valid[fe_gen]       = 1'b1;
-                        normalized_grant_seq_tag[fe_gen]     = nominated_seq_tag[fe_gen][0];
-                        normalized_grant_class[fe_gen]       = normalized_physical_class[0];
-                        normalized_grant_target_slot[fe_gen] = normalized_target_slot[0];
-                    end
-                    normalized_accept[fe_gen][1]: begin
-                        normalized_grant_valid[fe_gen]       = 1'b1;
-                        normalized_grant_seq_tag[fe_gen]     = nominated_seq_tag[fe_gen][1];
-                        normalized_grant_class[fe_gen]       = normalized_physical_class[1];
-                        normalized_grant_target_slot[fe_gen] = normalized_target_slot[1];
-                    end
-                    normalized_accept[fe_gen][2]: begin
-                        normalized_grant_valid[fe_gen]       = 1'b1;
-                        normalized_grant_seq_tag[fe_gen]     = nominated_seq_tag[fe_gen][2];
-                        normalized_grant_class[fe_gen]       = normalized_physical_class[2];
-                        normalized_grant_target_slot[fe_gen] = normalized_target_slot[2];
-                    end
-                    normalized_accept[fe_gen][3]: begin
-                        normalized_grant_valid[fe_gen]       = 1'b1;
-                        normalized_grant_seq_tag[fe_gen]     = nominated_seq_tag[fe_gen][3];
-                        normalized_grant_class[fe_gen]       = normalized_physical_class[3];
-                        normalized_grant_target_slot[fe_gen] = normalized_target_slot[3];
-                    end
-                    default: begin end
-                endcase
-            end
+        // Any non-empty legal matrix necessarily produces at least one
+        // round-0 acceptance. Advance fairness from this early reduction
+        // instead of waiting for request, conflict, and metadata networks.
+        if (|legal) begin
+            fe_rr_ptr_d = add_fe_offset(fe_rr_ptr_q, fe_id_t'(1));
         end
-    endgenerate
 
-    always_comb begin : grant_denormalization
-        grant_valid_d       = '0;
-        grant_seq_tag_d     = '0;
-        grant_class_d       = '0;
-        grant_target_slot_d = '0;
-
-        case (fe_rr_ptr_q)
-            2'd0: begin
-                grant_valid_d = normalized_grant_valid; grant_seq_tag_d = normalized_grant_seq_tag; grant_class_d = normalized_grant_class; grant_target_slot_d = normalized_grant_target_slot;
-            end
-            2'd1: begin
-                grant_valid_d[1] = normalized_grant_valid[0]; grant_valid_d[2] = normalized_grant_valid[1]; grant_valid_d[3] = normalized_grant_valid[2]; grant_valid_d[0] = normalized_grant_valid[3];
-                grant_seq_tag_d[1] = normalized_grant_seq_tag[0]; grant_seq_tag_d[2] = normalized_grant_seq_tag[1]; grant_seq_tag_d[3] = normalized_grant_seq_tag[2]; grant_seq_tag_d[0] = normalized_grant_seq_tag[3];
-                grant_class_d[1] = normalized_grant_class[0]; grant_class_d[2] = normalized_grant_class[1]; grant_class_d[3] = normalized_grant_class[2]; grant_class_d[0] = normalized_grant_class[3];
-                grant_target_slot_d[1] = normalized_grant_target_slot[0]; grant_target_slot_d[2] = normalized_grant_target_slot[1]; grant_target_slot_d[3] = normalized_grant_target_slot[2]; grant_target_slot_d[0] = normalized_grant_target_slot[3];
-            end
-            2'd2: begin
-                grant_valid_d[2] = normalized_grant_valid[0]; grant_valid_d[3] = normalized_grant_valid[1]; grant_valid_d[0] = normalized_grant_valid[2]; grant_valid_d[1] = normalized_grant_valid[3];
-                grant_seq_tag_d[2] = normalized_grant_seq_tag[0]; grant_seq_tag_d[3] = normalized_grant_seq_tag[1]; grant_seq_tag_d[0] = normalized_grant_seq_tag[2]; grant_seq_tag_d[1] = normalized_grant_seq_tag[3];
-                grant_class_d[2] = normalized_grant_class[0]; grant_class_d[3] = normalized_grant_class[1]; grant_class_d[0] = normalized_grant_class[2]; grant_class_d[1] = normalized_grant_class[3];
-                grant_target_slot_d[2] = normalized_grant_target_slot[0]; grant_target_slot_d[3] = normalized_grant_target_slot[1]; grant_target_slot_d[0] = normalized_grant_target_slot[2]; grant_target_slot_d[1] = normalized_grant_target_slot[3];
-            end
-            default: begin
-                grant_valid_d[3] = normalized_grant_valid[0]; grant_valid_d[0] = normalized_grant_valid[1]; grant_valid_d[1] = normalized_grant_valid[2]; grant_valid_d[2] = normalized_grant_valid[3];
-                grant_seq_tag_d[3] = normalized_grant_seq_tag[0]; grant_seq_tag_d[0] = normalized_grant_seq_tag[1]; grant_seq_tag_d[1] = normalized_grant_seq_tag[2]; grant_seq_tag_d[2] = normalized_grant_seq_tag[3];
-                grant_class_d[3] = normalized_grant_class[0]; grant_class_d[0] = normalized_grant_class[1]; grant_class_d[1] = normalized_grant_class[2]; grant_class_d[2] = normalized_grant_class[3];
-                grant_target_slot_d[3] = normalized_grant_target_slot[0]; grant_target_slot_d[0] = normalized_grant_target_slot[1]; grant_target_slot_d[1] = normalized_grant_target_slot[2]; grant_target_slot_d[2] = normalized_grant_target_slot[3];
-            end
-        endcase
-
-        grant_any_d     = |grant_valid_d;
-        class_rr_next_d = next_class_id(class_rr_ptr_q);
-        fe_rr_next_d    = next_fe_id(fe_rr_ptr_q);
     end
 
     //--------------------------------------------------------------------------
-    // D2A grant capture, D2B reservation, and fairness update
+    // Registered interfaces
     //--------------------------------------------------------------------------
 
-    always_ff @(posedge clk_i or negedge rst_ni) begin : grant_pipeline_update
+    always_comb begin : interface_outputs
+        select_valid_o            = grant_valid_q;
+        select_candidate_onehot_o = '0;
+        completion_valid_o        = '0;
+        completion_seq_tag_o      = '0;
+
+        for (int fe = 0; fe < FE_NUM; fe++) begin
+            if (grant_valid_q[fe]) begin
+                select_candidate_onehot_o[fe][grant_candidate_id_q[fe]] =
+                    1'b1;
+            end
+            completion_valid_o[fe] =
+                fe_out_valid_i[fe] && future_valid_q[fe][0];
+            if (future_valid_q[fe][0]) begin
+                completion_seq_tag_o[fe] = future_seq_tag_q[fe][0];
+            end
+        end
+    end
+
+    //--------------------------------------------------------------------------
+    // Grant state
+    //--------------------------------------------------------------------------
+
+    always_ff @(posedge clk_i or negedge rst_ni) begin : match_pipeline_state
         if (!rst_ni) begin
-            grant_valid_q <= '0;
+            grant_valid_q     <= '0;
+            fe_rr_ptr_q       <= '0;
+            candidate_bank_rr_ptr_q <= 1'b0;
         end else begin
-            grant_valid_q <= grant_valid_d;
+            grant_valid_q     <= grant_valid_d;
+            fe_rr_ptr_q       <= fe_rr_ptr_d;
+            candidate_bank_rr_ptr_q <= candidate_bank_rr_ptr_d;
 
-            for (int fe_idx = 0; fe_idx < FE_NUM; fe_idx++) begin
-                if (grant_valid_d[fe_idx]) begin
-                    grant_seq_tag_q[fe_idx] <= grant_seq_tag_d[fe_idx];
-                    grant_class_q[fe_idx] <= grant_class_d[fe_idx];
-                    grant_target_slot_q[fe_idx] <=
-                        grant_target_slot_d[fe_idx];
+            for (int fe = 0; fe < FE_NUM; fe++) begin
+                if (grant_valid_d[fe]) begin
+                    grant_seq_tag_q[fe] <= grant_seq_tag_d[fe];
+                    grant_candidate_id_q[fe] <= grant_candidate_id_d[fe];
+                    grant_delay_q[fe] <= grant_delay_d[fe];
                 end
-            end
-        end
-    end
-
-    always_ff @(posedge clk_i or negedge rst_ni) begin : return_calendar_update
-        if (!rst_ni) begin
-            return_slot_valid_q <= '0;
-        end else begin
-            // Consume the current calendar slot. Protocol mismatches are
-            // verification errors and do not create a replay path.
-            for (int fe_idx = 0; fe_idx < FE_NUM; fe_idx++) begin
-                if (return_slot_valid_q[fe_idx][schedule_phase_q]) begin
-                    return_slot_valid_q[fe_idx][schedule_phase_q] <= 1'b0;
-                end
-            end
-
-            // The registered D2B selection and reservation are one event.
-            for (int fe_idx = 0; fe_idx < FE_NUM; fe_idx++) begin
-                if (grant_valid_q[fe_idx]) begin
-                    return_slot_valid_q[fe_idx]
-                                       [grant_target_slot_q[fe_idx]] <= 1'b1;
-                    return_slot_seq_tag_q[fe_idx]
-                                         [grant_target_slot_q[fe_idx]] <=
-                        grant_seq_tag_q[fe_idx];
-                end
-            end
-        end
-    end
-
-    always_ff @(posedge clk_i or negedge rst_ni) begin : scheduler_control_update
-        if (!rst_ni) begin
-            schedule_phase_q <= '0;
-            class_rr_ptr_q   <= '0;
-            fe_rr_ptr_q      <= '0;
-        end else begin
-            schedule_phase_q <= next_slot_id(schedule_phase_q);
-
-            if (grant_any_d) begin
-                class_rr_ptr_q <= class_rr_next_d;
-                fe_rr_ptr_q    <= fe_rr_next_d;
             end
         end
     end
 
     //--------------------------------------------------------------------------
-    // FE return association and calendar advancement
+    // D2B return reservation and completion association
     //--------------------------------------------------------------------------
 
-    always_comb begin : completion_association
-        completion_valid_o      = '0;
-        completion_seq_tag_o    = '0;
+    always_ff @(posedge clk_i or negedge rst_ni) begin : future_table_state
+        if (!rst_ni) begin
+            future_valid_q <= '0;
+        end else begin
+            for (int fe = 0; fe < FE_NUM; fe++) begin
+                for (int slot = 0;
+                     slot < (RETURN_FUTURE_DEPTH - 1);
+                     slot++) begin
+                    future_valid_q[fe][slot] <=
+                        future_valid_q[fe][slot + 1];
+                    if (future_valid_q[fe][slot + 1]) begin
+                        future_seq_tag_q[fe][slot] <=
+                            future_seq_tag_q[fe][slot + 1];
+                    end
+                end
+                future_valid_q[fe][RETURN_FUTURE_DEPTH-1] <= 1'b0;
 
-        for (int fe_idx = 0; fe_idx < FE_NUM; fe_idx++) begin
-            if (fe_out_valid_i[fe_idx]
-                && return_slot_valid_q[fe_idx][schedule_phase_q]) begin
-                completion_valid_o[fe_idx] = 1'b1;
-                completion_seq_tag_o[fe_idx] =
-                    return_slot_seq_tag_q[fe_idx][schedule_phase_q];
+                if (grant_valid_q[fe]) begin
+                    unique case (grant_delay_q[fe])
+                        delay_t'(0): begin
+                            future_valid_q[fe][1] <= 1'b1;
+                            future_seq_tag_q[fe][1] <= grant_seq_tag_q[fe];
+                        end
+                        delay_t'(1): begin
+                            future_valid_q[fe][2] <= 1'b1;
+                            future_seq_tag_q[fe][2] <= grant_seq_tag_q[fe];
+                        end
+                        delay_t'(2): begin
+                            future_valid_q[fe][3] <= 1'b1;
+                            future_seq_tag_q[fe][3] <= grant_seq_tag_q[fe];
+                        end
+                        default: begin
+                            future_valid_q[fe][4] <= 1'b1;
+                            future_seq_tag_q[fe][4] <= grant_seq_tag_q[fe];
+                        end
+                    endcase
+                end
             end
         end
     end
