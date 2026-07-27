@@ -94,6 +94,8 @@ module ppe_rob #(
     localparam int DATA_BANK_W   = $clog2(DATA_BANK_NUM);
     localparam int DATA_ROW_NUM  = ROB_DEPTH / DATA_BANK_NUM;
     localparam int DATA_ROW_W    = $clog2(DATA_ROW_NUM);
+    localparam int ROB_TAG_HI_W  = SEQ_W - ROB_ID_W;
+    localparam int HISTORY_TAG_HI_W = SEQ_W - HISTORY_ID_W;
 
     typedef logic [LANE_COUNT_W-1:0] lane_count_t;
     typedef logic [DATA_BANK_W-1:0]  data_bank_t;
@@ -118,16 +120,38 @@ module ppe_rob #(
     // Active ROB and retired-history storage
     //--------------------------------------------------------------------------
 
-    logic [ROB_DEPTH-1:0]            rob_valid_q;
-    logic [ROB_DEPTH-1:0]            rob_result_valid_q;
-    logic [ROB_DEPTH-1:0][SEQ_W-1:0] rob_seq_tag_q;
+    logic [ROB_DEPTH-1:0]                  rob_valid_q;
+    logic [ROB_DEPTH-1:0]                  rob_result_valid_q;
+    logic [ROB_DEPTH-1:0][ROB_TAG_HI_W-1:0] rob_tag_hi_q;
+    logic [ROB_DEPTH-1:0][SEQ_W-1:0]       rob_seq_tag_q;
 
     logic [DATA_BANK_NUM-1:0][DATA_ROW_NUM-1:0]
           [PACKET_W-1:0] rob_data_q;
 
-    logic [RESULT_BANKS-1:0]               history_valid_q;
-    logic [RESULT_BANKS-1:0][SEQ_W-1:0]    history_seq_tag_q;
+    logic [RESULT_BANKS-1:0] history_valid_q;
+    logic [RESULT_BANKS-1:0][HISTORY_TAG_HI_W-1:0]
+          history_tag_hi_q;
+    logic [RESULT_BANKS-1:0][SEQ_W-1:0] history_seq_tag_q;
     logic [RESULT_BANKS-1:0][PACKET_W-1:0] history_data_q;
+
+    // Full-tag views preserve debug visibility without duplicating state.
+    for (genvar entry_idx = 0;
+         entry_idx < ROB_DEPTH;
+         entry_idx++) begin : gen_rob_tag_view
+        assign rob_seq_tag_q[entry_idx] = {
+            rob_tag_hi_q[entry_idx],
+            ROB_ID_W'(entry_idx)
+        };
+    end
+
+    for (genvar history_idx = 0;
+         history_idx < RESULT_BANKS;
+         history_idx++) begin : gen_history_tag_view
+        assign history_seq_tag_q[history_idx] = {
+            history_tag_hi_q[history_idx],
+            HISTORY_ID_W'(history_idx)
+        };
+    end
 
     //--------------------------------------------------------------------------
     // Global state and per-cycle events
@@ -179,6 +203,13 @@ module ppe_rob #(
     logic [ISSUE_WIDTH-1:0]   dep_gather_history_match;
     logic [ISSUE_WIDTH-1:0][PACKET_W-1:0] dep_gather_active_data;
     logic [ISSUE_WIDTH-1:0][PACKET_W-1:0] dep_gather_history_data;
+
+    logic [DATA_BANK_NUM-1:0] source_bank_req_valid;
+    logic [DATA_BANK_NUM-1:0][DATA_ROW_W-1:0] source_bank_req_row;
+    logic [DATA_BANK_NUM-1:0][ROB_TAG_HI_W-1:0]
+          source_bank_req_tag_hi;
+    logic [DATA_BANK_NUM-1:0] source_bank_data_valid;
+    logic [DATA_BANK_NUM-1:0][PACKET_W-1:0] source_bank_data;
 
     function automatic logic [PACKET_W-1:0] rob_data_read(
         input rob_id_t rob_id
@@ -253,7 +284,8 @@ module ppe_rob #(
                 if (wb_valid_i[wb_idx]
                     && (wb_rob_id[wb_idx] == rob_id_t'(entry_idx))
                     && rob_valid_q[entry_idx]
-                    && (rob_seq_tag_q[entry_idx] == wb_seq_tag_i[wb_idx])
+                    && (rob_tag_hi_q[entry_idx]
+                        == wb_seq_tag_i[wb_idx][SEQ_W-1:ROB_ID_W])
                     && !rob_result_valid_q[entry_idx]) begin
                     wb_entry_commit[entry_idx][wb_idx] = 1'b1;
                     wb_commit[wb_idx] = 1'b1;
@@ -296,7 +328,10 @@ module ppe_rob #(
                 && rob_result_valid_q[scan_rob_id]) begin
                 retire_valid_o[retire_idx] = 1'b1;
                 retire_rob_id[retire_idx]  = scan_rob_id;
-                retire_seq_tag[retire_idx] = rob_seq_tag_q[scan_rob_id];
+                retire_seq_tag[retire_idx] = {
+                    rob_tag_hi_q[scan_rob_id],
+                    scan_rob_id
+                };
                 retire_count = retire_count + lane_count_t'(1);
             end else begin
                 prefix_done = 1'b0;
@@ -383,21 +418,72 @@ module ppe_rob #(
     //--------------------------------------------------------------------------
 
     always_comb begin : issue_source_read
+        source_bank_req_valid  = '0;
+        source_bank_req_row    = '0;
+        source_bank_req_tag_hi = '0;
+        source_bank_data_valid = '0;
+        source_bank_data       = '0;
         issue_read_data_valid_o = '0;
         issue_read_data_o       = '0;
 
-        for (int read_idx = 0; read_idx < ISSUE_WIDTH; read_idx++) begin
+        // D2A emits at most one request from each low-two-bit issue bank.
+        // Select one row per data bank, then share that 8:1 read before
+        // routing the result back to the FE-indexed response.
+        for (int bank_idx = 0;
+             bank_idx < DATA_BANK_NUM;
+             bank_idx++) begin
+            for (int read_idx = 0;
+                 read_idx < ISSUE_WIDTH;
+                 read_idx++) begin
+                if (issue_read_valid_i[read_idx]
+                    && (issue_read_seq_tag_i[read_idx]
+                        [DATA_BANK_W-1:0] == data_bank_t'(bank_idx))) begin
+                    source_bank_req_valid[bank_idx] = 1'b1;
+                    source_bank_req_row[bank_idx] =
+                        issue_read_seq_tag_i[read_idx]
+                        [ROB_ID_W-1:DATA_BANK_W];
+                    source_bank_req_tag_hi[bank_idx] =
+                        issue_read_seq_tag_i[read_idx]
+                        [SEQ_W-1:ROB_ID_W];
+                end
+            end
+        end
+
+        for (int bank_idx = 0;
+             bank_idx < DATA_BANK_NUM;
+             bank_idx++) begin
             rob_id_t source_rob_id;
 
-            source_rob_id = rob_id_t'(
-                issue_read_seq_tag_i[read_idx][ROB_ID_W-1:0]);
-            if (issue_read_valid_i[read_idx]
+            source_rob_id = '0;
+            source_rob_id[DATA_BANK_W-1:0] = data_bank_t'(bank_idx);
+            source_rob_id[ROB_ID_W-1:DATA_BANK_W] =
+                source_bank_req_row[bank_idx];
+
+            if (source_bank_req_valid[bank_idx]
                 && rob_valid_q[source_rob_id]
-                && (rob_seq_tag_q[source_rob_id]
-                    == issue_read_seq_tag_i[read_idx])
+                && (rob_tag_hi_q[source_rob_id]
+                    == source_bank_req_tag_hi[bank_idx])
                 && !rob_result_valid_q[source_rob_id]) begin
-                issue_read_data_valid_o[read_idx] = 1'b1;
-                issue_read_data_o[read_idx] = rob_data_read(source_rob_id);
+                source_bank_data_valid[bank_idx] = 1'b1;
+                source_bank_data[bank_idx] =
+                    rob_data_q[bank_idx][source_bank_req_row[bank_idx]];
+            end
+        end
+
+        for (int read_idx = 0;
+             read_idx < ISSUE_WIDTH;
+             read_idx++) begin
+            data_bank_t source_bank;
+
+            source_bank = data_bank_t'(
+                issue_read_seq_tag_i[read_idx][DATA_BANK_W-1:0]);
+            if (issue_read_valid_i[read_idx]) begin
+                issue_read_data_valid_o[read_idx] =
+                    source_bank_data_valid[source_bank];
+                if (source_bank_data_valid[source_bank]) begin
+                    issue_read_data_o[read_idx] =
+                        source_bank_data[source_bank];
+                end
             end
         end
     end
@@ -427,16 +513,18 @@ module ppe_rob #(
 
             if (dep_status_valid_i[query_idx]) begin
                 if (rob_valid_q[target_rob_id]
-                    && (rob_seq_tag_q[target_rob_id]
-                        == dep_status_target_seq_tag_i[query_idx])) begin
+                    && (rob_tag_hi_q[target_rob_id]
+                        == dep_status_target_seq_tag_i[query_idx]
+                           [SEQ_W-1:ROB_ID_W])) begin
                     dep_status_active_match[query_idx] = 1'b1;
                     dep_status_active_available[query_idx] =
                         rob_result_valid_q[target_rob_id];
                 end
 
                 if (history_valid_q[history_id]
-                    && (history_seq_tag_q[history_id]
-                        == dep_status_target_seq_tag_i[query_idx])) begin
+                    && (history_tag_hi_q[history_id]
+                        == dep_status_target_seq_tag_i[query_idx]
+                           [SEQ_W-1:HISTORY_ID_W])) begin
                     dep_status_history_match[query_idx] = 1'b1;
                 end
             end
@@ -455,8 +543,9 @@ module ppe_rob #(
 
             if (dep_gather_valid_i[query_idx]) begin
                 if (rob_valid_q[target_rob_id]
-                    && (rob_seq_tag_q[target_rob_id]
-                        == dep_gather_target_seq_tag_i[query_idx])) begin
+                    && (rob_tag_hi_q[target_rob_id]
+                        == dep_gather_target_seq_tag_i[query_idx]
+                           [SEQ_W-1:ROB_ID_W])) begin
                     dep_gather_active_match[query_idx] = 1'b1;
                     dep_gather_active_available[query_idx] =
                         rob_result_valid_q[target_rob_id];
@@ -467,8 +556,9 @@ module ppe_rob #(
                 end
 
                 if (history_valid_q[history_id]
-                    && (history_seq_tag_q[history_id]
-                        == dep_gather_target_seq_tag_i[query_idx])) begin
+                    && (history_tag_hi_q[history_id]
+                        == dep_gather_target_seq_tag_i[query_idx]
+                           [SEQ_W-1:HISTORY_ID_W])) begin
                     dep_gather_history_match[query_idx] = 1'b1;
                     dep_gather_history_data[query_idx] =
                         history_data_q[history_id];
@@ -608,8 +698,8 @@ module ppe_rob #(
             for (int alloc_idx = 0; alloc_idx < N; alloc_idx++) begin
                 if (alloc_fire[alloc_idx]) begin
                     rob_valid_q[alloc_rob_id[alloc_idx]] <= 1'b1;
-                    rob_seq_tag_q[alloc_rob_id[alloc_idx]] <=
-                        alloc_seq_tag_i[alloc_idx];
+                    rob_tag_hi_q[alloc_rob_id[alloc_idx]] <=
+                        alloc_seq_tag_i[alloc_idx][SEQ_W-1:ROB_ID_W];
                     rob_result_valid_q[alloc_rob_id[alloc_idx]] <= 1'b0;
                 end
             end
@@ -678,8 +768,9 @@ module ppe_rob #(
                  history_idx++) begin
                 if (history_write_en[history_idx]) begin
                     history_valid_q[history_idx] <= 1'b1;
-                    history_seq_tag_q[history_idx] <=
-                        history_write_seq_tag[history_idx];
+                    history_tag_hi_q[history_idx] <=
+                        history_write_seq_tag[history_idx]
+                        [SEQ_W-1:HISTORY_ID_W];
                 end
             end
         end
