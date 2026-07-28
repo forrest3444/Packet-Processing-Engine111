@@ -59,10 +59,10 @@ module ppe_top_sv #(
     // Internal point-to-point interconnects intentionally omit _i/_o suffixes;
     // direction is expressed only at each owning module boundary.
 
-    logic [N-1:0]                 alloc_req_valid;
+    logic [N-1:0]                 alloc_reserve_valid;
+    logic                         alloc_reserve_ready;
+    logic [N-1:0]                 alloc_commit_valid;
     logic [N-1:0][SEQ_W-1:0]      alloc_seq_tag;
-    logic                         alloc_ready;
-    logic [N-1:0]                 issue_alloc_valid;
     logic [N-1:0][SEQ_W-1:0]      alloc_target_seq_tag;
     logic [N-1:0][PACKET_W-1:0]   alloc_packet;
     logic [N-1:0][DELAY_W-1:0]    alloc_delay;
@@ -78,10 +78,10 @@ module ppe_top_sv #(
         .in_packet_i              (in_packet),
         .in_desc_i                (in_desc),
         .bkps_o                   (bkps),
-        .alloc_req_valid_o        (alloc_req_valid),
+        .alloc_reserve_valid_o    (alloc_reserve_valid),
+        .alloc_reserve_ready_i    (alloc_reserve_ready),
+        .alloc_commit_valid_o     (alloc_commit_valid),
         .alloc_seq_tag_o          (alloc_seq_tag),
-        .alloc_ready_i            (alloc_ready),
-        .issue_alloc_valid_o      (issue_alloc_valid),
         .alloc_target_seq_tag_o   (alloc_target_seq_tag),
         .alloc_packet_o           (alloc_packet),
         .alloc_delay_o            (alloc_delay),
@@ -106,29 +106,20 @@ module ppe_top_sv #(
     logic [FE_NUM-1:0]               completion_valid;
     logic [FE_NUM-1:0][SEQ_W-1:0]    completion_seq_tag;
 
-    logic [FE_NUM-1:0]               dep_gather_valid;
-    logic [FE_NUM-1:0][SEQ_W-1:0]    dep_gather_target_seq_tag;
-    logic [FE_NUM-1:0]               dep_gather_data_valid;
-    logic [FE_NUM-1:0][PACKET_W-1:0] dep_gather_data;
-
     logic [FE_NUM-1:0]               issue_valid;
     logic [FE_NUM-1:0][SEQ_W-1:0]    issue_seq_tag;
     logic [FE_NUM-1:0][PACKET_W-1:0] issue_packet;
-    logic [FE_NUM-1:0]               issue_packet_valid;
     logic [FE_NUM-1:0][DELAY_W-1:0]  issue_delay;
     logic [FE_NUM-1:0]               issue_dep_required;
     logic [FE_NUM-1:0][SEQ_W-1:0]    issue_target_seq_tag;
     logic [FE_NUM-1:0][PACKET_W-1:0] issue_dep_data;
-
     logic [FE_NUM-1:0]               fe_out_valid;
     logic [FE_NUM-1:0][PACKET_W-1:0] fe_out_data;
-
-    assign issue_dep_data = dep_gather_data;
 
     ppe_issue_table u_issue_table (
         .clk_i                       (clk),
         .rst_ni                      (internal_rst_n),
-        .issue_alloc_valid_i         (issue_alloc_valid),
+        .issue_alloc_valid_i         (alloc_commit_valid),
         .alloc_seq_tag_i             (alloc_seq_tag),
         .alloc_target_seq_tag_i      (alloc_target_seq_tag),
         .alloc_delay_i               (alloc_delay),
@@ -143,8 +134,6 @@ module ppe_top_sv #(
         .candidate_delay_o           (candidate_delay),
         .select_valid_i              (select_valid),
         .select_candidate_onehot_i   (select_candidate_onehot),
-        .dep_gather_valid_o          (dep_gather_valid),
-        .dep_gather_target_seq_tag_o (dep_gather_target_seq_tag),
         .issue_valid_o               (issue_valid),
         .issue_seq_tag_o             (issue_seq_tag),
         .issue_delay_o               (issue_delay),
@@ -198,21 +187,20 @@ module ppe_top_sv #(
     ) u_rob (
         .clk_i                       (clk),
         .rst_ni                      (internal_rst_n),
-        .alloc_req_valid_i           (alloc_req_valid),
+        .alloc_reserve_valid_i       (alloc_reserve_valid),
+        .alloc_reserve_ready_o       (alloc_reserve_ready),
+        .alloc_commit_valid_i        (alloc_commit_valid),
         .alloc_seq_tag_i             (alloc_seq_tag),
         .alloc_packet_i              (alloc_packet),
-        .alloc_ready_o               (alloc_ready),
         .dep_status_valid_i          (dep_status_valid),
         .dep_status_target_seq_tag_i (dep_status_target_seq_tag),
         .dep_status_available_o      (dep_status_available),
-        .dep_gather_valid_i          (dep_gather_valid),
-        .dep_gather_target_seq_tag_i (dep_gather_target_seq_tag),
-        .dep_gather_data_valid_o     (dep_gather_data_valid),
-        .dep_gather_data_o           (dep_gather_data),
-        .issue_read_valid_i          (issue_valid),
-        .issue_read_seq_tag_i        (issue_seq_tag),
-        .issue_read_data_valid_o     (issue_packet_valid),
-        .issue_read_data_o           (issue_packet),
+        .issue_valid_i               (issue_valid),
+        .issue_seq_tag_i             (issue_seq_tag),
+        .issue_dep_required_i        (issue_dep_required),
+        .issue_target_seq_tag_i      (issue_target_seq_tag),
+        .issue_packet_o              (issue_packet),
+        .issue_dep_data_o            (issue_dep_data),
         .wb_valid_i                  (completion_valid),
         .wb_seq_tag_i                (completion_seq_tag),
         .wb_data_i                   (fe_out_data),

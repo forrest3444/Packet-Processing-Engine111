@@ -53,10 +53,6 @@ module ppe_issue_table (
                  [ppe_types_pkg::CAND_WINDOW_DEPTH-1:0]
                                                              select_candidate_onehot_i,
 
-    output logic [ppe_types_pkg::FE_NUM-1:0]               dep_gather_valid_o,
-    output logic [ppe_types_pkg::FE_NUM-1:0]
-                 [ppe_types_pkg::SEQ_W-1:0]                dep_gather_target_seq_tag_o,
-
     output logic [ppe_types_pkg::FE_NUM-1:0]               issue_valid_o,
     output logic [ppe_types_pkg::FE_NUM-1:0]
                  [ppe_types_pkg::SEQ_W-1:0]                issue_seq_tag_o,
@@ -110,6 +106,20 @@ module ppe_issue_table (
     logic [FE_NUM-1:0]            selected_dep_required_q;
 
     logic [ISSUE_DEPTH-1:0]       wake_hit;
+    logic [ADMIT_BANKS-1:0][N-1:0] alloc_bank_lane_hit;
+    logic [ADMIT_BANKS-1:0]       alloc_bank_write_en;
+    admit_row_id_t                alloc_bank_row[ADMIT_BANKS];
+    seq_tag_t                     alloc_bank_seq_tag[ADMIT_BANKS];
+    delay_t                       alloc_bank_delay[ADMIT_BANKS];
+    logic [ADMIT_BANKS-1:0]       alloc_bank_dep_required;
+    logic [ISSUE_DEPTH-1:0]       alloc_entry_write_en;
+    seq_tag_t                     alloc_entry_seq_tag[ISSUE_DEPTH];
+    delay_t                       alloc_entry_delay[ISSUE_DEPTH];
+    logic [ISSUE_DEPTH-1:0]       alloc_entry_dep_required;
+    logic [N-1:0]                 dep_status_valid_q;
+    seq_tag_t                     dep_status_target_seq_tag_q[N];
+    seq_tag_t                     dep_status_consumer_seq_tag_q[N];
+    logic [ISSUE_DEPTH-1:0]       dep_status_pending_entry;
     logic [ISSUE_DEPTH-1:0]       eligible_ready;
     logic [CAND_WINDOW_DEPTH-1:0] candidate_remove;
     logic [ISSUE_DEPTH-1:0]       select_entry_hit;
@@ -124,16 +134,105 @@ module ppe_issue_table (
     // Dependency initialization and registered-state wakeup
     //--------------------------------------------------------------------------
 
+    always_comb begin : allocation_bank_route
+        alloc_bank_lane_hit    = '0;
+        alloc_bank_write_en    = '0;
+        alloc_bank_dep_required = '0;
+
+        for (int bank = 0; bank < ADMIT_BANKS; bank++) begin
+            alloc_bank_row[bank]     = '0;
+            alloc_bank_seq_tag[bank] = '0;
+            alloc_bank_delay[bank]   = '0;
+            for (int lane = 0; lane < N; lane++) begin
+                alloc_bank_lane_hit[bank][lane] =
+                    issue_alloc_valid_i[lane]
+                    && (alloc_seq_tag_i[lane][ADMIT_BANK_W-1:0]
+                        == admit_bank_id_t'(bank));
+                alloc_bank_write_en[bank] |=
+                    alloc_bank_lane_hit[bank][lane];
+                alloc_bank_row[bank] |=
+                    alloc_seq_tag_i[lane][ROB_ID_W-1:ADMIT_BANK_W]
+                    & {ADMIT_ROW_W{alloc_bank_lane_hit[bank][lane]}};
+                alloc_bank_seq_tag[bank] |=
+                    alloc_seq_tag_i[lane]
+                    & {SEQ_W{alloc_bank_lane_hit[bank][lane]}};
+                alloc_bank_delay[bank] |=
+                    alloc_delay_i[lane]
+                    & {DELAY_W{alloc_bank_lane_hit[bank][lane]}};
+                alloc_bank_dep_required[bank] |=
+                    alloc_dep_required_i[lane]
+                    & alloc_bank_lane_hit[bank][lane];
+            end
+        end
+    end
+
+    always_comb begin : allocation_row_decode
+        alloc_entry_write_en     = '0;
+        alloc_entry_dep_required = '0;
+
+        for (int bank = 0; bank < ADMIT_BANKS; bank++) begin
+            for (int row = 0; row < ADMIT_ROWS; row++) begin
+                rob_id_t entry;
+
+                entry = rob_id_t'((row * ADMIT_BANKS) + bank);
+                alloc_entry_write_en[entry] =
+                    alloc_bank_write_en[bank]
+                    && (alloc_bank_row[bank] == admit_row_id_t'(row));
+                alloc_entry_seq_tag[entry] =
+                    alloc_bank_seq_tag[bank];
+                alloc_entry_delay[entry] =
+                    alloc_bank_delay[bank];
+                alloc_entry_dep_required[entry] =
+                    alloc_bank_dep_required[bank];
+            end
+        end
+    end
+
     always_comb begin : dependency_status_request
         dep_status_valid_o          = '0;
         dep_status_target_seq_tag_o = '0;
 
         for (int lane = 0; lane < N; lane++) begin
-            dep_status_valid_o[lane] =
-                issue_alloc_valid_i[lane] && alloc_dep_required_i[lane];
+            dep_status_valid_o[lane] = dep_status_valid_q[lane];
             if (dep_status_valid_o[lane]) begin
                 dep_status_target_seq_tag_o[lane] =
-                    alloc_target_seq_tag_i[lane];
+                    dep_status_target_seq_tag_q[lane];
+            end
+        end
+    end
+
+    always_ff @(posedge clk_i or negedge rst_ni) begin : dependency_status_pipeline
+        if (!rst_ni) begin
+            dep_status_valid_q <= '0;
+        end else begin
+            for (int lane = 0; lane < N; lane++) begin
+                dep_status_valid_q[lane] <=
+                    issue_alloc_valid_i[lane]
+                    && alloc_dep_required_i[lane];
+                if (issue_alloc_valid_i[lane]
+                    && alloc_dep_required_i[lane]) begin
+                    dep_status_target_seq_tag_q[lane] <=
+                        alloc_target_seq_tag_i[lane];
+                    dep_status_consumer_seq_tag_q[lane] <=
+                        alloc_seq_tag_i[lane];
+                end
+            end
+        end
+    end
+
+    always_comb begin : dependency_status_pending_decode
+        dep_status_pending_entry = '0;
+
+        for (int lane = 0; lane < N; lane++) begin
+            rob_id_t consumer_id;
+
+            consumer_id =
+                dep_status_consumer_seq_tag_q[lane][ROB_ID_W-1:0];
+            if (dep_status_valid_q[lane]) begin
+                if (issue_seq_tag_q[consumer_id]
+                    == dep_status_consumer_seq_tag_q[lane]) begin
+                    dep_status_pending_entry[consumer_id] = 1'b1;
+                end
             end
         end
     end
@@ -145,6 +244,7 @@ module ppe_issue_table (
             for (int fe = 0; fe < FE_NUM; fe++) begin
                 if (completion_valid_i[fe]
                     && (issue_state_q[entry] == ISSUE_WAIT_DEP)
+                    && !dep_status_pending_entry[entry]
                     && (issue_target_seq_tag_q[entry]
                         == completion_seq_tag_i[fe])) begin
                     wake_hit[entry] = 1'b1;
@@ -288,8 +388,6 @@ module ppe_issue_table (
         candidate_valid_o           = candidate_valid_q;
         candidate_seq_tag_o         = '0;
         candidate_delay_o           = '0;
-        dep_gather_valid_o          = '0;
-        dep_gather_target_seq_tag_o = '0;
         issue_valid_o               = selected_valid_q;
         issue_seq_tag_o             = '0;
         issue_delay_o               = '0;
@@ -311,12 +409,6 @@ module ppe_issue_table (
                     selected_dep_required_q[fe];
                 issue_target_seq_tag_o[fe] =
                     selected_target_seq_tag_q[fe];
-                dep_gather_valid_o[fe] =
-                    selected_dep_required_q[fe];
-                if (selected_dep_required_q[fe]) begin
-                    dep_gather_target_seq_tag_o[fe] =
-                        selected_target_seq_tag_q[fe];
-                end
             end
         end
     end
@@ -344,30 +436,57 @@ module ppe_issue_table (
                 end
             end
 
+            for (int lane = 0; lane < N; lane++) begin
+                if (dep_status_valid_q[lane]
+                    && dep_status_available_i[lane]) begin
+                    rob_id_t consumer_id;
+
+                    consumer_id =
+                        dep_status_consumer_seq_tag_q[lane][ROB_ID_W-1:0];
+                    if ((issue_state_q[consumer_id] == ISSUE_WAIT_DEP)
+                        && (issue_seq_tag_q[consumer_id]
+                            == dep_status_consumer_seq_tag_q[lane])) begin
+                        issue_state_q[consumer_id] <= ISSUE_READY;
+                    end
+                end
+            end
+
             for (int fe = 0; fe < FE_NUM; fe++) begin
                 if (select_valid_i[fe]) begin
                     issue_state_q[select_entry_id[fe]] <= ISSUE_SELECTED;
                 end
             end
 
-            for (int lane = 0; lane < N; lane++) begin
-                if (issue_alloc_valid_i[lane]) begin
-                    rob_id_t allocation_id;
+            for (int entry = 0; entry < ISSUE_DEPTH; entry++) begin
+                if (alloc_entry_write_en[entry]) begin
+                    issue_state_q[entry] <=
+                        alloc_entry_dep_required[entry]
+                        ? ISSUE_WAIT_DEP : ISSUE_READY;
+                end
+            end
+        end
+    end
 
-                    allocation_id =
-                        alloc_seq_tag_i[lane][ROB_ID_W-1:0];
-                    issue_seq_tag_q[allocation_id] <=
-                        alloc_seq_tag_i[lane];
-                    issue_target_seq_tag_q[allocation_id] <=
-                        alloc_target_seq_tag_i[lane];
-                    issue_delay_q[allocation_id] <=
-                        alloc_delay_i[lane];
-                    issue_dep_required_q[allocation_id] <=
-                        alloc_dep_required_i[lane];
-                    issue_state_q[allocation_id] <=
-                        (!alloc_dep_required_i[lane]
-                         || dep_status_available_i[lane])
-                        ? ISSUE_READY : ISSUE_WAIT_DEP;
+    always_ff @(posedge clk_i) begin : issue_entry_metadata
+        for (int entry = 0; entry < ISSUE_DEPTH; entry++) begin
+            if (alloc_entry_write_en[entry]) begin
+                issue_seq_tag_q[entry] <= alloc_entry_seq_tag[entry];
+                issue_delay_q[entry] <= alloc_entry_delay[entry];
+                issue_dep_required_q[entry] <=
+                    alloc_entry_dep_required[entry];
+            end
+        end
+
+        for (int lane = 0; lane < N; lane++) begin
+            if (dep_status_valid_q[lane]) begin
+                rob_id_t consumer_id;
+
+                consumer_id =
+                    dep_status_consumer_seq_tag_q[lane][ROB_ID_W-1:0];
+                if (issue_seq_tag_q[consumer_id]
+                    == dep_status_consumer_seq_tag_q[lane]) begin
+                    issue_target_seq_tag_q[consumer_id] <=
+                        dep_status_target_seq_tag_q[lane];
                 end
             end
         end
@@ -385,7 +504,8 @@ module ppe_issue_table (
                     selected_id = select_entry_id[fe];
                     selected_seq_tag_q[fe] <= select_seq_tag[fe];
                     selected_target_seq_tag_q[fe] <=
-                        issue_target_seq_tag_q[selected_id];
+                        issue_dep_required_q[selected_id]
+                        ? issue_target_seq_tag_q[selected_id] : '0;
                     selected_delay_q[fe] <= issue_delay_q[selected_id];
                     selected_dep_required_q[fe] <=
                         issue_dep_required_q[selected_id];

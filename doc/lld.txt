@@ -68,16 +68,16 @@ packed array表达；不为固定lane展开独立编号端口。状态数组只�
   |                | registered FIFO head                                    |
   |                v                                                         |
   |  +---------------------------+                                           |
-  |  | D0 Allocation             |<---------------- internal alloc_ready      |
-  |  | - valid rank / dense seq  |---- alloc metadata -------------------+---|--+
-  |  | - target tag/state init   |                                           |  |
+  |  | D0A Reservation           |<------------ internal reserve_ready       |
+  |  | - valid rank / dense seq  |                                           |
+  |  | - registered commit data  |---- D0B alloc metadata --------------+---|--+
   |  +-------------+-------------+                                           |  |
   |                | registered issue entry                                 |  |
   |                v                                                         |  |
   |  +---------------------------+       +-------------------------------+   |  |
   |  | Issue Table [0..31]       |       | Sequence / Control State      |   |  |
   |  | - narrow metadata         |       | - next_seq_tag                |   |  |
-  |  | - target seq tag          |       | - fe_rr_ptr                    |   |  |
+  |  | - target seq tag          |       | - FE fairness pointer          |   |  |
   |  | - state/candidate member  |       +-------------------------------+   |  |
   |  +------+--------------------+                                           |  |
   |         |                                                                |  |
@@ -85,7 +85,7 @@ packed array表达；不为固定lane展开独立编号端口。状态数组只�
   |         v                                                                |  |
   |  +---------------------------+       +-------------------------------+      |
   |  | Dependency Event Control  |<----->| Backend Status / Gather       |      |
-  |  | - D0 status init          |       | active ROB / history          |      |
+  |  | - D0C status init         |       | active ROB / history          |      |
   |  | - completion wakeup       |<--- completion seq_tag events ---------------+
   |  | - WAIT_DEP                |       | completion / retire bypass    |      |
   |  +-------------+-------------+
@@ -104,14 +104,14 @@ packed array表达；不为固定lane展开独立编号端口。状态数组只�
   |  | D3 Operand Read / FE Issue                                      |
   |  | - read selected packet from ROB                                 |
   |  | - four-level authoritative dependency gather ---------+          |
-  |  | - packet/dependency to FE routing                      |          |
+  |  | - packet/dependency routing to FE                       |          |
   |  +-------------------------+-------------------------------|----------+
   |                            |                               |
   |                            | Flow D-C：FE派发              |
   |                            v                               |
   |  +-------------------------------------------------------------------+
   |  | Per-FE State                                                    |
-  |  | launch register / 6-entry relative future table and tags        |
+  |  | launch register / 7-entry relative future table and tags        |
   |  +-------------------------------------------------------------------+
   +-----------------------------+--------------------------------------------+
                                 |
@@ -128,7 +128,7 @@ packed array表达；不为固定lane展开独立编号端口。状态数组只�
 2.2 Backend内部架构图
 
                          From ppe_ingress
-                 alloc_req_valid / seq_tag
+              reserve_valid / registered commit bundle
                                   |
                                   | Flow R-A：ROB分配
                                   v
@@ -136,7 +136,7 @@ packed array表达；不为固定lane展开独立编号端口。状态数组只�
   |                                backend                                     |
   |                                                                            |
   |  +--------------------------+                                              |
-  |  | A0 Allocation Manager    |---- occupancy update                         |
+  |  | A0 Reservation/Commit    |---- occupancy update                         |
   |  +-------------+------------+                                              |
   |                | metadata writes                                           |
   |                v                                                           |
@@ -175,36 +175,39 @@ packed array表达；不为固定lane展开独立编号端口。状态数组只�
   |                                          +-----------------------------+   |
   |                                                                            |
   |  +--------------------------+                                              |
-  |  | Allocation Capacity      |<--- occupancy / retire_count / alloc request |
+  |  | Allocation Capacity      |<--- occupancy / retire_count / reserve request|
   |  +-------------+------------+                                              |
-  |                | internal alloc_ready                                      |
+  |                | internal reserve_ready                                    |
   +----------------+-----------------------------------------------------------+
 
   Backend内部四条通路：
 
-    A0：输入分配ROB entry；
+    A0：预留容量并在下一周期提交ROB entry；
     W0：接收最多4路FE乱序完成结果；
-    G0：为D0提供available状态并为D3提供最多4路权威依赖数据；
+    G0：为D0C提供available状态并为D3提供最多4路权威依赖数据；
     R0：从ROB head保序退休、更新retired history并产生寄存器输出。
 
 2.3 典型无依赖报文数据流
 
   1) I0在bkps允许时把外部输入捕获到两项elastic FIFO的寄存tail槽位；
-  2) D0在内部alloc_ready有效时为FIFO head分配seq，Issue Table和A0从seq低位索引
-     本地entry，并将无依赖报文标记为ISSUE_READY；
-  3) D2A0组合形成4项shortlist，D2A1选择报文和目标FE并捕获grant；
-  4) D2B写相对未来返回表并锁定Issue Table entry；
-  5) D3从ROB读取原始packet并向FE发出请求，issue entry释放；
-  6) FE返回，W0按完整seq tag低位写ROB并设置result_valid；
-  7) 报文到达ROB head且DONE后，R0将数据装入输出寄存器；
-  8) 同一退休沿更新对应retired history bank并释放ROB entry。
+  2) D0A在内部reservation ready有效时为FIFO head分配seq并寄存commit bundle，
+     同沿ROB提前占用对应容量；
+  3) D0B把保证提交的bundle写入ROB entry，并由Issue Table将无依赖报文标记为
+     ISSUE_READY；
+  4) D2A0组合形成4项shortlist，D2A1选择报文和目标FE并捕获grant；
+  5) D2B写相对未来返回表并锁定Issue Table entry；
+  6) D3从ROB读取原始packet并向FE发出请求，issue entry释放；
+  7) FE返回，W0按完整seq tag低位写ROB并设置result_valid；
+  8) 报文到达ROB head且DONE后，R0将数据装入输出寄存器；
+  9) 同一退休沿更新对应retired history bank并释放ROB entry。
 
 2.4 典型依赖等待数据流
 
-  1) I0捕获依赖报文到elastic FIFO，D0从寄存head分配seq并预计算完整target seq tag，
-     target ROB/history索引由tag低位导出；
-  2) D0通过G0查询active ROB/history小位宽状态，并检查同周期completion/retirement
-     bypass；ready时进入ISSUE_READY，否则进入ISSUE_WAIT_DEP；
+  1) I0捕获依赖报文到elastic FIFO，D0A从寄存head分配seq、预计算完整target seq tag
+     并取得ROB容量reservation；
+  2) D0B提交ROB/Issue Table allocation，写ISSUE_WAIT_DEP并寄存状态探针；
+     D0C通过G0查询active ROB/history小位宽
+     状态及completion/retirement bypass，available时转ISSUE_READY，否则继续等待；
   3) 目标FE返回时，W0写active ROB并以完整tag唤醒ISSUE_WAIT_DEP entry；
   4) 被唤醒报文最早下一周期进入READY并由D2A选择；
   5) D3通过G0按四级优先级gather权威依赖数据并向FE派发；
@@ -285,13 +288,24 @@ Ingress保存两项整批elastic FIFO：
 Ingress维护：
 
   next_seq_tag[5:0]
+  alloc_commit_valid[N]
+  alloc_commit_seq_tag[N][5:0]
+  alloc_commit_target_seq_tag[N][5:0]
+  alloc_commit_delay[N][1:0]
+  alloc_commit_dep_required[N]
+  alloc_commit_slot
 
 外部in_valid/in_packet/in_desc只允许作为slot_wr_ptr所选槽位寄存器的D输入，不得作为
 槽位写使能，也不得进入FIFO控制、rank、descriptor decode、ROB容量或bkps next-state
 组合逻辑。槽位写使能只由bkps_q和slot_wr_ptr生成。空批只根据head槽位的寄存
 lane-valid识别。FIFO head的寄存lane valid、
 packet和desc是D0功能处理的唯一输入。宽packet/desc数组在对应slot无效时不要求复位。
-next_seq_tag按2^SEQ_W回绕。不保存独立residue计数器或entry字段。
+next_seq_tag按2^SEQ_W回绕。不保存独立residue计数器或entry字段。commit bundle不复制
+128 bit packet，只保存被reservation的FIFO槽位号；D0B提交沿读取该槽的沿前旧packet。
+即使同沿外部capture复用该槽，非阻塞更新也保证ROB捕获旧packet。
+两个slot各自并行形成窄rank、count、seq、target、delay和dep_required预览，
+slot_rd_ptr只选择最终head metadata。FIFO非空时commit metadata寄存器允许预览当前
+head；只有alloc_commit_valid表示该预览已经取得reservation并可由D0B提交。
 
 3.3 Ready Queue and Arbitration State
 
@@ -326,9 +340,8 @@ candidate_way_rr_ptr执行固定2选1；每bank最多贡献一个shortlist项。
 为每个FE保存一组D2A1 pending grant：
 
   grant_valid
-  grant_seq_tag[5:0]
-  grant_candidate_id[2:0]
-  grant_delay[1:0]
+  grant_candidate_onehot[7:0]
+  grant_pending_block[2:0]
 
 Issue table为每个FE保存一组D2B到D3 selected-metadata流水寄存器：
 
@@ -341,17 +354,19 @@ ppe_fe_scheduler保存每FE相对返回表：
   future_seq_tag[FE_NUM][0..5][5:0]
 
 grant寄存器是D2A到D2B的控制流水；selected-metadata寄存器是D2B到D3的控制流水。
-D2B将寄存的grant_candidate_id解码为grant_candidate_onehot送回Issue Table，Issue Table从对应有效候选槽取得完整tag，
-再从tag低位临时派生issue entry索引。候选槽one-hot不得作为报文身份用于ROB或依赖查询。
-D3在每个周期消费当前valid issue bundle
-并通过G0读取权威依赖数据。合法选择不可撤销，依赖bundle的权威data_valid必须成立；
+D2B将寄存的grant_candidate_onehot直接送回Issue Table，Issue Table从对应有效候选槽
+取得完整tag，再从tag低位临时派生issue entry索引。候选槽one-hot不得作为报文身份
+用于ROB或依赖查询。
+D3在每个周期消费当前valid issue bundle并通过G0读取权威依赖数据，直接形成
+FE operand bundle。合法选择不可撤销，source和所需依赖读取必须命中；
 D2B允许在D3消费当前bundle的同一上升沿为该FE写入下一selected tag，不因当前bundle
 存在而产生隔周期气泡。
 
 沿前future slot0表示本上升沿返回，slot1..5表示随后1..5个上升沿。每个非复位沿先
 消费slot0并向低位移位；本沿D2B提交的grant在沿后写slot[delay+1]。D2A1检查新grant时，
-delay 0..2分别检查沿前future slot3..5，并把当前pending grant的slot[delay+2]作为
-虚拟占用；delay 3目标超出沿前已存在预约最远一沿，天然为空。只有valid位参与空闲
+delay 0..2分别检查沿前future slot3..5。当前grant比新grant早一沿，
+其delay 1/2/3分别与新请求delay 0/1/2冲突；delay 3目标超出沿前正式预约最远位置。
+只有valid位参与空闲
 判断，seq_tag在valid=0时不要求清零。返回时ROB写地址从完整tag低位临时派生。
 
 3.5 FE Arbitration State
@@ -360,12 +375,14 @@ delay 0..2分别检查沿前future slot3..5，并把当前pending grant的slot[d
   fe_rr_ptr[1:0]
 
 每个candidate_way_rr_ptr指向对应bank下一周期优先观察的本地way，并且每周期翻转；
-fe_rr_ptr指向下一次归一化FE lane零对应的物理FE，存在任意成功分配后推进一位。
+fe_rr_ptr指向下一周期候选0的首选FE，并且每周期推进一位；因此公平状态不依赖
+D2A当周期legal或accept组合结果。
 
-若D2A在cycle n捕获grant，D2B在cycle n+1提交select和返回预约，所选请求将在
-cycle n+2由D3送入FE。delay=d的目标返回沿为cycle n+d+3。D2A在cycle n沿前检查
-future slot[d+3]；同周期尚未写入future表的grant_q位于概念slot[delay+2]，必须
-一并检查。D2B沿后把grant_q写入slot[delay+1]，
+若D2A在cycle n捕获grant，D2B在cycle n+1提交select和返回预约，
+cycle n+2由D3读取operand并送入FE。
+delay=d的目标返回沿为cycle n+d+3。D2A在cycle n沿前检查future slot[d+3]；
+同周期尚未写入future表的grant必须按相对周期一并检查。
+D2B沿后把grant写入slot[delay+1]，
 其后每沿移位，恰在目标返回沿前位于slot0。
 
 3.6 Dependency Control State
@@ -402,20 +419,24 @@ fe_out_data同时作为最终输出数据和依赖结果，不保存两份128 bi
 比较语义等价，禁止只比较ROB ID。
 Active dependency读取仍支持每周期最多4路任意ROB ID；同周期最多4路writeback ID互异，
 但允许落入相同result bank，因此每个entry必须保留独立写使能，不能引入bank冲突停顿。
-Allocation packet先按rob_id低2位捕获到4组A1 bank-local寄存器。密集allocation tag保证
+Allocation commit packet先按rob_id低2位捕获到4组A1 bank-local寄存器。密集allocation tag保证
 同一批次每个bank最多命中一次；A1下一沿按row写统一data阵列。A1只延迟宽packet写入，
-valid、seq_tag和result_valid仍在A0 allocation沿更新。
+valid、seq_tag和result_valid仍在D0B commit沿更新。D0A reservation不搬移packet；
+D0B从commit bundle保存的FIFO槽位读取沿前旧packet并捕获bank-local row/data。
 
 4.2 ROB Global State
 
   head_ptr[4:0]
   occupancy[5:0]
 
-  free_count = ROB_DEPTH - occupancy
+  occupancy_after_retire = occupancy - pending_retire_count
 
 head_ptr按32自然回绕。Allocation物理索引由alloc_seq_tag低位直接产生，不保存tail_ptr。
-occupancy范围为0..32。Allocation只使用沿前free_count，不组合借用本周期retire_count；
-退休释放的credit在下一周期由更新后的occupancy反映。
+occupancy范围为0..32，并包含最多一项已经reservation但尚未commit的batch。Allocation
+不组合借用本周期retire_count，只借用沿前已经寄存且本沿必提交的pending_retire_count；
+退休scan不进入容量路径。固定4-lane实现直接把16种alloc_reserve_valid向量译码为0..4
+常量增量，并与对应容量阈值比较，不串接
+popcount、通用容量比较和第二次可变增量加法。
 
 4.3 Retired History Bank
 
@@ -453,38 +474,33 @@ Top外部lane端口直接使用packed array：
   in_desc_i[N][4:0]
   bkps_o
 
-5.1 Ingress -> ROB/Issue Table：Registered-Head Allocation
+5.1 Ingress -> ROB/Issue Table：Reservation and Registered Commit
 
-Ingress对FIFO寄存head保持原始lane索引，不对128 bit packet做物理压缩。送往ROB的
-request接口为：
+Ingress对FIFO寄存head保持原始lane索引，不对128 bit packet做物理压缩。D0A送往ROB的
+容量reservation接口为：
 
-  alloc_req_valid_o[N]
+  alloc_reserve_valid_o[N]
+  alloc_reserve_ready_i
+
+alloc_reserve_valid是FIFO head保存的lane-valid向量，不受ready门控；backend据此统计
+请求批次大小并组合返回alloc_reserve_ready。reservation接受条件为：
+
+  reserve_fire = alloc_reserve_valid & {N{alloc_reserve_ready}}
+
+D0A接受reservation时，ROB立即把reserve_count计入occupancy，ingress弹出FIFO head、
+推进next_seq_tag并寄存一项commit bundle。D0B commit不再携带ready或接受反馈：
+
+  alloc_commit_valid_o[N]
   alloc_seq_tag_o[N][SEQ_W-1:0]
   alloc_packet_o[N][127:0]
-  alloc_ready_i
-
-alloc_req_valid是FIFO head保存的lane-valid向量，不受alloc_ready门控；backend据此统计
-寄存请求批次大小并组合返回alloc_ready。ROB内部定义：
-
-  alloc_fire = alloc_req_valid & {N{alloc_ready}}
-
-并只对alloc_fire更新entry metadata并捕获bank-local原始packet，不需要由ingress把
-accepted valid绕回ROB。原始packet在下一A1沿写入统一data阵列。送往Issue Table的
-accepted allocation接口为：
-
-  issue_alloc_valid_o[N]
-  alloc_seq_tag_o[N][SEQ_W-1:0]
   alloc_target_seq_tag_o[N][SEQ_W-1:0]
   alloc_delay_o[N][1:0]
   alloc_dep_required_o[N]
 
-其中：
-
-  issue_alloc_valid = alloc_req_valid & {N{alloc_ready}}
-
-Issue Table只接收issue_alloc_valid。Ingress在
-|alloc_req_valid && alloc_ready时弹出FIFO head并推进next_seq_tag。Issue table和backend
-分别从alloc_seq_tag低位派生本地entry索引。不存在allocation ROB ID请求/响应或独立residue接口。
+同一alloc_commit_valid同时送ROB和Issue Table。ROB以它写metadata并捕获bank-local
+原始packet，原始packet在下一A1沿写入统一data阵列；Issue Table以它初始化entry。
+commit bundle已经取得容量保证，禁止再次反压或部分提交。Issue Table和backend分别从
+alloc_seq_tag低位派生本地entry索引。不存在allocation ROB ID请求/响应或独立residue接口。
 完整desc不跨越ingress边界：desc[1:0]解码为alloc_delay，desc[4:2]是否非零解码为
 alloc_dep_required；实际依赖距离已经体现在alloc_target_seq_tag中。
 
@@ -501,36 +517,40 @@ seq tag密集分配，因此无需backend向issue table返回allocation ID或acc
 
 5.3 Issue Table <-> Backend：Dependency Resolve
 
-D0为最多N个新allocation发出小位宽状态请求：
+D0C为上一周期D0B提交的最多N个有依赖allocation发出小位宽状态请求：
 
   dep_status_valid[N]
   dep_status_target_seq_tag[N][SEQ_W-1:0]
   dep_status_available[N]
 
-D3为最多ISSUE_WIDTH个已选依赖报文发出数据请求：
+D3把Issue Table已有的完整issue bundle直接送入Backend：
 
-  dep_gather_valid[ISSUE_WIDTH]
-  dep_gather_target_seq_tag[ISSUE_WIDTH][SEQ_W-1:0]
-  dep_gather_data_valid[ISSUE_WIDTH]
-  dep_gather_data[ISSUE_WIDTH][127:0]
+  issue_valid[ISSUE_WIDTH]
+  issue_seq_tag[ISSUE_WIDTH][SEQ_W-1:0]
+  issue_delay[ISSUE_WIDTH][1:0]
+  issue_dep_required[ISSUE_WIDTH]
+  issue_target_seq_tag[ISSUE_WIDTH][SEQ_W-1:0]
+  issue_packet[ISSUE_WIDTH][127:0]
+  issue_dep_data[ISSUE_WIDTH][127:0]
 
 Backend组合解析每路请求，active ROB和history索引均由target seq tag低位内部派生，
-不跨模块传递target ROB ID或residue。D0只使用available；D3使用data_valid和data。
-正常状态下ISSUE_SELECTED且dep_required的D3查询必须data_valid，否则属于内部一致性错误，不通过
-fallback/replay恢复。
+不跨模块传递target ROB ID或residue。issue_seq_tag读取原始packet；
+issue_valid且issue_dep_required时，issue_target_seq_tag读取权威依赖结果。正常状态下
+两类读取必须命中。D3将packet、dependency、valid、delay和dep_required直接送入FE；
+该路径不设置ready、fallback或replay端口。
 
 请求无效时响应定义为：
 
   - dep_status_valid=0时，dep_status_available必须为0；
-  - dep_gather_valid=0时，dep_gather_data_valid必须为0；
-  - dep_gather_data_valid=0时，dep_gather_data不作功能要求，实现应赋0以抑制无意义切换。
+  - issue_valid=0时，issue_packet和issue_dep_data输出0；
+  - issue_valid=1且issue_dep_required=0时，issue_dep_data输出0。
 
 Issue Table直接管理请求资格、completion wakeup比较和D3响应语义适配，不设置中间
 dependency模块或额外流水边界。
 
 5.4 Issue Table <-> FE Scheduler
 
-ppe_issue_table接收D0 accepted allocation bundle：
+ppe_issue_table接收D0B guaranteed commit bundle：
 
   issue_alloc_valid[N]
   alloc_seq_tag[N][SEQ_W-1:0]
@@ -538,7 +558,7 @@ ppe_issue_table接收D0 accepted allocation bundle：
   alloc_delay[N][1:0]
   alloc_dep_required[N]
 
-Issue Table直接形成D0 status query并接收available：
+Issue Table在D0B沿捕获有依赖allocation的状态探针，在D0C形成status query并接收available：
 
   dep_status_valid[N]
   dep_status_target_seq_tag[N][SEQ_W-1:0]
@@ -573,20 +593,25 @@ ppe_fe_scheduler接口为：
   completion_valid[FE_NUM]
   completion_seq_tag[FE_NUM][SEQ_W-1:0]
 
-ppe_fe_scheduler先从每bank两项candidate中提取至多1项形成4项shortlist，再由静态4x4网络生成grant，
-不将legal matrix、RR起点或返回表暴露为端口。D2A1结果写入内部grant寄存器；D2B
-下一周期把寄存候选槽one-hot作为select原子输出给Issue Table，并把grant写入future表。
-不存在外部reserve握手或ready。模块内部保存candidate_way_rr_ptr、fe_rr_ptr、grant、
+ppe_fe_scheduler先从每bank两项candidate中提取至多1项形成4项shortlist，再由静态4x4
+单轮匹配网络生成grant，不将legal matrix、RR起点或返回表暴露为端口。D2A1结果写入
+内部grant寄存器；grant直接保存per-FE候选槽one-hot，D2B将该寄存one-hot作为select
+原子输出给Issue Table，
+并把预约写入future表。不存在外部reserve握手或ready。模块内部保存
+candidate_way_rr_ptr、fe_rr_ptr、grant、
 future_valid和future_seq_tag，不保存shortlist、issue entry、READY队列、packet或
 dependency data。
 
 D2A0将槽bank和槽4+bank视为该bank的两个本地way，屏蔽grant占用槽后执行固定2选1。
+四路寄存grant one-hot按位OR形成占用屏蔽，不允许先编码为候选ID再动态解码。
 candidate_way_rr_ptr逐周期翻转本地way优先级；shortlist槽号固定等于bank号。
-不做8项compact、全宽旋转、动态数组索引或跨8项前缀rank。FE轮转起点仅在产生grant后推进。
-D2A1为每个shortlist候选使用错位FE起点并行提名；同一FE按shortlist顺序接受至多
-一个提名。全合法矩阵必须形成
-4项唯一配对。算法不承诺任意稀疏合法矩阵下的最大基数，但candidate和FE轮转不得形成
-永久饥饿。grant保存完整tag和delay供D2B返回预约，不把tag回送Issue Table。
+不做8项compact、全宽旋转、动态数组索引或跨8项前缀rank。D2A1按candidate编号为
+各候选设置错位FE优先级，每个候选并行提名首个legal FE；同一FE冲突时按candidate
+编号接受最前一项，未获接受的候选本周期不重匹配。全合法矩阵必须形成4项唯一配对。
+算法不承诺任意稀疏合法矩阵下的最大基数。grant保存候选槽one-hot以及下一批
+delay 0/1/2冲突的3-bit预译码；D2B按寄存one-hot从候选槽读取完整tag和真实delay
+供返回预约，不把tag回送Issue Table，也不在D2A复制tag或保存二进制delay。
+fe_rr_ptr每周期推进一位。
 
 select_valid[fe]=1表示上一周期D2A1已完成不可撤销匹配，且该沿对应FE返回槽预约成功。
 Issue table在该沿按select_candidate_onehot读取本地候选槽，将entry锁定为ISSUE_SELECTED
@@ -600,12 +625,13 @@ Issue table在该沿按select_candidate_onehot读取本地候选槽，将entry�
   issue_target_seq_tag[FE_NUM][SEQ_W-1:0]
 
 issue_valid=0时其余issue bundle字段输出0。合法选择在下一周期必然进入FE；Issue table
-在该FE接收沿自动将对应旧entry转为ISSUE_FREE，不需要外部再次回送物理ID或commit。
+在FE接收沿自动将对应旧entry转为ISSUE_FREE，不需要外部再次回送物理ID或commit。
 同一沿允许ppe_fe_scheduler为该FE锁存下一项选择，从而保持逐周期发射。接口没有ready。
 
-Issue Table仅对issue_valid且issue_dep_required的bundle形成ROB gather请求，同时以
-issue_valid和issue_seq_tag形成ROB source packet请求。合法source read和依赖issue的
-gather data_valid必须为1，但它们不参与issue_valid或entry释放条件。下游生成：
+Issue Table不再形成独立ROB gather请求；完整issue bundle直接送入ROB。ROB以
+issue_valid和issue_seq_tag读取source packet，并仅在issue_dep_required时使用
+issue_target_seq_tag读取依赖结果。合法bundle的两类读取必须命中，该不变量由验证侧
+检查，不设置功能data-valid、ready、fallback或replay端口。下游生成：
 
   fe_dep_valid = issue_valid && issue_dep_required
 
@@ -671,7 +697,7 @@ ppe_retire_output和四个FE
 的共享低有效复位。各子模块不得再次同步复位或产生独立释放时序。
 
 ================================================================================
-6. Ingress I0/D0：输入捕获、缓冲与分配
+6. Ingress I0/D0：输入捕获、容量预留与分配
 ================================================================================
 
 6.1 I0 Two-slot Elastic Input Capture
@@ -679,8 +705,8 @@ ppe_retire_output和四个FE
 在上升沿且bkps_q=0时，ingress将全部lane的in_valid、in_packet和in_desc无条件写入
 slot_wr_ptr选择的寄存槽位，同时推进写指针和占用计数。原始输入不参与任何其他状态
 更新。两项槽位本身构成有序FIFO，不存在capture到FIFO的第二次宽数据搬移。下一周期
-仅根据寄存head lane-valid判断：空批直接释放；非空批在alloc_ready时完成allocation
-并释放。tail capture与head release允许同沿发生。
+仅根据寄存head lane-valid判断：空批直接释放；非空批在alloc_reserve_ready时完成
+reservation、寄存commit bundle并释放。tail capture与head release允许同沿发生。
 
 6.2 D0 Registered-Head Rank
 
@@ -688,7 +714,7 @@ slot_wr_ptr选择的寄存槽位，同时推进写指针和占用计数。原始
 
   lane_rank[i] = elastic FIFO head中lane编号小于i且valid=1的lane数量
 
-固定N=4基线使用静态平衡网络，不以循环累加器形成串行依赖：
+固定N=4基线对两个slot分别使用静态平衡网络，不以循环累加器形成串行依赖：
 
   lower_pair_count = valid[0] + valid[1]
   upper_pair_count = valid[2] + valid[3]
@@ -698,14 +724,16 @@ slot_wr_ptr选择的寄存槽位，同时推进写指针和占用计数。原始
   lane_rank[3] = lower_pair_count + valid[2]
   head_packet_count = lower_pair_count + upper_pair_count
 
-对非空FIFO head：
+每个slot独立计算上述rank和packet_count；slot_rd_ptr只在这些窄结果之后选择
+非空FIFO head。对所选head：
 
-  seq_tag[i]        = next_seq_tag + lane_rank[i]
-  alloc_req_valid[i] = slot_lane_valid[slot_rd_ptr][i]
-  issue_alloc_valid[i] = alloc_req_valid[i] && alloc_ready
+  seq_tag[i]           = next_seq_tag + lane_rank[i]
+  alloc_reserve_valid[i] = slot_lane_valid[slot_rd_ptr][i]
+  reserve_fire[i]      = alloc_reserve_valid[i] && alloc_reserve_ready
 
-当alloc_ready=0或internal_rst_n=0时，所有issue_alloc_valid和ROB内部alloc_fire必须为0，
-Issue Table和ROB均不写新entry；FIFO head及next_seq_tag保持。
+当alloc_reserve_ready=0或internal_rst_n=0时，reserve_fire必须为0，FIFO head、
+next_seq_tag和commit bundle不得接受该请求。上一周期已经寄存的commit bundle不受
+当前ready影响，并在本沿无条件写ROB和Issue Table。
 
 seq_tag使用固定位宽自然回绕。Ingress不读取ROB指针，也不产生rob_id或residue输出；
 backend和issue table之间不存在ROB ID通路。
@@ -722,6 +750,11 @@ backend和issue table之间不存在ROB ID通路。
 
   target_seq_tag = seq_tag - K mod 64
 
+固定N=4实现必须先以4 bit补码计算delta=lane_rank-K，再执行一次SEQ_W位
+next_seq_tag+sign_extend(delta)，避免seq加法与target减法形成两段SEQ_W宽串联算术。
+两个slot的窄seq/target算术并行展开，slot_rd_ptr只选择最终结果；该物理改写与上述
+模64语义等价。
+
 密集seq分配建立并必须保持以下不变量：
 
   rob_id         = seq_tag[4:0]
@@ -730,13 +763,34 @@ backend和issue table之间不存在ROB ID通路。
 
 ROB和history索引均由完整tag低位组合派生，不作为ingress输出或entry存储字段。
 
-6.5 D0 Allocation Update
+6.5 D0A Reservation / D0B Commit
 
-|alloc_req_valid && alloc_ready的内部allocation沿同时完成：
+|alloc_reserve_valid && alloc_reserve_ready的D0A reservation沿同时完成：
 
-  - Issue Table使用alloc_seq_tag低位和ingress metadata写entry；
-  - backend使用内部alloc_fire和alloc_seq_tag写ROB；
+  - backend把reserve_count计入occupancy，提前占用下一周期commit所需容量；
+  - ingress把当前head预览标记为有效commit，并保存原FIFO槽位号；
   - ingress释放elastic FIFO head并按有效lane数量推进next_seq_tag。
+
+FIFO非空时，ingress的commit metadata寄存器每沿预览当前head的seq_tag、
+target_seq_tag、delay和dep_required，不以alloc_reserve_ready作为写使能。
+alloc_commit_valid单独由reservation成功限定；因此未取得reservation的预览不得被
+ROB或Issue Table使用，且ROB ready不广播到各metadata寄存器CE。
+
+下一周期D0B无条件提交寄存bundle：
+
+  - backend写ROB metadata并捕获原FIFO槽位中的沿前旧packet；
+  - Issue Table使用alloc_seq_tag低位写metadata；无依赖entry写ISSUE_READY，
+    有依赖entry写ISSUE_WAIT_DEP并捕获窄依赖状态探针。
+
+再下一周期D0C使用Issue Table寄存探针查询依赖状态；available时将对应且完整tag仍
+匹配的ISSUE_WAIT_DEP entry转为ISSUE_READY。D0A、D0B和D0C可每周期处理相邻批次，
+不降低4-wide allocation吞吐；新增D0A/D0B边界使无依赖报文的最短调度延迟增加一拍。
+
+Issue Table物理写入先按alloc_seq_tag[1:0]把四路allocation静态路由到4个bank，再由
+每个bank的alloc_seq_tag[4:2]生成8-row one-hot write enable。密集seq分配保证每批
+每个bank至多命中一路，因此该网络没有仲裁语义；metadata与issue_state可以由关联但
+独立的时序过程拥有。依赖target_seq_tag复用D0B状态探针寄存器，并在D0C按consumer
+ROB ID写入entry。
 
 外部输入被I0捕获后至少经过一个寄存边界才能进行D0 allocation，不允许组合直通
 sequence allocation、ROB、Issue Table、FE或任何顶层输出。
@@ -745,15 +799,18 @@ sequence allocation、ROB、Issue Table、FE或任何顶层输出。
 7. Scheduler依赖初始化与事件唤醒
 ================================================================================
 
-7.1 D0 New Entry Initialization
+7.1 D0B Initialization / D0C Dependency Resolve
 
   dep_offset=0：dep_required <- 0, state <- ISSUE_READY
 
-  dep_offset!=0：向G0发送完整target_seq_tag。G0内部派生target ROB/history索引，并按
-  completion bypass、retirement bypass、active ROB和retired history顺序返回ready。
-  ready时dep_required <- 1, state <- ISSUE_READY；否则
-  dep_required <- 1, state <- ISSUE_WAIT_DEP。该组合状态查询不进入
-  bkps路径，不返回或复制128 bit依赖数据。
+  dep_offset!=0：D0B沿先执行dep_required <- 1, state <- ISSUE_WAIT_DEP，并寄存
+  consumer seq_tag和完整target_seq_tag。D0C向G0发送寄存target_seq_tag；G0内部派生
+  target ROB/history索引，并按completion bypass、retirement bypass、active ROB和
+  retired history顺序返回available。available且consumer完整tag仍匹配时，在D0C沿将
+  target_seq_tag写入entry并把state更新为ISSUE_READY；否则写入target_seq_tag并保持
+  ISSUE_WAIT_DEP。状态探针尚未提交target metadata的一拍禁止completion scan该consumer，
+  同周期completion由状态查询的completion bypass覆盖。该查询不进入bkps路径，不返回
+  或复制128 bit依赖数据。
 
 7.2 Reverse Waiter Wakeup
 
@@ -766,13 +823,13 @@ READY bank提名只读取沿前issue_state，不组合读取completion wake hit�
 
 7.3 Simultaneous Initialization and Completion
 
-D0初始化的completion bypass与ISSUE_WAIT_DEP wakeup使用相同的完整tag比较。本周期
-新分配entry若目标在同周期completion中命中，则沿后直接进入ISSUE_READY；该entry仍最早从
-下一周期参与D2A。若目标active ROB entry存在但result_valid=0且无completion bypass，
-G0必须返回not ready，禁止继续使用history。
+D0B新分配的依赖entry在本沿固定进入ISSUE_WAIT_DEP，不组合读取本周期completion。
+若目标同周期completion，下一周期D0C状态探针从active ROB取得available并将entry转为
+ISSUE_READY。若D0C查询时目标active ROB entry存在但result_valid=0且无completion
+bypass，G0必须返回not available，禁止继续使用history。
 
-Completion wakeup在issue_state边界终止，不组合进入候选提名。同周期completion bypass
-命中的新allocation直接进入ISSUE_READY。Allocation状态初始化具有最终优先权；完整tag
+Completion wakeup和D0C状态更新均在issue_state边界终止，不组合进入候选提名。
+D0B allocation状态初始化具有最终优先权；D0C保存consumer完整tag并在更新前复核，
 防止旧身份事件误唤醒。
 
 ================================================================================
@@ -782,7 +839,7 @@ Completion wakeup在issue_state边界终止，不组合进入候选提名。同�
 8.1 READY Discovery and Admission
 
 ISSUE_READY且candidate_present=0的entry可被发现。发现逻辑只使用沿前Issue Entry状态；
-D0新allocation和本周期completion wakeup均在本沿更新状态，最早下一周期参与发现。
+D0B新allocation和本周期completion wakeup均在本沿更新状态，最早下一周期参与发现。
 entry按ROB ID低2位进入4个交错bank，每bank从8个row中轮询提名至多1项。
 
 每bank候选槽固定为bank和4+bank。若至少一个槽沿前无效或本周期被D2B删除，则该bank
@@ -797,7 +854,8 @@ candidate_present屏蔽，不能被立即重新提名。ISSUE_WAIT_DEP不得进�
 D2A0先屏蔽grant仍占用的槽，再由每个bank的candidate_way_rr_ptr在两个way间执行
 固定2选1，形成最多4项shortlist。shortlist槽号固定等于bank号，同一bank每周期最多
 贡献一个候选。若优先way不可用则选择另一way；两者均不可用时该bank shortlist无效。
-完整tag和delay仅由本地2选1取得。shortlist不改变Issue Entry状态或
+候选身份以8-bit one-hot直接传入D2A1，完整tag和delay仅由本地2选1取得。
+shortlist不改变Issue Entry状态或
 candidate_present，未匹配项保持在原候选槽。
 
 8.3 D2A1 Legal Matrix and Fixed Match
@@ -809,21 +867,27 @@ shortlist候选c与FE f的合法条件为：
   delay=2: legal[c][f] = !future_valid[f][5]
   delay=3: legal[c][f] = 1
 
-以上future项还需与当前grant虚拟预约比较：grant delay 1/2/3分别占用新请求检查的
-slot 3/4/5。delay 3的新请求目标晚于所有沿前预约，不需要第7个future槽。
+以上future项还需与pending grant虚拟预约比较：D2A在grant产生时把delay 1/2/3
+分别预译码为阻塞新请求delay 0/1/2的三个位；下一周期legal matrix直接读取对应位。
+delay 3的新请求目标晚于所有沿前正式预约，不需要扩展future表。
 
-shortlist c从fe_rr_ptr+c开始按环形FE顺序提名第一个legal FE，使全合法矩阵自然分散
-到4个FE；同一FE冲突时按shortlist编号接受一个候选。不允许动态数组索引或跨候选
-greedy链。一个候选和一个FE在本周期均最多使用一次。存在grant
-时fe_rr_ptr推进一位。
+每个候选从fe_rr_ptr加candidate编号形成的错位起点开始，平行选择首个legal FE；
+同一FE冲突时按candidate编号接受最前一项。未获接受的候选不在本周期串行尝试其他FE。
+该固定单轮网络保证一个候选和一个FE均最多使用一次，全legal矩阵形成4项唯一配对。
+fe_rr_ptr逐周期推进，不由本周期legal或accept组合结果直接更新。
 
 8.4 FE Selection and Return Reservation
 
 一个FE每周期最多接收一个D2A1分配。D2A1成功后pending grant不可撤销；下一周期D2B：
 
   - Issue table保存该FE的selected valid和完整seq_tag；
-  - future table在本沿写入slot[delay+1]；
+  - scheduler按寄存候选槽one-hot读取沿前稳定candidate seq_tag和delay，future table
+    在本沿写入slot[delay+1]；
   - issue entry进入ISSUE_SELECTED。
+
+D2A grant不保存seq_tag或二进制delay。candidate槽在D2B沿后才删除或替换，因此
+scheduler和Issue Table在该沿使用同一寄存one-hot读取的均为被选择旧候选，禁止在
+D2A匹配路径复制tag。
 
 若某候选无法匹配任何FE，则保持ISSUE_READY并等待后续周期，不得因其他候选成功而丢失。
 一旦D2A1 pending grant写入，选择不可取消或rollback；ppe_fe_scheduler必须在产生grant前确认
@@ -850,10 +914,10 @@ D0状态初始化具有最终优先级。
   - dep_required=0时输出fe_dep_valid=0、fe_dep_data=0；
   - dep_required=1时向G0发送完整target_seq_tag；
   - G0按completion bypass、retirement bypass、active ROB、retired history顺序解析；
-  - 将packet、dependency和delay路由到目标FE；有依赖时gather data_valid必须为1；
+  - 将packet、dependency和delay路由到目标FE；合法issue的读取命中由验证侧检查；
   - 拉高对应FE的fe_in_valid一个周期。
 
-正常请求在FE接收沿：
+正常请求在D3 operand采样沿：
 
   - issue entry转为ISSUE_FREE；
   - 保留D2B已经写入的future预约；
@@ -861,20 +925,21 @@ D0状态初始化具有最终优先级。
 
 D3 source请求满足同周期有效seq_tag低2位互异，因为D2A每个READY bank最多选择一项。
 ROB先按低2位把最多4个请求分配到4个data bank，每个bank只执行一次8:1 row读取，再将
-结果按原FE编号路由回issue bundle。该共享不改变FE编号接口或source data_valid语义。
+结果按原FE编号路由回issue bundle。该共享不改变FE编号接口或source读取语义。
 依赖target不继承该互异约束，多个target仍可命中同一data bank的不同row。
 
-D3正常路径包含bank-local ROB source packet mux、最多4路active ROB/history 128 bit读取、两级bypass
-比较/选择和FE数据路由，是首版重点关注的宽数据路径。依赖entry进入ISSUE_SELECTED后，
+D3正常路径包含bank-local ROB source packet mux、最多4路active ROB/history 128 bit读取和两级bypass
+比较/选择；结果在同周期直接送FE。依赖entry进入ISSUE_SELECTED后，
 其目标结果不会失效：目标退休前由active ROB提供，退休沿由retirement bypass提供，
-退休后由history提供。若dep_gather_data_valid=0，属于内部一致性错误；验证侧必须报错，
-该情况属于验证必须捕获的内部一致性错误，设计不设置可综合rollback、fallback或replay状态。
+退休后由history提供。若合法issue无法取得source packet或所需dependency data，属于
+验证必须捕获的内部一致性错误，设计不设置功能valid端口或可综合rollback、fallback、
+replay状态。
 
 ================================================================================
 10. Backend A0/A1：ROB Allocation
 ================================================================================
 
-对于本周期每个内部alloc_fire：
+对于本周期每个alloc_commit_valid：
 
   alloc_rob_id = alloc_seq_tag[ROB_ID_W-1:0]
   rob[alloc_rob_id].valid          <- 1
@@ -889,13 +954,12 @@ D3正常路径包含bank-local ROB source packet mux、最多4路active ROB/hist
 A1在下一上升沿将各有效alloc_data_bank写入对应统一data槽。A0到最早D3之间已有
 D1、D2A和D2B边界，因此A1不增加报文发射延迟。W0随后以处理结果原址覆盖同一data槽并
 置result_valid。无效entry的
-数据内容不要求清零。alloc_fire只由ROB本地alloc_req_valid和alloc_ready生成，不设置
-alloc_valid输入端口。
+数据内容不要求清零。alloc_commit_valid来自上一周期已经接受的reservation，不设置
+ready或重放端口。occupancy只在reservation沿增加，commit沿不再次增加。
 
-D3 source读取使用issue_seq_tag低位索引。仅当ROB valid、完整tag匹配且result_valid=0时
-返回source_data_valid和原始packet；此条件区分原始packet与已经覆盖的结果，不允许把
-完成结果误作FE输入。物理比较使用低位索引隐含部分与entry保存的tag高位，语义仍为
-完整tag匹配。
+D3 source读取使用issue_seq_tag低位索引。ROB valid、完整tag匹配且result_valid=0是
+合法issue的不变量；该条件区分原始packet与已经覆盖的结果，不允许把完成结果误作FE
+输入。物理比较使用低位索引隐含部分与entry保存的tag高位，语义仍为完整tag匹配。
 
 ================================================================================
 11. Backend G0：依赖状态与数据解析
@@ -930,17 +994,19 @@ D3 source读取使用issue_seq_tag低位索引。仅当ROB valid、完整tag匹�
 
 11.2 Query Width
 
-D0每周期最多提交N路status query，只返回dep_status_available，不要求切换128 bit数据。
-D3每周期最多提交ISSUE_WIDTH路data query，每路返回dep_gather_data_valid和128 bit
-data。同一target被多路
+D0C每周期最多提交N路status query，只返回dep_status_available，不要求切换128 bit数据。
+D3每周期最多提交ISSUE_WIDTH路dependency data query，每路返回128 bit data。同一target被多路
 请求命中时允许共享一次读取并广播；实现也可描述为等价的独立组合读取。
 每个query的target ROB ID、history ID、active完整tag命中和history完整tag命中只生成
 一次中间结果，并由available/data选择共同使用。RTL不增加运行时跨query合并器；综合
 工具可对相同target请求共享组合读取，独立读取仍是周期语义等价的合法实现。
+每路D3 query对四个completion lane并行形成one-hot完整tag命中，128 bit bypass data
+使用两级平衡OR归并；之后按completion、active、history执行固定优先级选择。不得用
+source_resolved跨completion lane形成串行选择链。
 
 11.3 Cycle Boundary Rules
 
-Completion bypass可以使D0新entry或ISSUE_WAIT_DEP entry在W0写ROB的同一沿得到available状态，
+Completion bypass可以使D0C查询的entry或ISSUE_WAIT_DEP entry在W0写ROB的同一沿得到available状态，
 但该entry最早下一周期参加D2A，不允许同沿completion-to-FE直通。Retirement bypass
 读取沿前旧ROB数据，并优先于沿后可能复用同一ROB ID的新allocation。上升沿后，目标
 改由已更新history命中。该规则不依赖存储体未定义的read-during-write行为。
@@ -995,7 +1061,7 @@ history。事件携带valid、完整seq_tag和128 bit data；本地ROB ID从tag�
   wb_seq_tag = future_seq_tag[fe_id][0]
 
 该沿消费slot0并将future表向低位移位。合法协议下fe_out_valid必须与slot0 valid相等。
-FE返回、D3发射、D2B select和下一批D2A1 grant捕获允许同沿发生；D2B新预约写入沿后
+FE返回、D3发射、D2B select和下一批D2A1 match捕获允许同沿发生；D2B新预约写入沿后
 slot1..4，不会与本周期slot0消费冲突。
 
 ================================================================================
@@ -1004,16 +1070,26 @@ slot1..4，不会与本周期slot0消费冲突。
 
 13.1 Consecutive DONE Scan
 
-从head_ptr开始检查最多4项：
+从逻辑head开始检查最多4项：
 
-  done0 = rob[head+0].valid && rob[head+0].result_valid
-  done1 = done0 && rob[head+1].valid && rob[head+1].result_valid
-  done2 = done1 && rob[head+2].valid && rob[head+2].result_valid
-  done3 = done2 && rob[head+3].valid && rob[head+3].result_valid
+  raw_done0 = rob[head+0].valid && rob[head+0].result_valid
+  raw_done1 = rob[head+1].valid && rob[head+1].result_valid
+  raw_done2 = rob[head+2].valid && rob[head+2].result_valid
+  raw_done3 = rob[head+3].valid && rob[head+3].result_valid
 
-  retire_count = done0 + done1 + done2 + done3
+  retire_valid = {
+      raw_done0,
+      raw_done0 && raw_done1,
+      raw_done0 && raw_done1 && raw_done2,
+      raw_done0 && raw_done1 && raw_done2 && raw_done3
+  }
 
-所有ROB索引按32自然回绕。
+  retire_count = decode_dense_prefix(retire_valid)
+
+所有ROB索引按32自然回绕。物理head状态保存为head_bank和四个bank_row_cursor；
+逻辑head ROB ID等价于{bank_row_cursor[head_bank], head_bank}。每个bank直接从其
+寄存cursor选择一项DONE，再按head_bank固定旋转为上述逻辑顺序。retire_count只译码
+0000、0001、0011、0111、1111五种合法编码，不使用逐项累加。
 
 13.2 ROB Logical Retirement Bundle
 
@@ -1025,22 +1101,31 @@ ppe_rob输出按报文序排列的逻辑退休bundle：
 retire_valid从slot 0开始连续有效，不得留洞；slot j对应head+j的沿前ROB结果。
 该bundle为组合退休事件，供ppe_retire_output在同一上升沿捕获，不使用ready或反压。
 
-固定4-bank result实现对物理bank b读取：
-
-  row[b] = head_ptr[4:2] + (b < head_ptr[1:0])
-
-3 bit row加法自然按8回绕。这样四个bank各执行一次8:1选择，得到连续退休窗口中的四个
-数据，再由head_ptr[1:0]控制的rotate-by-1/rotate-by-2固定网络恢复slot 0..3逻辑顺序。
-Metadata DONE scan仍按head+j检查，数据置换不得改变dense-prefix valid。
+固定4-bank result实现由每个bank直接使用bank_row_cursor[b]执行一次8:1选择，得到
+连续退休窗口中的四个数据，再由head_bank控制的rotate-by-1/rotate-by-2固定网络恢复
+slot 0..3逻辑顺序。bank cursor等价于原先由完整head动态计算的row，但不在读取前串联
+比较和加法。每个bank的物理ROB ID直接取{bank_row_cursor[b], b}，tag_hi按同一cursor
+执行bank-local 8:1读取；ROB ID、tag_hi和DONE复用相同固定旋转，不执行head+j和32:1
+tag选择。数据置换不得改变dense-prefix valid。
 
 13.3 Retirement Register Update
 
-退休沿在ppe_rob内同时执行：
+R0退休识别沿在ppe_rob内执行：
 
-  - 对每个退休报文写history[rob_seq_tag[2:0]]，保存完整seq_tag和result_data；
-  - 清除对应ROB valid/result_valid；
-  - head_ptr推进retire_count；
-  - occupancy减retire_count并合并同周期allocation数量。
+  - head_bank按retire_count模4推进；
+  - 将本周期退休的逻辑valid反向旋转为physical-bank advance，每个命中bank的
+    bank_row_cursor加一；
+  - 将retire valid、tag、data和count写入pending-retire寄存器；
+  - occupancy合并同周期allocation数量和上一周期pending retire count。
+
+下一沿提交pending-retire：
+
+  - 对每个退休报文写history[rob_seq_tag[2:0]]；
+  - 清除对应ROB valid/result_valid。
+
+Pending期间旧active entry保持有效；提交沿前由active提供依赖，沿后由history提供，
+因此内部所有权延后但available语义无空窗。head_bank和bank_row_cursor的组合状态
+与原5 bit自然回绕head_ptr严格等价，不生成ROB_DEPTH比较/减法路径。
 
 同一退休沿在ppe_retire_output内同时执行：
 
@@ -1070,22 +1155,23 @@ W0在本周期刚写回的entry不参与同周期R0退休，最早下一周期�
 14. 全局反压
 ================================================================================
 
-Backend只对FIFO寄存head计算内部allocation ready：
+Backend只对FIFO寄存head计算内部allocation reservation ready：
 
-  request_count   = popcount(alloc_req_valid[3:0])
-  free_count      = ROB_DEPTH - occupancy
-  alloc_ready     = (request_count != 0) && (free_count >= request_count)
+  occupancy_after_retire = occupancy - pending_retire_count
+  reserve_count           = decode16(alloc_reserve_valid[3:0])
+  alloc_reserve_ready     = reserve_count != 0
+                            && occupancy_after_retire <= ROB_DEPTH-reserve_count
 
-free_count使用本周期沿前注册状态，当前retirement prefix释放的空间从下一周期开始可用。
-这避免retirement scan进入allocation ready和metadata写路径。ROB首次从满载状态释放时
-可能保守停顿一次；此后只要退休持续提供credit，retire与allocate仍可每周期并行。
+容量计算只借用已寄存且本沿必提交的pending-retire credit，避免当前retirement scan
+进入reservation ready路径。接受reservation的同一沿把reserve_count计入occupancy；
+下一周期commit因此不重新检查容量。实现按16种请求向量静态展开上述关系。
 
 Ingress以两项elastic FIFO吸收寄存反压延迟。定义：
 
   capture_batch   = !bkps_q
-  head_nonempty   = |alloc_req_valid
-  allocation_batch = (slot_count != 0) && head_nonempty && alloc_ready
-  head_release    = (slot_count != 0) && (!head_nonempty || alloc_ready)
+  head_nonempty   = |alloc_reserve_valid
+  reserve_batch   = (slot_count != 0) && head_nonempty && alloc_reserve_ready
+  head_release    = (slot_count != 0) && (!head_nonempty || alloc_reserve_ready)
 
 沿后占用按capture与head release统一更新：
 
@@ -1111,7 +1197,7 @@ capture_batch时翻转。不得用动态bank索引形成覆盖全部宽存储的
 让原始lane-valid参与bank写使能。
 
 复位期间bkps_q置1，slot_count和读写指针清零。复位释放后bkps只能在时钟沿拉低。
-原始in_valid不得参与alloc_ready、bkps_d或任何其他功能组合逻辑。
+原始in_valid不得参与alloc_reserve_ready、bkps_d或任何其他功能组合逻辑。
 
 ROB_DEPTH=32且issue table以seq_tag低位索引。ROB entry能够退休意味着对应issue entry
 此前已经派发并释放，因此backend释放的物理槽在同沿也可由相同低位的新allocation复用。
@@ -1125,7 +1211,8 @@ A0、G0、W0和R0允许同周期作用于不同entry。W0不写history；R0是hi
 
 必须满足：
 
-  - 新allocation entry允许与本周期退休entry重叠，且仅能复用退休前缀释放的entry；
+  - 新reservation允许借用本沿提交的pending-retire credit；对应allocation commit
+    在下一沿写入已经保证可用的entry；
   - 重叠entry的退休输出、retirement bypass和history写入读取沿前旧内容，allocation
     对沿后ROB valid、seq_tag和result_valid具有最终优先权；
   - allocation原始packet由A0按bank捕获并在A1提交；A1目标entry在正常流水下不可能
@@ -1133,13 +1220,14 @@ A0、G0、W0和R0允许同周期作用于不同entry。W0不写history；R0是hi
   - 新writeback entry不在同周期退休；
   - 已DONE退休entry不再次收到writeback；
   - 同周期4路writeback ID互不相同；
-  - 同周期allocation和retirement数量统一合并更新occupancy；
+  - 同周期reservation和pending retirement数量统一合并更新occupancy；commit不再次
+    修改occupancy；
   - ROB valid、result_valid、head和occupancy只有ppe_rob一个时序状态所有者；
   - start_lane和out_valid/out_packet只有ppe_retire_output一个时序状态所有者。
 
 必须按统一next-state计算：
 
-  occupancy_next = occupancy + alloc_count - retire_count
+  occupancy_next = occupancy - pending_retire_count + accepted_reserve_count
 
 valid/result_valid数组在同一个时序always block中按writeback、retire、allocation
 顺序更新，使同址allocation最后赋值。退休数据选择仍由沿前数组组合产生，不受同沿
@@ -1191,7 +1279,7 @@ HLD和LLD，不属于首版RTL编码时的自由选择。
   1) 同一issue entry不得被重复选择或重复派发。
   2) selected entry、FE launch和future预约必须成对建立。
   3) 有效future槽的seq_tag在返回前不得被覆盖。
-  4) 依赖未满足时不得被select；ISSUE_SELECTED依赖entry的权威gather必须data_valid。
+  4) 依赖未满足时不得被select；ISSUE_SELECTED entry的source和所需依赖读取必须命中。
   5) 依赖查询必须完整匹配seq_tag。
   6) FE返回只设置active ROB result并形成completion事件，不直接写retired history。
   7) Active ROB tag命中但result_valid=0时必须等待，禁止继续查询history。

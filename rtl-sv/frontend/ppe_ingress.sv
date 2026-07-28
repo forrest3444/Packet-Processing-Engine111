@@ -13,10 +13,10 @@
 //   descriptor decode, sequence assignment, and backpressure use registered
 //   state exclusively.
 //
-//   The registered FIFO head requests one whole-batch ROB allocation. Empty
-//   batches are recognized only after capture and are released without an
-//   allocation. Bank-local conditional updates expose common clock-enable
-//   behavior without instantiating gated clocks.
+//   The registered FIFO head first reserves whole-batch ROB capacity. Accepted
+//   metadata is captured in a narrow commit register and is written to the ROB
+//   and issue table on the following cycle. Empty batches are recognized only
+//   after capture and are released without a reservation.
 //
 // Governing documents:
 //   - doc/ppe_feature_description.txt, Sections 2.3 and 4
@@ -37,12 +37,12 @@ module ppe_ingress #(
 
     output logic                                      bkps_o,
 
-    output logic [ppe_types_pkg::N-1:0]               alloc_req_valid_o,
+    output logic [ppe_types_pkg::N-1:0]               alloc_reserve_valid_o,
+    input  logic                                      alloc_reserve_ready_i,
+
+    output logic [ppe_types_pkg::N-1:0]               alloc_commit_valid_o,
     output logic [ppe_types_pkg::N-1:0]
                  [ppe_types_pkg::SEQ_W-1:0]           alloc_seq_tag_o,
-    input  logic                                      alloc_ready_i,
-
-    output logic [ppe_types_pkg::N-1:0]               issue_alloc_valid_o,
     output logic [ppe_types_pkg::N-1:0]
                  [ppe_types_pkg::SEQ_W-1:0]           alloc_target_seq_tag_o,
     output logic [ppe_types_pkg::N-1:0][PACKET_W-1:0] alloc_packet_o,
@@ -60,9 +60,10 @@ module ppe_ingress #(
     localparam int SLOT_DEPTH   = 2;
     localparam int SLOT_COUNT_W = $clog2(SLOT_DEPTH + 1);
     localparam int LANE_COUNT_W = $clog2(N + 1);
+    localparam int DEP_OFFSET_W = DESC_W - DELAY_W;
+    localparam int DELTA_W      = DEP_OFFSET_W + 1;
     localparam int DEP_MSB      = DESC_W - 1;
     localparam int DEP_LSB      = DELAY_W;
-
     logic [SLOT_DEPTH-1:0][N-1:0]               slot_lane_valid_q;
     logic [SLOT_DEPTH-1:0][N-1:0][PACKET_W-1:0] slot_packet_q;
     logic [SLOT_DEPTH-1:0][N-1:0][DESC_W-1:0]   slot_desc_q;
@@ -80,30 +81,80 @@ module ppe_ingress #(
     logic                      slot_bank1_write;
     logic                      head_nonempty;
     logic                      head_release;
-    logic                      allocation_batch;
+    logic                      reserve_batch;
 
-    logic [LANE_COUNT_W-1:0]   lower_pair_count;
-    logic [LANE_COUNT_W-1:0]   upper_pair_count;
+    logic [SLOT_DEPTH-1:0][LANE_COUNT_W-1:0]
+                               slot_lower_pair_count;
+    logic [SLOT_DEPTH-1:0][LANE_COUNT_W-1:0]
+                               slot_upper_pair_count;
+    logic [SLOT_DEPTH-1:0][LANE_COUNT_W-1:0]
+                               slot_packet_count;
+    logic [SLOT_DEPTH-1:0][N-1:0][LANE_COUNT_W-1:0]
+                               slot_lane_rank;
+    logic [SLOT_DEPTH-1:0][N-1:0][DELTA_W-1:0]
+                               slot_target_delta;
+    logic [SLOT_DEPTH-1:0][N-1:0][SEQ_W-1:0]
+                               slot_seq_tag;
+    logic [SLOT_DEPTH-1:0][N-1:0][SEQ_W-1:0]
+                               slot_target_seq_tag;
+    logic [SLOT_DEPTH-1:0][N-1:0][DELAY_W-1:0]
+                               slot_delay;
+    logic [SLOT_DEPTH-1:0][N-1:0]
+                               slot_dep_required;
+
+    logic [N-1:0]              head_lane_valid;
     logic [LANE_COUNT_W-1:0]   head_packet_count;
-    logic [N-1:0][LANE_COUNT_W-1:0] lane_rank;
+    logic [N-1:0][SEQ_W-1:0]   head_seq_tag;
+    logic [N-1:0][SEQ_W-1:0]   head_target_seq_tag;
+    logic [N-1:0][DELAY_W-1:0] head_delay;
+    logic [N-1:0]              head_dep_required;
+
+    logic [N-1:0]              alloc_commit_valid_q;
+    logic [N-1:0][SEQ_W-1:0]   alloc_commit_seq_tag_q;
+    logic [N-1:0][SEQ_W-1:0]   alloc_commit_target_seq_tag_q;
+    logic [N-1:0][DELAY_W-1:0] alloc_commit_delay_q;
+    logic [N-1:0]              alloc_commit_dep_required_q;
+    logic                      alloc_commit_slot_q;
 
     //--------------------------------------------------------------------------
     // Registered head, elastic transfer, and registered backpressure
     //--------------------------------------------------------------------------
 
-    always_comb begin : slot_head_request
-        alloc_req_valid_o = '0;
+    always_comb begin : slot_head_select
+        head_lane_valid       = '0;
+        head_packet_count     = '0;
+        head_seq_tag          = '0;
+        head_target_seq_tag   = '0;
+        head_delay            = '0;
+        head_dep_required     = '0;
+
         if (slot_count_q != '0) begin
-            alloc_req_valid_o = slot_lane_valid_q[slot_rd_ptr_q];
+            if (slot_rd_ptr_q) begin
+                head_lane_valid     = slot_lane_valid_q[1];
+                head_packet_count   = slot_packet_count[1];
+                head_seq_tag        = slot_seq_tag[1];
+                head_target_seq_tag = slot_target_seq_tag[1];
+                head_delay          = slot_delay[1];
+                head_dep_required   = slot_dep_required[1];
+            end else begin
+                head_lane_valid     = slot_lane_valid_q[0];
+                head_packet_count   = slot_packet_count[0];
+                head_seq_tag        = slot_seq_tag[0];
+                head_target_seq_tag = slot_target_seq_tag[0];
+                head_delay          = slot_delay[0];
+                head_dep_required   = slot_dep_required[0];
+            end
         end
+
+        alloc_reserve_valid_o = head_lane_valid;
     end
 
-    assign head_nonempty = |alloc_req_valid_o;
-    assign allocation_batch = (slot_count_q != '0)
-                              && head_nonempty
-                              && alloc_ready_i;
+    assign head_nonempty = |alloc_reserve_valid_o;
+    assign reserve_batch = (slot_count_q != '0)
+                           && head_nonempty
+                           && alloc_reserve_ready_i;
     assign head_release = (slot_count_q != '0)
-                          && (!head_nonempty || alloc_ready_i);
+                          && (!head_nonempty || alloc_reserve_ready_i);
 
     // An open registered interface captures one whole batch regardless of its
     // raw lane-valid pattern. Empty batches are recognized only after capture.
@@ -130,52 +181,81 @@ module ppe_ingress #(
     assign bkps_o = bkps_q;
 
     //--------------------------------------------------------------------------
-    // Registered-head rank, sequence, and descriptor decode
+    // Per-slot rank, sequence, and descriptor decode
     //--------------------------------------------------------------------------
 
-    always_comb begin : allocation_metadata_decode
-        lane_rank              = '0;
-        alloc_seq_tag_o        = '0;
-        alloc_target_seq_tag_o = '0;
-        alloc_packet_o         = '0;
-        alloc_delay_o          = '0;
-        alloc_dep_required_o   = '0;
+    always_comb begin : per_slot_metadata_decode
+        slot_lower_pair_count = '0;
+        slot_upper_pair_count = '0;
+        slot_packet_count     = '0;
+        slot_lane_rank        = '0;
+        slot_target_delta     = '0;
+        slot_seq_tag          = '0;
+        slot_target_seq_tag   = '0;
+        slot_delay            = '0;
+        slot_dep_required     = '0;
 
-        lower_pair_count = LANE_COUNT_W'(alloc_req_valid_o[0])
-                           + LANE_COUNT_W'(alloc_req_valid_o[1]);
-        upper_pair_count = LANE_COUNT_W'(alloc_req_valid_o[2])
-                           + LANE_COUNT_W'(alloc_req_valid_o[3]);
+        for (int slot_idx = 0;
+             slot_idx < SLOT_DEPTH;
+             slot_idx++) begin
+            slot_lower_pair_count[slot_idx] =
+                LANE_COUNT_W'(slot_lane_valid_q[slot_idx][0])
+                + LANE_COUNT_W'(slot_lane_valid_q[slot_idx][1]);
+            slot_upper_pair_count[slot_idx] =
+                LANE_COUNT_W'(slot_lane_valid_q[slot_idx][2])
+                + LANE_COUNT_W'(slot_lane_valid_q[slot_idx][3]);
 
-        lane_rank[0] = '0;
-        lane_rank[1] = LANE_COUNT_W'(alloc_req_valid_o[0]);
-        lane_rank[2] = lower_pair_count;
-        lane_rank[3] = lower_pair_count
-                       + LANE_COUNT_W'(alloc_req_valid_o[2]);
-        head_packet_count = lower_pair_count + upper_pair_count;
+            slot_lane_rank[slot_idx][0] = '0;
+            slot_lane_rank[slot_idx][1] =
+                LANE_COUNT_W'(slot_lane_valid_q[slot_idx][0]);
+            slot_lane_rank[slot_idx][2] =
+                slot_lower_pair_count[slot_idx];
+            slot_lane_rank[slot_idx][3] =
+                slot_lower_pair_count[slot_idx]
+                + LANE_COUNT_W'(slot_lane_valid_q[slot_idx][2]);
+            slot_packet_count[slot_idx] =
+                slot_lower_pair_count[slot_idx]
+                + slot_upper_pair_count[slot_idx];
 
-        for (int lane_idx = 0; lane_idx < N; lane_idx++) begin
-            if (alloc_req_valid_o[lane_idx]) begin
-                alloc_seq_tag_o[lane_idx] =
-                    next_seq_tag_q + SEQ_W'(lane_rank[lane_idx]);
-                alloc_packet_o[lane_idx] =
-                    slot_packet_q[slot_rd_ptr_q][lane_idx];
-                alloc_delay_o[lane_idx] =
-                    slot_desc_q[slot_rd_ptr_q][lane_idx][DELAY_W-1:0];
+            for (int lane_idx = 0; lane_idx < N; lane_idx++) begin
+                if (slot_lane_valid_q[slot_idx][lane_idx]) begin
+                    slot_seq_tag[slot_idx][lane_idx] =
+                        next_seq_tag_q
+                        + SEQ_W'(slot_lane_rank[slot_idx][lane_idx]);
+                    slot_delay[slot_idx][lane_idx] =
+                        slot_desc_q[slot_idx][lane_idx][DELAY_W-1:0];
 
-                if (slot_desc_q[slot_rd_ptr_q][lane_idx][DEP_MSB:DEP_LSB]
-                    != '0) begin
-                    alloc_dep_required_o[lane_idx] = 1'b1;
-                    alloc_target_seq_tag_o[lane_idx] =
-                        alloc_seq_tag_o[lane_idx]
-                        - SEQ_W'(slot_desc_q[slot_rd_ptr_q][lane_idx]
-                                 [DEP_MSB:DEP_LSB]);
+                    if (slot_desc_q[slot_idx][lane_idx]
+                        [DEP_MSB:DEP_LSB] != '0) begin
+                        slot_dep_required[slot_idx][lane_idx] = 1'b1;
+                        slot_target_delta[slot_idx][lane_idx] =
+                            DELTA_W'(slot_lane_rank[slot_idx][lane_idx])
+                            - DELTA_W'(slot_desc_q[slot_idx][lane_idx]
+                                      [DEP_MSB:DEP_LSB]);
+                        slot_target_seq_tag[slot_idx][lane_idx] =
+                            next_seq_tag_q
+                            + {{(SEQ_W-DELTA_W){
+                                   slot_target_delta[slot_idx][lane_idx]
+                                                    [DELTA_W-1]}},
+                               slot_target_delta[slot_idx][lane_idx]};
+                    end
                 end
             end
         end
     end
 
-    assign issue_alloc_valid_o =
-        alloc_req_valid_o & {N{allocation_batch}};
+    always_comb begin : allocation_commit_outputs
+        alloc_commit_valid_o      = alloc_commit_valid_q;
+        alloc_seq_tag_o           = alloc_commit_seq_tag_q;
+        alloc_target_seq_tag_o    = alloc_commit_target_seq_tag_q;
+        alloc_delay_o             = alloc_commit_delay_q;
+        alloc_dep_required_o      = alloc_commit_dep_required_q;
+        alloc_packet_o            = '0;
+
+        if (|alloc_commit_valid_q) begin
+            alloc_packet_o = slot_packet_q[alloc_commit_slot_q];
+        end
+    end
 
     //--------------------------------------------------------------------------
     // Slot, sequence, and backpressure state update
@@ -217,8 +297,25 @@ module ppe_ingress #(
     always_ff @(posedge clk_i or negedge rst_ni) begin : sequence_state_update
         if (!rst_ni) begin
             next_seq_tag_q <= '0;
-        end else if (allocation_batch) begin
+        end else if (reserve_batch) begin
             next_seq_tag_q <= next_seq_tag_q + SEQ_W'(head_packet_count);
+        end
+    end
+
+    always_ff @(posedge clk_i or negedge rst_ni) begin : allocation_commit_state
+        if (!rst_ni) begin
+            alloc_commit_valid_q <= '0;
+        end else begin
+            alloc_commit_valid_q <=
+                alloc_reserve_valid_o & {N{reserve_batch}};
+
+            if (slot_count_q != '0) begin
+                alloc_commit_seq_tag_q        <= head_seq_tag;
+                alloc_commit_target_seq_tag_q <= head_target_seq_tag;
+                alloc_commit_delay_q          <= head_delay;
+                alloc_commit_dep_required_q   <= head_dep_required;
+                alloc_commit_slot_q           <= slot_rd_ptr_q;
+            end
         end
     end
 

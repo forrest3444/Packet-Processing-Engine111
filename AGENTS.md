@@ -56,10 +56,6 @@ Functional correctness is a hard gate. After correctness, use this qualitative o
 
 ## RTL coding requirements
 
-- RTL MUST use synthesizable Verilog-2001 in `.v` files. Do not use SystemVerilog syntax or RTL constructs.
-- SystemVerilog remains allowed in the UVM testbench and verification-only `.sv` files.
-- Do not use RTL `logic`, `always_comb`, `always_ff`, `always_latch`, `typedef`, `enum`, `struct`, `interface`, packages, assertions embedded in RTL, unpacked array ports, or other SystemVerilog-only features.
-- Express conceptual array interfaces as explicitly named Verilog-2001 ports or internally packed vectors. Use `generate` constructs only in Verilog-2001-compatible form.
 - Use nonblocking assignments for sequential state and complete assignments/defaults in combinational logic.
 - Give each state element one clear owning sequential process.
 - Avoid inferred latches, combinational loops, `casex`, simulation delays, and unsynthesizable constructs in RTL.
