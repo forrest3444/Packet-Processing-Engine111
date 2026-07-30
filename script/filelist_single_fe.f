@@ -1,5 +1,5 @@
 +define+PPE_SV_ARCH
--f rtl-sv/filelist_single_fe.f
+-f rtl/filelist_single_fe.f
 
 +incdir+tb/tb
 +incdir+tb/env

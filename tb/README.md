@@ -53,7 +53,7 @@ characterization:
 ./script/run_regression.sh all
 ```
 
-The script defaults to the maintained `rtl-sv` DUT, performs one lint and one
+The script defaults to the maintained `rtl` DUT, performs one lint and one
 elaboration per invocation, and reuses that image for all selected tests. Set
 `DUT=legacy` to run the retained Verilog baseline.
 
@@ -65,7 +65,7 @@ in `performance_metrics.log`.
 
 ## SystemVerilog DUT with the shared UVM environment
 
-The new `rtl-sv` implementation uses a separate UVM top and filelist while
+The new `rtl` implementation uses a separate UVM top and filelist while
 reusing the existing interface, agents, sequences, scoreboard, and tests. The
 legacy `tb_top` is unchanged.
 
@@ -84,7 +84,7 @@ make run FILELIST=./script/filelist_sv.f TB_TOP=tb_top_sv BUILD_NAME=sv \
 
 ## Registered top-level boundary verification
 
-The `rtl-sv` implementation must add checks for the registered external-interface
+The `rtl` implementation must add checks for the registered external-interface
 contract before it replaces the current bring-up RTL:
 
 - raw input changes must not affect allocation, scheduling, or any top-level

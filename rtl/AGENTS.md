@@ -1,4 +1,10 @@
-# RTL Design Guidelines
+# Verilog-2001 RTL Design Guidelines
+
+## Scope
+
+These rules apply to the maintained four-FE RTL. The single-FE baseline remains
+SystemVerilog until it is migrated as a separate task; it shares only the
+Verilog configuration header with the maintained RTL.
 
 ## File Organization
 
@@ -7,7 +13,7 @@ Use a fixed module skeleton for shared definitions, then organize the implementa
 Recommended order:
 
 1. Module parameters
-2. Ports, grouped by interface
+2. ANSI-style ports, grouped by interface
 3. Local parameters and type definitions
 4. Functional domains
 5. Verification hooks, if any
@@ -30,19 +36,22 @@ Within each functional domain, keep related declarations, combinational logic, n
 
 - Use `parameter` only for externally configurable values.
 - Use `localparam` for internal derived constants.
-- Place design-wide shared types and constants in a package.
+- Place design-wide shared constants in one guarded `.vh` configuration header.
+- Keep port directions and widths in the ANSI module interface. Do not repeat
+  port declarations inside the module body.
+- Do not use SystemVerilog packages, typedefs, enums, structs, or casts.
 - Keep module-specific implementation details local to the module.
 
 ## Signal Ownership
 
 - Each signal must have exactly one driver.
-- Each register must be updated in exactly one `always_ff` block.
+- Each register must be updated in exactly one sequential `always` block.
 - Group registers that belong to the same function and share the same reset and enable conditions.
-- Avoid one large `always_ff` block containing unrelated state.
+- Avoid one large sequential `always` block containing unrelated state.
 
 ## Combinational Logic
 
-- Use `always_comb`.
+- Use `always @*`.
 - Assign default values before conditional logic.
 - Ensure every output is assigned on all paths.
 - Avoid inferred latches and combinational loops.
@@ -50,7 +59,7 @@ Within each functional domain, keep related declarations, combinational logic, n
 
 ## Sequential Logic
 
-- Use `always_ff`.
+- Use `always @(posedge clk...)` for sequential logic.
 - Use nonblocking assignments only.
 - Reset control state and valid bits as required.
 - Do not reset large datapath arrays unless functionally necessary.
@@ -58,12 +67,13 @@ Within each functional domain, keep related declarations, combinational logic, n
 
 ## State Machines
 
-- Define states with `typedef enum`.
+- Define states with explicitly sized `localparam` constants.
 - State encoding is a microarchitecture decision and must follow the design
   specification. Use one-hot encoding only when required or justified by
   implementation evidence; do not change encoding for style alone.
-- Use three-process style: next-state logic, state register, and output logic.
-- Default `state_d` to `state_q` at the top of `always_comb`.
+- Use three-process style when an FSM warrants it: next-state logic, state
+  register, and output logic.
+- Default `state_d` to `state_q` at the top of `always @*`.
 - Always include a `default` branch that returns to a safe state.
 
 ## Naming
@@ -89,16 +99,20 @@ external protocol.
 
 ## Source Conventions
 
-- Begin synthesizable `.sv` files with ``timescale 1ns/1ps`` and
+- Begin synthesizable `.v` files with ``timescale 1ns/1ps`` and
   ``default_nettype none``; restore ``default_nettype wire`` at end of file.
 - Use a concise file header stating the file, block, responsibility, and
   governing design references when applicable.
-- Express repeated channels as packed arrays instead of numbered ports.
-- Keep shared dimensions and types in a package; derive private widths with
-  `localparam`.
-- Use `int` only for static loop indices. Synthesized counters, pointers,
-  addresses, and arithmetic temporaries require explicitly sized types.
-- Give every `always_comb` and `always_ff` block a functional label.
+- Express repeated channels as flat vectors. Slice `k` occupies
+  `[k*WIDTH +: WIDTH]`, so logical index zero is always the least-significant
+  slice.
+- Keep shared dimensions in the guarded configuration header; derive private
+  widths with `localparam integer`.
+- Use block-local `integer` declarations only for static loop indices.
+  Synthesized counters, pointers, addresses, and arithmetic temporaries require
+  explicitly sized `reg` declarations.
+- Use `wire` for nets and `reg` for procedural assignments. Do not use `logic`.
+- Give every combinational and sequential `always` block a functional label.
 
 ## Reset, Clock Enables, and Verification
 

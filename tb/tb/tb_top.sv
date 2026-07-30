@@ -47,7 +47,7 @@ module tb_top;
         .out_packet3 (pif.out_packet3)
     );
 
-    fe_mock #(
+    FE_MOCK #(
         .PACKET_W (PACKET_W)
     ) u_fe_probe (
         .clk           (clk),

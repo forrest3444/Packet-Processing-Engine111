@@ -9,23 +9,17 @@ DUT        ?= sv
 ifeq ($(DUT),sv)
 DUT_TB_TOP       := tb_top_sv
 DUT_FILELIST     := ./script/filelist_sv.f
-DUT_RTL_FILELIST := ./rtl-sv/filelist.f
-DUT_RTL_TOP      := ppe_top_sv
-DUT_RTL_LANGUAGE := 1800-2017
+DUT_RTL_FILELIST := ./rtl/filelist.f
+DUT_RTL_TOP      := PPE_TOP_SV
+DUT_RTL_LANGUAGE := 1364-2001
 else ifeq ($(DUT),single_fe)
 DUT_TB_TOP       := tb_top_single_fe
 DUT_FILELIST     := ./script/filelist_single_fe.f
-DUT_RTL_FILELIST := ./rtl-sv/filelist_single_fe.f
+DUT_RTL_FILELIST := ./rtl/filelist_single_fe.f
 DUT_RTL_TOP      := ppe_single_fe_inorder
 DUT_RTL_LANGUAGE := 1800-2017
-else ifeq ($(DUT),legacy)
-DUT_TB_TOP       := tb_top
-DUT_FILELIST     := ./script/filelist.f
-DUT_RTL_FILELIST := ./script/rtl_filelist.f
-DUT_RTL_TOP      := ppe_top
-DUT_RTL_LANGUAGE := 1364-2001
 else
-$(error DUT must be 'sv', 'single_fe', or 'legacy')
+$(error DUT must be 'sv' or 'single_fe')
 endif
 
 TB_TOP     ?= $(DUT_TB_TOP)
@@ -76,6 +70,7 @@ VERILATOR_LINT_OPTS = --lint-only       \
                       --language $(DUT_RTL_LANGUAGE) \
                       --Wall            \
                       -Wno-fatal        \
+                      -Wno-DECLFILENAME \
                       --top-module $(RTL_TOP)
 
 ###############################################################################
@@ -151,7 +146,7 @@ help:
 	@echo "  make regress-performance Run P0-P6 and mixed-load performance characterization"
 	@echo "  make regress             Run functional and performance regressions"
 	@echo "Variables:"
-	@echo "  DUT=$(DUT) (sv, single_fe, or legacy)"
+	@echo "  DUT=$(DUT) (sv or single_fe)"
 	@echo "  VERILATOR=$(VERILATOR) RTL_FILELIST=$(RTL_FILELIST) RTL_TOP=$(RTL_TOP)"
 	@echo "  TESTNAME=$(TESTNAME) SEED=$(SEED) VERB=$(VERB) BUILD_NAME=$(BUILD_NAME) RUN_TAG=$(RUN_TAG)"
 	@echo "  REGRESS_BUILD_NAME=$(REGRESS_BUILD_NAME) REGRESS_FUNC_SEEDS='$(REGRESS_FUNC_SEEDS)' REGRESS_PERF_SEEDS='$(REGRESS_PERF_SEEDS)'"

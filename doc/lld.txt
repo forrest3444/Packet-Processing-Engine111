@@ -24,26 +24,25 @@ PPE Low-Level Design
   PACKET_W     = 128
   DESC_W       = 5
 
-新架构可综合RTL使用SystemVerilog。顶层外部报文端口和模块内部重复lane/FE通路均使用
-packed array表达；不为固定lane展开独立编号端口。状态数组只能由一个明确
-的always_ff进程拥有，纯组合选择器使用always_comb并提供完整默认赋值。
+新架构可综合RTL使用Verilog-2001。顶层外部报文端口和模块内部重复lane/FE通路均使用
+扁平向量表达；逻辑索引0固定对应最低位切片，不为固定lane展开独立编号端口。状态数组
+只能由一个明确的时序always进程拥有，纯组合选择器使用always @*并提供完整默认赋值。
 
 1.1 参数与类型组织
 
-  - ppe_types_pkg保存必须跨模块一致的基线配置、由其推导的公共位宽，以及rob_id_t、
-    seq_tag_t、delay_t等被多个模块使用的窄类型；package常量使用localparam，表示它们
-    不能在单个子模块例化处独立覆盖。
+  - ppe_config.vh保存必须跨模块一致的基线配置及公共位宽；配置使用带include guard的
+    宏定义，不能在单个子模块例化处独立覆盖。RTL不依赖SystemVerilog package或typedef。
   - ISSUE_DEPTH固定由ROB_DEPTH派生，ISSUE_WIDTH固定由FE_NUM派生，RESULT_BANKS固定由
     MAX_DEP+1派生；ROB_ID_W、SEQ_W和HISTORY_ID_W均由基础配置计算，不重复写数值。
   - CAND_WINDOW_DEPTH、RETURN_FUTURE_DEPTH和READY_ENQUEUE_WIDTH属于跨模块接口或
-    调度结构配置，在package中统一定义，例化处禁止使用裸常数覆盖。
+    调度结构配置，在ppe_config.vh中统一定义，例化处禁止使用裸常数覆盖。
   - PACKET_W和DESC_W直接影响可复用模块端口宽度，允许作为顶层及相关子模块参数；
     当前唯一受支持的系统基线仍为128和5，顶层负责一致传递。
-  - 只在单模块内部使用的FIFO深度、计数器宽度、指针加法宽度及私有typedef保留为
-    localparam或模块内类型，不提升到package。
-  - 仅用于展开循环的过程索引统一使用int；参与实际组合数据通路的计数、索引和临时
-    算术变量必须使用由配置推导的显式小位宽类型。所有always_comb/always_ff块使用描述
-    功能的显式标签；只有状态所有权可以清晰分离时才拆分always_ff，存在同址更新优先级
+  - 只在单模块内部使用的FIFO深度、计数器宽度和指针加法宽度保留为localparam，不提升
+    到共享头文件。
+  - 仅用于静态展开循环的过程索引使用integer；参与实际组合数据通路的计数、索引和临时
+    算术变量必须使用由配置推导的显式小位宽reg。所有always块使用描述功能的显式标签；
+    只有状态所有权可以清晰分离时才拆分时序always，存在同址更新优先级
     的状态数组必须继续由同一个进程拥有。
 
 ================================================================================
@@ -121,13 +120,13 @@ packed array表达；不为固定lane展开独立编号端口。状态数组只�
   Scheduler与backend之间的跨模块路径：
 
     a) ingress向backend申请ROB entry并发送seq metadata；
-    b) D0读取最多4路依赖available状态，D3读取最多4路权威依赖数据；
+    b) D0读取最多4路依赖available状态，候选进入时预取最多4路权威依赖数据；
     c) backend按completion、retirement、active ROB、history优先级响应；
     d) FE返回事件写active ROB，并以完整tag唤醒scheduler等待项。
 
 2.2 Backend内部架构图
 
-                         From ppe_ingress
+                         From PPE_INGRESS
               reserve_valid / registered commit bundle
                                   |
                                   | Flow R-A：ROB分配
@@ -184,7 +183,7 @@ packed array表达；不为固定lane展开独立编号端口。状态数组只�
 
     A0：预留容量并在下一周期提交ROB entry；
     W0：接收最多4路FE乱序完成结果；
-    G0：为D0C提供available状态并为D3提供最多4路权威依赖数据；
+    G0：为D0C提供available状态并为候选预取提供最多4路权威依赖数据；
     R0：从ROB head保序退休、更新retired history并产生寄存器输出。
 
 2.3 典型无依赖报文数据流
@@ -194,9 +193,9 @@ packed array表达；不为固定lane展开独立编号端口。状态数组只�
      同沿ROB提前占用对应容量；
   3) D0B把保证提交的bundle写入ROB entry，并由Issue Table将无依赖报文标记为
      ISSUE_READY；
-  4) D2A0组合形成4项shortlist，D2A1选择报文和目标FE并捕获grant；
-  5) D2B写相对未来返回表并锁定Issue Table entry；
-  6) D3从ROB读取原始packet并向FE发出请求，issue entry释放；
+  4) D1把READY报文写入候选槽并从ROB预取原始packet；
+  5) D2A0组合形成4项shortlist，D2A1选择报文和目标FE并捕获grant；
+  6) D2B写相对未来返回表并锁定Issue Table entry，D3以寄存operand向FE发出请求；
   7) FE返回，W0按完整seq tag低位写ROB并设置result_valid；
   8) 报文到达ROB head且DONE后，R0将数据装入输出寄存器；
   9) 同一退休沿更新对应retired history bank并释放ROB entry。
@@ -209,9 +208,10 @@ packed array表达；不为固定lane展开独立编号端口。状态数组只�
      D0C通过G0查询active ROB/history小位宽
      状态及completion/retirement bypass，available时转ISSUE_READY，否则继续等待；
   3) 目标FE返回时，W0写active ROB并以完整tag唤醒ISSUE_WAIT_DEP entry；
-  4) 被唤醒报文最早下一周期进入READY并由D2A选择；
-  5) D3通过G0按四级优先级gather权威依赖数据并向FE派发；
-  6) 目标退休前从active ROB读取，退休沿可由retirement bypass读取，退休后从history读取。
+  4) 被唤醒报文最早下一周期进入READY并写入候选槽；
+  5) 候选写入时通过G0按四级优先级预取权威依赖数据，随后由D2A选择并向FE派发；
+  6) 预取时目标退休前从active ROB读取，退休沿可由retirement bypass读取，
+     退休后从history读取。
 
 2.5 典型保序阻塞数据流
 
@@ -271,7 +271,8 @@ Issue table深度为32，以ROB ID作为entry索引，主要数据结构为：
 
 candidate_present作为独立于issue_entry_t的成员资格账本，表示对应READY entry已经
 存在于8项候选窗。未进入候选窗的READY entry直接保留在状态表中，后续周期继续发现。
-packet不在Issue Table保存；target ROB ID固定从target_seq_tag低位派生，不单独保存。
+packet和dependency不在32项Issue Entry保存；只在进入候选槽后预取并保存。
+target ROB ID固定从target_seq_tag低位派生，不单独保存。
 
 3.2 Ingress Input Buffer and Sequence State
 
@@ -313,7 +314,12 @@ Scheduler维护4组两项本地候选缓冲；匹配时每bank组合形成1项sh
 
   candidate_valid[0..7]
   candidate_seq_tag[0..7][5:0]
+  candidate_target_seq_tag[0..7][5:0]
   candidate_delay[0..7][1:0]
+  candidate_dep_required[0..7]
+  candidate_packet[0..7][127:0]
+  candidate_dep_data[0..7][127:0]
+  candidate_data_valid[0..7]
   candidate_present[ROB_DEPTH]
   ready_admit_row_rr_ptr[0..3][2:0]
   candidate_way_rr_ptr[0..3]
@@ -321,6 +327,8 @@ Scheduler维护4组两项本地候选缓冲；匹配时每bank组合形成1项sh
   shortlist_candidate_onehot[0..3][7:0]
   shortlist_seq_tag[0..3][5:0]
   shortlist_delay[0..3][1:0]
+  candidate_legal[0..7][3:0]
+  candidate_pending_block[0..7][2:0]
 
 entry按ROB ID低2位分为4个交错bank，每bank包含8个row和两个固定候选槽。
 候选槽bank对应way0，槽4+bank对应way1。每个bank仅在至少一个本地槽沿前无效或
@@ -334,7 +342,9 @@ Issue Table状态表中。candidate_present只覆盖8个本地候选槽；提名
 shortlist是D2A内部组合可见集合，不保存为状态，不改变Issue Entry状态或
 candidate_present。D2A0对每个bank的两个本地候选屏蔽pending grant，并按
 candidate_way_rr_ptr执行固定2选1；每bank最多贡献一个shortlist项。未匹配项仍保留
-在本地候选槽，candidate_way_rr_ptr每周期翻转以避免固定way队头长期阻塞。
+在本地候选槽，candidate_way_rr_ptr每周期翻转以避免固定way队头长期阻塞。两个way
+分别根据自身delay并行预译码FE legal vector和下一批3-bit冲突位，固定2选1只在末级
+选择已译码结果，不形成way delay mux到legal decode的串行路径。
 
 四个FE的相对未来返回表在模块内部扁平为24项，索引为{fe_id, slot[0..5]}。Scheduler
 为每个FE保存一组D2A1 pending grant：
@@ -343,22 +353,27 @@ candidate_way_rr_ptr执行固定2选1；每bank最多贡献一个shortlist项。
   grant_candidate_onehot[7:0]
   grant_pending_block[2:0]
 
-Issue table为每个FE保存一组D2B到D3 selected-metadata流水寄存器：
+候选槽保存D2B所需的完整窄metadata以及预取packet和dependency。Issue table为每个FE
+保存一组D2B到D3 selected-operand流水寄存器：
 
   selected_valid
   selected_seq_tag[5:0]
+  selected_delay[1:0]
+  selected_dep_required
+  selected_packet[127:0]
+  selected_dep_data[127:0]
 
 ppe_fe_scheduler保存每FE相对返回表：
 
   future_valid[FE_NUM][0..5]
   future_seq_tag[FE_NUM][0..5][5:0]
 
-grant寄存器是D2A到D2B的控制流水；selected-metadata寄存器是D2B到D3的控制流水。
+grant寄存器是D2A到D2B的控制流水；selected-operand寄存器是D2B到D3的数据流水。
 D2B将寄存的grant_candidate_onehot直接送回Issue Table，Issue Table从对应有效候选槽
-取得完整tag，再从tag低位临时派生issue entry索引。候选槽one-hot不得作为报文身份
-用于ROB或依赖查询。
-D3在每个周期消费当前valid issue bundle并通过G0读取权威依赖数据，直接形成
-FE operand bundle。合法选择不可撤销，source和所需依赖读取必须命中；
+直接取得seq tag、delay、dep_required和预取数据。seq tag低位只临时派生
+issue entry索引用于状态释放。候选槽one-hot不得作为报文身份用于ROB或依赖查询。
+D3在每个周期消费当前valid selected-operand bundle并直接形成FE operand bundle。
+合法选择不可撤销，候选预取的source和所需依赖必须命中；
 D2B允许在D3消费当前bundle的同一上升沿为该FE写入下一selected tag，不因当前bundle
 存在而产生隔周期气泡。
 
@@ -387,7 +402,7 @@ D2B沿后把grant写入slot[delay+1]，
 
 3.6 Dependency Control State
 
-Scheduler不保存非权威依赖数据副本，也不保存fallback或replay状态。Completion并行
+Scheduler不保存非权威依赖数据副本，也不保存依赖数据fallback或replay状态。Completion并行
 比较32项窄target tag；依赖满足由ISSUE_WAIT_DEP/ISSUE_READY唯一表达。128 bit结果始终
 由backend active ROB或retired history拥有。
 
@@ -463,11 +478,11 @@ valid和保存的seq_tag高3位，低3位由被访问bank隐含。二者合并�
 
 5.0 Top输入寄存边界与寄存反压
 
-ppe_top将原始顶层packed in_valid、in_packet和in_desc只连接到ppe_ingress输入
+ppe_top将原始顶层in_valid、in_packet和in_desc扁平向量只连接到ppe_ingress输入
 捕获端口。其他PPE子模块不得读取这些原始端口。ppe_ingress的bkps_o由bkps_q寄存器
 直接驱动，不得由FIFO占用、ROB状态、retire前缀或当前in_valid组合赋值。
 
-Top外部lane端口直接使用packed array：
+Top外部lane端口使用扁平向量，以下方括号表示逻辑维度：
 
   in_valid_i[N]
   in_packet_i[N][127:0]
@@ -523,29 +538,28 @@ D0C为上一周期D0B提交的最多N个有依赖allocation发出小位宽状态
   dep_status_target_seq_tag[N][SEQ_W-1:0]
   dep_status_available[N]
 
-D3把Issue Table已有的完整issue bundle直接送入Backend：
+候选槽写入时，Issue Table按bank形成寄存预取请求：
 
-  issue_valid[ISSUE_WIDTH]
-  issue_seq_tag[ISSUE_WIDTH][SEQ_W-1:0]
-  issue_delay[ISSUE_WIDTH][1:0]
-  issue_dep_required[ISSUE_WIDTH]
-  issue_target_seq_tag[ISSUE_WIDTH][SEQ_W-1:0]
-  issue_packet[ISSUE_WIDTH][127:0]
-  issue_dep_data[ISSUE_WIDTH][127:0]
+  prefetch_valid[FE_NUM]
+  prefetch_seq_tag[FE_NUM][SEQ_W-1:0]
+  prefetch_dep_required[FE_NUM]
+  prefetch_target_seq_tag[FE_NUM][SEQ_W-1:0]
+  prefetch_packet[FE_NUM][127:0]
+  prefetch_dep_data[FE_NUM][127:0]
 
-Backend组合解析每路请求，active ROB和history索引均由target seq tag低位内部派生，
-不跨模块传递target ROB ID或residue。issue_seq_tag读取原始packet；
-issue_valid且issue_dep_required时，issue_target_seq_tag读取权威依赖结果。正常状态下
-两类读取必须命中。D3将packet、dependency、valid、delay和dep_required直接送入FE；
+Backend组合解析每路寄存请求，active ROB和history索引均由target seq tag低位内部派生，
+不跨模块传递target ROB ID或residue。prefetch_seq_tag读取原始packet；
+prefetch_valid且prefetch_dep_required时，prefetch_target_seq_tag读取权威依赖结果。
+正常状态下两类读取必须命中。Issue Table在下一沿把响应写入请求对应的候选槽；
 该路径不设置ready、fallback或replay端口。
 
 请求无效时响应定义为：
 
   - dep_status_valid=0时，dep_status_available必须为0；
-  - issue_valid=0时，issue_packet和issue_dep_data输出0；
-  - issue_valid=1且issue_dep_required=0时，issue_dep_data输出0。
+  - prefetch_valid=0时，prefetch_packet和prefetch_dep_data不被采样；
+  - prefetch_valid=1且prefetch_dep_required=0时，prefetch_dep_data不被采样。
 
-Issue Table直接管理请求资格、completion wakeup比较和D3响应语义适配，不设置中间
+Issue Table直接管理请求资格、completion wakeup比较和预取响应语义适配，不设置中间
 dependency模块或额外流水边界。
 
 5.4 Issue Table <-> FE Scheduler
@@ -573,9 +587,8 @@ ppe_issue_table拥有READY发现、candidate_present和4组两项本地候选缓
   candidate_valid[CAND_WINDOW_DEPTH]
   candidate_seq_tag[CAND_WINDOW_DEPTH][SEQ_W-1:0]
   candidate_delay[CAND_WINDOW_DEPTH][1:0]
-
-首版CAND_WINDOW_DEPTH=8。每个candidate_valid对应的entry必须处于
-ISSUE_READY；ISSUE_FREE、ISSUE_WAIT_DEP和ISSUE_SELECTED entry禁止出现在候选窗口。
+首版CAND_WINDOW_DEPTH=8。每个candidate_valid对应的entry必须处于ISSUE_READY；
+ISSUE_FREE、ISSUE_WAIT_DEP和ISSUE_SELECTED entry禁止出现在候选窗口。
 候选接口不携带packet或target tag。
 
 ppe_fe_scheduler接口为：
@@ -593,8 +606,11 @@ ppe_fe_scheduler接口为：
   completion_valid[FE_NUM]
   completion_seq_tag[FE_NUM][SEQ_W-1:0]
 
+Verilog-2001实现将上述多维逻辑端口按最右维连续展平，低位切片对应索引0；
+展平只改变源代码表达，不改变接口位序、寄存边界或周期语义。
+
 ppe_fe_scheduler先从每bank两项candidate中提取至多1项形成4项shortlist，再由静态4x4
-单轮匹配网络生成grant，不将legal matrix、RR起点或返回表暴露为端口。D2A1结果写入
+单轮匹配网络生成grant。delay 3候选对所有FE合法，不检查返回槽冲突。D2A结果写入
 内部grant寄存器；grant直接保存per-FE候选槽one-hot，D2B将该寄存one-hot作为select
 原子输出给Issue Table，
 并把预约写入future表。不存在外部reserve握手或ready。模块内部保存
@@ -604,6 +620,8 @@ dependency data。
 
 D2A0将槽bank和槽4+bank视为该bank的两个本地way，屏蔽grant占用槽后执行固定2选1。
 四路寄存grant one-hot按位OR形成占用屏蔽，不允许先编码为候选ID再动态解码。
+每个候选槽并行根据candidate_delay生成4-bit FE legal vector和3-bit pending block；
+way选择后D2A1直接使用已译码结果，不再对shortlist delay重复译码。
 candidate_way_rr_ptr逐周期翻转本地way优先级；shortlist槽号固定等于bank号。
 不做8项compact、全宽旋转、动态数组索引或跨8项前缀rank。D2A1按candidate编号为
 各候选设置错位FE优先级，每个候选并行提名首个legal FE；同一FE冲突时按candidate
@@ -615,23 +633,22 @@ fe_rr_ptr每周期推进一位。
 
 select_valid[fe]=1表示上一周期D2A1已完成不可撤销匹配，且该沿对应FE返回槽预约成功。
 Issue table在该沿按select_candidate_onehot读取本地候选槽，将entry锁定为ISSUE_SELECTED
-并保存per-FE selected metadata；选择不得取消或rollback。下一
-周期直接形成按FE编号排列的D3 metadata bundle：
+并保存per-FE selected operand；选择不得取消或rollback。下一
+周期直接形成按FE编号排列的D3 bundle：
 
   issue_valid[FE_NUM]
-  issue_seq_tag[FE_NUM][SEQ_W-1:0]
+  issue_packet[FE_NUM][127:0]
   issue_delay[FE_NUM][1:0]
   issue_dep_required[FE_NUM]
-  issue_target_seq_tag[FE_NUM][SEQ_W-1:0]
+  issue_dep_data[FE_NUM][127:0]
 
 issue_valid=0时其余issue bundle字段输出0。合法选择在下一周期必然进入FE；Issue table
 在FE接收沿自动将对应旧entry转为ISSUE_FREE，不需要外部再次回送物理ID或commit。
 同一沿允许ppe_fe_scheduler为该FE锁存下一项选择，从而保持逐周期发射。接口没有ready。
 
-Issue Table不再形成独立ROB gather请求；完整issue bundle直接送入ROB。ROB以
-issue_valid和issue_seq_tag读取source packet，并仅在issue_dep_required时使用
-issue_target_seq_tag读取依赖结果。合法bundle的两类读取必须命中，该不变量由验证侧
-检查，不设置功能data-valid、ready、fallback或replay端口。下游生成：
+Issue Table在候选写入时形成寄存ROB预取请求；匹配和D3不再组合读取ROB。
+合法预取的两类读取必须命中，该不变量由验证侧检查，不设置功能data-valid、ready、
+fallback或replay端口。下游生成：
 
   fe_dep_valid = issue_valid && issue_dep_required
 
@@ -671,7 +688,7 @@ backend的数据接口为：
   wb_data0..3[127:0]
 
 其中wb_valid/wb_seq_tag直接使用对应completion事件，wb_data直接来自FE，不经过
-ppe_fe_scheduler。Backend内部以wb_seq_tag低ROB_ID_W位生成本地写地址。
+PPE_FE_SCHEDULER。Backend内部以wb_seq_tag低ROB_ID_W位生成本地写地址。
 
 5.7 ROB -> Retire Output -> Top
 
@@ -685,14 +702,14 @@ ppe_rob不输出物理lane编号或start_lane。ppe_retire_output不向ppe_rob�
 
 对外接口分别由对应状态所有者驱动：
 
-  ppe_ingress       -> bkps
-  ppe_retire_output -> out_valid[N]
-  ppe_retire_output -> out_packet[N][127:0]
+  PPE_INGRESS       -> bkps
+  PPE_RETIRE_OUTPUT -> out_valid[N]
+  PPE_RETIRE_OUTPUT -> out_packet[N][127:0]
 
 5.8 Top -> PPE子模块/FE：Internal Reset
 
 ppe_top使用外部rst_n实现唯一的两级复位同步器，生成internal_rst_n。
-internal_rst_n异步拉低、同步释放，并作为ingress、scheduler、ppe_rob、
+internal_rst_n异步拉低、同步释放，并作为ingress、scheduler、PPE_ROB、
 ppe_retire_output和四个FE
 的共享低有效复位。各子模块不得再次同步复位或产生独立释放时序。
 
@@ -782,8 +799,8 @@ ROB或Issue Table使用，且ROB ready不广播到各metadata寄存器CE。
   - Issue Table使用alloc_seq_tag低位写metadata；无依赖entry写ISSUE_READY，
     有依赖entry写ISSUE_WAIT_DEP并捕获窄依赖状态探针。
 
-再下一周期D0C使用Issue Table寄存探针查询依赖状态；available时将对应且完整tag仍
-匹配的ISSUE_WAIT_DEP entry转为ISSUE_READY。D0A、D0B和D0C可每周期处理相邻批次，
+再下一周期D0C使用Issue Table寄存探针查询依赖状态；响应以寄存consumer ROB ID直接
+定址对应ISSUE_WAIT_DEP entry，available时将其转为ISSUE_READY。D0A、D0B和D0C可每周期处理相邻批次，
 不降低4-wide allocation吞吐；新增D0A/D0B边界使无依赖报文的最短调度延迟增加一拍。
 
 Issue Table物理写入先按alloc_seq_tag[1:0]把四路allocation静态路由到4个bank，再由
@@ -804,13 +821,16 @@ sequence allocation、ROB、Issue Table、FE或任何顶层输出。
   dep_offset=0：dep_required <- 0, state <- ISSUE_READY
 
   dep_offset!=0：D0B沿先执行dep_required <- 1, state <- ISSUE_WAIT_DEP，并寄存
-  consumer seq_tag和完整target_seq_tag。D0C向G0发送寄存target_seq_tag；G0内部派生
+  consumer ROB ID和完整target_seq_tag。consumer ROB ID只作为模块内部D0C定址信息。
+  D0C向G0发送寄存target_seq_tag；G0内部派生
   target ROB/history索引，并按completion bypass、retirement bypass、active ROB和
-  retired history顺序返回available。available且consumer完整tag仍匹配时，在D0C沿将
+  retired history顺序返回available。D0C响应以寄存consumer ROB ID直接形成entry-local
+  写使能；available时，在D0C沿将
   target_seq_tag写入entry并把state更新为ISSUE_READY；否则写入target_seq_tag并保持
   ISSUE_WAIT_DEP。状态探针尚未提交target metadata的一拍禁止completion scan该consumer，
   同周期completion由状态查询的completion bypass覆盖。该查询不进入bkps路径，不返回
-  或复制128 bit依赖数据。
+  或复制128 bit依赖数据。D0B提交后到对应D0C响应前，该物理entry受状态所有权约束不得
+  释放或重新分配，因此无需再次执行consumer完整tag反查。
 
 7.2 Reverse Waiter Wakeup
 
@@ -829,8 +849,8 @@ ISSUE_READY。若D0C查询时目标active ROB entry存在但result_valid=0且无
 bypass，G0必须返回not available，禁止继续使用history。
 
 Completion wakeup和D0C状态更新均在issue_state边界终止，不组合进入候选提名。
-D0B allocation状态初始化具有最终优先权；D0C保存consumer完整tag并在更新前复核，
-防止旧身份事件误唤醒。
+D0B allocation状态初始化具有最终优先权；D0C使用前一周期D0B提交并寄存的consumer
+物理entry ID直接更新状态。
 
 ================================================================================
 8. Scheduler D2A/D2B：报文与FE仲裁及预约提交
@@ -843,7 +863,9 @@ D0B新allocation和本周期completion wakeup均在本沿更新状态，最早�
 entry按ROB ID低2位进入4个交错bank，每bank从8个row中轮询提名至多1项。
 
 每bank候选槽固定为bank和4+bank。若至少一个槽沿前无效或本周期被D2B删除，则该bank
-允许一次提名；优先写入被删除或无效的way0，否则写way1。提名entry在本沿置
+允许一次提名。每bank先形成固定8-bit READY向量，再由RR起点选择静态展开的旋转
+优先编码结果；不得使用动态数组扫描形成串行row选择链。优先写入被删除或无效的
+way0，否则写way1。提名entry在本沿置
 candidate_present。D2B删除和本地提名可以同沿发生，但被删除的旧entry仍由沿前
 candidate_present屏蔽，不能被立即重新提名。ISSUE_WAIT_DEP不得进入候选缓冲。
 候选接口只读取候选寄存器，不提供组合提名旁路。
@@ -880,7 +902,7 @@ fe_rr_ptr逐周期推进，不由本周期legal或accept组合结果直接更新
 
 一个FE每周期最多接收一个D2A1分配。D2A1成功后pending grant不可撤销；下一周期D2B：
 
-  - Issue table保存该FE的selected valid和完整seq_tag；
+  - Issue table直接从候选槽保存该FE的selected valid及完整窄metadata；
   - scheduler按寄存候选槽one-hot读取沿前稳定candidate seq_tag和delay，future table
     在本沿写入slot[delay+1]；
   - issue entry进入ISSUE_SELECTED。
@@ -909,12 +931,10 @@ D0状态初始化具有最终优先级。
 
 对每个issue_valid=1的FE：
 
-  - Issue table直接使用D2B沿寄存的seq tag、delay、dep_required和target seq tag；
-  - ROB以issue seq tag读取原始packet；该entry的result_valid此时必须为0；
+  - Issue table直接使用D2B沿寄存的packet、delay、dep_required和dependency；
   - dep_required=0时输出fe_dep_valid=0、fe_dep_data=0；
-  - dep_required=1时向G0发送完整target_seq_tag；
-  - G0按completion bypass、retirement bypass、active ROB、retired history顺序解析；
-  - 将packet、dependency和delay路由到目标FE；合法issue的读取命中由验证侧检查；
+  - dep_required=1时输出候选槽已经预取并保持的权威dependency；
+  - 将寄存packet、dependency和delay路由到目标FE；
   - 拉高对应FE的fe_in_valid一个周期。
 
 正常请求在D3 operand采样沿：
@@ -923,17 +943,15 @@ D0状态初始化具有最终优先级。
   - 保留D2B已经写入的future预约；
   - 当前selected tag被同周期D2B结果替换，若无新选择则清除selected_valid。
 
-D3 source请求满足同周期有效seq_tag低2位互异，因为D2A每个READY bank最多选择一项。
-ROB先按低2位把最多4个请求分配到4个data bank，每个bank只执行一次8:1 row读取，再将
-结果按原FE编号路由回issue bundle。该共享不改变FE编号接口或source读取语义。
+候选预取请求满足同周期有效seq_tag低2位互异，因为每个READY bank最多提名一项。
+ROB先按低2位把最多4个source请求分配到4个data bank，每个bank只执行一次8:1 row读取。
 依赖target不继承该互异约束，多个target仍可命中同一data bank的不同row。
 
-D3正常路径包含bank-local ROB source packet mux、最多4路active ROB/history 128 bit读取和两级bypass
-比较/选择；结果在同周期直接送FE。依赖entry进入ISSUE_SELECTED后，
-其目标结果不会失效：目标退休前由active ROB提供，退休沿由retirement bypass提供，
-退休后由history提供。若合法issue无法取得source packet或所需dependency data，属于
-验证必须捕获的内部一致性错误，设计不设置功能valid端口或可综合rollback、fallback、
-replay状态。
+候选写入沿寄存预取tag和目标槽位；响应周期候选可以向D2A可见，并在响应沿捕获packet
+和dependency。D2A grant还要经过D2B，故selected-operand采样发生在候选数据捕获之后，
+不形成ROB宽数据到匹配网络的组合通路。候选等待期间预取结果保持不变。若合法预取
+无法取得source packet或所需dependency data，属于验证必须捕获的内部一致性错误，
+设计不设置功能valid端口或可综合rollback、fallback、replay状态。
 
 ================================================================================
 10. Backend A0/A1：ROB Allocation
@@ -951,14 +969,14 @@ replay状态。
       data  = alloc_packet
   }
 
-A1在下一上升沿将各有效alloc_data_bank写入对应统一data槽。A0到最早D3之间已有
-D1、D2A和D2B边界，因此A1不增加报文发射延迟。W0随后以处理结果原址覆盖同一data槽并
+A1在下一上升沿将各有效alloc_data_bank写入对应统一data槽。候选预取请求在D1写入沿
+寄存，响应在随后一沿采样，因此A1不增加报文发射延迟。W0随后以处理结果原址覆盖同一data槽并
 置result_valid。无效entry的
 数据内容不要求清零。alloc_commit_valid来自上一周期已经接受的reservation，不设置
 ready或重放端口。occupancy只在reservation沿增加，commit沿不再次增加。
 
-D3 source读取使用issue_seq_tag低位索引。ROB valid、完整tag匹配且result_valid=0是
-合法issue的不变量；该条件区分原始packet与已经覆盖的结果，不允许把完成结果误作FE
+候选source预取使用prefetch_seq_tag低位索引。ROB valid、完整tag匹配且result_valid=0是
+合法预取的不变量；该条件区分原始packet与已经覆盖的结果，不允许把完成结果误作FE
 输入。物理比较使用低位索引隐含部分与entry保存的tag高位，语义仍为完整tag匹配。
 
 ================================================================================
@@ -1036,17 +1054,16 @@ Completion bypass可以使D0C查询的entry或ISSUE_WAIT_DEP entry在W0写ROB的
 W0必须捕获全部符合协议的有效FE返回，不允许通过ready反压FE。首版物理实现必须支持
 4路任意地址并发写回，不能使用单写端口存储后串行处理。
 
-四路wb_seq_tag低5位先产生共享entry decode。对每个entry：
+每路writeback先用tag低位直接读取目标entry的窄metadata并只执行一次完整身份资格
+检查，再将已经合格的wb_commit按ROB ID译码到entry-local写使能。对每个entry：
 
-  wb_entry_commit[entry][f] = wb_valid[f]
+  wb_entry_commit[entry][f] = wb_commit[f]
                              && wb_rob_id[f] == entry
-                             && rob_valid[entry]
-                             && rob_seq_generation[entry]
-                                == wb_seq_tag[f][SEQ_W-1:ROB_ID_W]
-                             && !rob_result_valid[entry]
   wb_entry_write_en[entry] = OR_f wb_entry_commit[entry][f]
 
 协议保证同一entry最多命中一路，因此entry-local固定4选1数据选择没有仲裁语义。每个
+entry的数据选择按两组2路掩码OR、再一级OR的平衡结构实现，不允许由writeback lane
+循环优先级形成4级串行mux链。每个
 128 bit data entry只在allocation或wb_entry_write_en有效时更新；metadata与data使用不同
 时序过程，但每个状态元素仍只有一个owner。
 
@@ -1262,9 +1279,8 @@ internal_rst_n。
 以下项目不改变首版功能和流水边界，实现后根据编译、仿真和后续时序数据观察：
 
   1) 四个8项READY bank提名、D2A0每bank两项取一和D2A1固定4x4单轮匹配组合深度；
-  2) D3的4个bank-local 8:1 source packet读取、最多4路32:1 active ROB读取、
-     history dependency和FE routing
-     的组合深度；
+  2) 候选预取的4个bank-local 8:1 source packet读取、最多4路32:1 active ROB读取
+     和history dependency组合深度；
   3) completion/retirement bypass tag比较、优先mux和宽数据扇出；
   4) 4路任意地址ROB writeback的decode和宽数据扇出；
   5) R0连续DONE scan、数据mux和输出旋转的组合深度。

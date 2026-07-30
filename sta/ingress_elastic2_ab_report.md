@@ -94,4 +94,4 @@ the dedicated saturation test.
 
 The two-slot implementation was adopted after this comparison. The governing
 documents now define the two-slot input boundary and its one-cycle-lower input
-latency. Production regression and STA must use `rtl-sv/filelist.f`.
+latency. Production regression and STA must use `rtl/filelist.f`.

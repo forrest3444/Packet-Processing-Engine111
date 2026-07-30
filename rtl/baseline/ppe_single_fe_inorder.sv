@@ -1,5 +1,6 @@
 `timescale 1ns/1ps
 `default_nettype none
+`include "rtl/common/ppe_config.vh"
 
 //------------------------------------------------------------------------------
 // Complete single-FE in-order architecture baseline.
@@ -11,20 +12,24 @@
 //------------------------------------------------------------------------------
 
 module ppe_single_fe_inorder #(
-    parameter int PACKET_W = ppe_types_pkg::DEFAULT_PACKET_W,
-    parameter int DESC_W   = ppe_types_pkg::DEFAULT_DESC_W
+    parameter int PACKET_W = `PPE_DEFAULT_PACKET_W,
+    parameter int DESC_W   = `PPE_DEFAULT_DESC_W
 ) (
     input  logic                                          clk,
     input  logic                                          rst_n,
-    input  logic [ppe_types_pkg::N-1:0]                  in_valid,
-    input  logic [ppe_types_pkg::N-1:0][PACKET_W-1:0]    in_packet,
-    input  logic [ppe_types_pkg::N-1:0][DESC_W-1:0]      in_desc,
+    input  logic [`PPE_N-1:0]                            in_valid,
+    input  logic [`PPE_N-1:0][PACKET_W-1:0]              in_packet,
+    input  logic [`PPE_N-1:0][DESC_W-1:0]                in_desc,
     output logic                                          bkps,
-    output logic [ppe_types_pkg::N-1:0]                  out_valid,
-    output logic [ppe_types_pkg::N-1:0][PACKET_W-1:0]    out_packet
+    output logic [`PPE_N-1:0]                            out_valid,
+    output logic [`PPE_N-1:0][PACKET_W-1:0]              out_packet
 );
 
-    import ppe_types_pkg::*;
+    localparam int N              = `PPE_N;
+    localparam int DELAY_W        = `PPE_DELAY_W;
+    localparam int RESULT_BANKS   = `PPE_RESULT_BANKS;
+    localparam int SEQ_W          = `PPE_SEQ_W;
+    localparam int HISTORY_ID_W   = `PPE_HISTORY_ID_W;
 
     localparam int INPUT_SLOTS  = 2;
     localparam int FIFO_DEPTH   = 32;
@@ -37,6 +42,8 @@ module ppe_single_fe_inorder #(
     typedef logic [FIFO_PTR_W-1:0] fifo_ptr_t;
     typedef logic [FIFO_COUNT_W-1:0] fifo_count_t;
     typedef logic [LANE_COUNT_W-1:0] lane_count_t;
+    typedef logic [SEQ_W-1:0] seq_tag_t;
+    typedef logic [DELAY_W-1:0] delay_t;
 
     //--------------------------------------------------------------------------
     // Reset and registered input boundary
@@ -176,7 +183,7 @@ module ppe_single_fe_inorder #(
         && !inflight_valid_q
         && head_dep_available;
 
-    fe_mock #(
+    FE_MOCK #(
         .PACKET_W (PACKET_W)
     ) u_fe (
         .clk           (clk),

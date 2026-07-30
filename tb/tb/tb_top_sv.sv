@@ -7,13 +7,13 @@
 //------------------------------------------------------------------------------
 
 `timescale 1ns/1ps
+`include "rtl/common/ppe_config.vh"
 
 `include "ppe_if.sv"
 `include "ppe_tb_pkg.sv"
 
 module tb_top_sv;
     import uvm_pkg::*;
-    import ppe_types_pkg::*;
     import ppe_tb_pkg::*;
 
     logic clk;
@@ -21,13 +21,15 @@ module tb_top_sv;
 
     // Verification-only baseline parameter consistency checks.
     initial begin
-        if (ROB_DEPTH != ISSUE_DEPTH) begin
+        if (`PPE_ROB_DEPTH != `PPE_ISSUE_DEPTH) begin
             $fatal(1, "ROB_DEPTH must equal ISSUE_DEPTH");
         end
-        if ((ROB_DEPTH < N) || ((ROB_DEPTH & (ROB_DEPTH - 1)) != 0)) begin
+        if ((`PPE_ROB_DEPTH < `PPE_N)
+            || ((`PPE_ROB_DEPTH & (`PPE_ROB_DEPTH - 1)) != 0)) begin
             $fatal(1, "ROB_DEPTH must be a power of two and at least N");
         end
-        if ((1 << SEQ_W) < (ROB_DEPTH + MAX_DEP)) begin
+        if ((1 << `PPE_SEQ_W)
+            < (`PPE_ROB_DEPTH + `PPE_MAX_DEP)) begin
             $fatal(1, "SEQ_W does not cover the active and dependency window");
         end
     end
@@ -37,7 +39,7 @@ module tb_top_sv;
         .rst_n (rst_n)
     );
 
-    ppe_top_sv #(
+    PPE_TOP_SV #(
         .PACKET_W (PACKET_W),
         .DESC_W   (5)
     ) dut (
@@ -58,7 +60,7 @@ module tb_top_sv;
 
     // Preserve the standalone FE contract test already present in the UVM
     // environment. It is independent from the four FEs inside ppe_top_sv.
-    fe_mock #(
+    FE_MOCK #(
         .PACKET_W (PACKET_W)
     ) u_fe_probe (
         .clk           (clk),

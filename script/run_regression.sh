@@ -17,25 +17,18 @@ case "${DUT}" in
         BUILD_NAME=${BUILD_NAME:-sv_regression}
         FILELIST=${FILELIST:-./script/filelist_sv.f}
         TB_TOP=${TB_TOP:-tb_top_sv}
-        RTL_FILELIST=${RTL_FILELIST:-./rtl-sv/filelist.f}
-        RTL_TOP=${RTL_TOP:-ppe_top_sv}
+        RTL_FILELIST=${RTL_FILELIST:-./rtl/filelist.f}
+        RTL_TOP=${RTL_TOP:-PPE_TOP_SV}
         ;;
     single_fe)
         BUILD_NAME=${BUILD_NAME:-single_fe_regression}
         FILELIST=${FILELIST:-./script/filelist_single_fe.f}
         TB_TOP=${TB_TOP:-tb_top_single_fe}
-        RTL_FILELIST=${RTL_FILELIST:-./rtl-sv/filelist_single_fe.f}
+        RTL_FILELIST=${RTL_FILELIST:-./rtl/filelist_single_fe.f}
         RTL_TOP=${RTL_TOP:-ppe_single_fe_inorder}
         ;;
-    legacy)
-        BUILD_NAME=${BUILD_NAME:-legacy_regression}
-        FILELIST=${FILELIST:-./script/filelist.f}
-        TB_TOP=${TB_TOP:-tb_top}
-        RTL_FILELIST=${RTL_FILELIST:-./script/rtl_filelist.f}
-        RTL_TOP=${RTL_TOP:-ppe_top}
-        ;;
     *)
-        echo "DUT must be 'sv', 'single_fe', or 'legacy'" >&2
+        echo "DUT must be 'sv' or 'single_fe'" >&2
         exit 2
         ;;
 esac
@@ -174,12 +167,8 @@ run_performance() {
 
 cd "${ROOT_DIR}"
 echo "Building ${DUT} regression image: ${BUILD_NAME}" | tee -a "${SUMMARY_LOG}"
-if [[ "${DUT}" == "sv" || "${DUT}" == "single_fe" ]]; then
-    lint_cmd=("${VERILATOR}" --lint-only --Wall -Wno-fatal
-              --top-module "${RTL_TOP}" -f "${RTL_FILELIST}")
-else
-    lint_cmd=("${MAKE_CMD}" lint RTL_FILELIST="${RTL_FILELIST}")
-fi
+lint_cmd=("${VERILATOR}" --lint-only --Wall -Wno-fatal -Wno-DECLFILENAME
+          --top-module "${RTL_TOP}" -f "${RTL_FILELIST}")
 if ! "${lint_cmd[@]}" >> "${BUILD_LOG}" 2>&1; then
     echo "FAIL lint log=${BUILD_LOG}" | tee -a "${SUMMARY_LOG}"
     exit 1

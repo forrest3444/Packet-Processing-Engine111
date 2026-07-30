@@ -6,6 +6,7 @@
 
 `ifndef PPE_TB_PKG_SV
 `define PPE_TB_PKG_SV
+`include "rtl/common/ppe_config.vh"
 
 package ppe_tb_pkg;
 
@@ -15,9 +16,9 @@ package ppe_tb_pkg;
     parameter int PACKET_W = 128;
 
 `ifdef PPE_SV_ARCH
-    parameter int TB_SEQ_W    = ppe_types_pkg::SEQ_W;
-    parameter int TB_ROB_ID_W = ppe_types_pkg::ROB_ID_W;
-    parameter int TB_OCC_W    = $clog2(ppe_types_pkg::ROB_DEPTH + 1);
+    parameter int TB_SEQ_W    = `PPE_SEQ_W;
+    parameter int TB_ROB_ID_W = `PPE_ROB_ID_W;
+    parameter int TB_OCC_W    = $clog2(`PPE_ROB_DEPTH + 1);
 `else
     parameter int TB_SEQ_W    = 5;
     parameter int TB_ROB_ID_W = 4;

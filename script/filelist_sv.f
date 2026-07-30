@@ -2,7 +2,7 @@
 # SystemVerilog Design RTL
 # =========================================================
 +define+PPE_SV_ARCH
--f rtl-sv/filelist.f
+-f rtl/filelist.f
 
 # =========================================================
 # Shared UVM Verification Environment

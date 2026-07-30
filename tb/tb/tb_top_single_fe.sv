@@ -10,7 +10,6 @@
 
 module tb_top_single_fe;
     import uvm_pkg::*;
-    import ppe_types_pkg::*;
     import ppe_tb_pkg::*;
 
     logic clk;
@@ -41,7 +40,7 @@ module tb_top_single_fe;
     );
 
     // Verification-only FE protocol probe retained for ppe_fe_pipeline_test.
-    fe_mock #(
+    FE_MOCK #(
         .PACKET_W (PACKET_W)
     ) u_fe_probe (
         .clk           (clk),
