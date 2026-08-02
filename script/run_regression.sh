@@ -4,7 +4,6 @@ set -uo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TARGET=${1:-all}
-DUT=${DUT:-sv}
 FUNC_SEEDS=${FUNC_SEEDS:-"1 23"}
 PERF_SEEDS=${PERF_SEEDS:-"1"}
 RUN_TIME=${RUN_TIME:-60s}
@@ -12,51 +11,23 @@ VERB=${VERB:-UVM_LOW}
 MAKE_CMD=${MAKE_CMD:-make}
 VERILATOR=${VERILATOR:-verilator}
 
-case "${DUT}" in
-    sv)
-        BUILD_NAME=${BUILD_NAME:-sv_regression}
-        FILELIST=${FILELIST:-./script/filelist_sv.f}
-        TB_TOP=${TB_TOP:-tb_top_sv}
-        RTL_FILELIST=${RTL_FILELIST:-./rtl/filelist.f}
-        RTL_TOP=${RTL_TOP:-PPE_TOP_SV}
-        ;;
-    single_fe)
-        BUILD_NAME=${BUILD_NAME:-single_fe_regression}
-        FILELIST=${FILELIST:-./script/filelist_single_fe.f}
-        TB_TOP=${TB_TOP:-tb_top_single_fe}
-        RTL_FILELIST=${RTL_FILELIST:-./rtl/filelist_single_fe.f}
-        RTL_TOP=${RTL_TOP:-ppe_single_fe_inorder}
-        ;;
-    *)
-        echo "DUT must be 'sv' or 'single_fe'" >&2
-        exit 2
-        ;;
-esac
+BUILD_NAME=${BUILD_NAME:-four_fe_regression}
+FILELIST=${FILELIST:-./script/filelist_sv.f}
+TB_TOP=${TB_TOP:-tb_top_sv}
+RTL_FILELIST=${RTL_FILELIST:-./rtl/filelist.f}
+RTL_TOP=${RTL_TOP:-PPE_TOP_SV}
 
 FUNCTIONAL_TESTS=(
     ppe_basic_test
-    ppe_fe_pipeline_test
     ppe_dep_loss_test
     ppe_rob32_wrap_test
     ppe_ingress_elastic_stress_test
 )
 
-PERFORMANCE_CASES=(
-    P1_DELAY1
-    P1_DELAY2
-    P1_DELAY3
-    P2_MIXED_DELAY
-    P3_LANES1
-    P3_LANES2
-    P3_LANES3
-    P4_DEP1_D0
-    P4_DEP1_D3
-    P5_DEP2
-    P5_DEP4
-    P5_DEP7
-    P6_DEP25
-    P6_DEP50
-    P6_DEP75
+PERFORMANCE_TESTS=(
+    ppe_p0_perf_test
+    ppe_uniform_random_delay_test
+    ppe_load_mix_perf_test
 )
 
 case "${TARGET}" in
@@ -67,7 +38,7 @@ case "${TARGET}" in
         ;;
 esac
 
-SUMMARY_DIR="${ROOT_DIR}/sim/regression/${DUT}/${TARGET}"
+SUMMARY_DIR="${ROOT_DIR}/sim/regression/four_fe/${TARGET}"
 SUMMARY_LOG="${SUMMARY_DIR}/summary.log"
 BUILD_LOG="${SUMMARY_DIR}/build.log"
 METRICS_LOG="${SUMMARY_DIR}/performance_metrics.log"
@@ -99,40 +70,25 @@ run_uvm() {
     local category=$1
     local testname=$2
     local seed=$3
-    local case_name=${4:-}
     local run_tag
     local run_log
     local label
     local status
 
-    if [[ -n "${case_name}" ]]; then
-        run_tag="${DUT}_${category}_${case_name}_seed_${seed}"
-        label="${testname}/${case_name}/seed=${seed}"
-    else
-        run_tag="${DUT}_${category}_${testname}_seed_${seed}"
-        label="${testname}/seed=${seed}"
-    fi
+    run_tag="four_fe_${category}_${testname}_seed_${seed}"
+    label="${testname}/seed=${seed}"
     run_log="${ROOT_DIR}/sim/run/${run_tag}/log/run.log"
 
     printf 'RUN  %s\n' "${label}" | tee -a "${SUMMARY_LOG}"
-    if [[ -n "${case_name}" ]]; then
-        "${MAKE_CMD}" -C "${ROOT_DIR}" run \
-            FILELIST="${FILELIST}" TB_TOP="${TB_TOP}" \
-            BUILD_NAME="${BUILD_NAME}" TESTNAME="${testname}" SEED="${seed}" \
-            RUN_TAG="${run_tag}" RUN_TIME="${RUN_TIME}" VERB="${VERB}" \
-            USER_SIM_OPTS="+PERF_CASE=${case_name}"
-        status=$?
-    else
-        "${MAKE_CMD}" -C "${ROOT_DIR}" run \
-            FILELIST="${FILELIST}" TB_TOP="${TB_TOP}" \
-            BUILD_NAME="${BUILD_NAME}" TESTNAME="${testname}" SEED="${seed}" \
-            RUN_TAG="${run_tag}" RUN_TIME="${RUN_TIME}" VERB="${VERB}"
-        status=$?
-    fi
+    "${MAKE_CMD}" -C "${ROOT_DIR}" run \
+        FILELIST="${FILELIST}" TB_TOP="${TB_TOP}" \
+        BUILD_NAME="${BUILD_NAME}" TESTNAME="${testname}" SEED="${seed}" \
+        RUN_TAG="${run_tag}" RUN_TIME="${RUN_TIME}" VERB="${VERB}"
+    status=$?
 
     record_result "${label}" "${run_log}" "${status}"
     if [[ "${category}" == "performance" && -f "${run_log}" ]]; then
-        grep -E '^UVM_INFO .*\[(P0_PERF|PERF_METRIC|LOAD_PERF)\]' "${run_log}" \
+        grep -E '^UVM_INFO .*\[(P0_PERF|UNIFORM_PERF|LOAD_PERF)\]' "${run_log}" \
             >> "${METRICS_LOG}" || true
     fi
 }
@@ -149,24 +105,18 @@ run_functional() {
 }
 
 run_performance() {
-    local case_name
+    local testname
     local seed
 
     for seed in ${PERF_SEEDS}; do
-        if [[ "${DUT}" == "single_fe" ]]; then
-            run_uvm performance ppe_single_fe_p0_perf_test "${seed}"
-        else
-            run_uvm performance ppe_p0_perf_test "${seed}"
-        fi
-        for case_name in "${PERFORMANCE_CASES[@]}"; do
-            run_uvm performance ppe_perf_test "${seed}" "${case_name}"
+        for testname in "${PERFORMANCE_TESTS[@]}"; do
+            run_uvm performance "${testname}" "${seed}"
         done
-        run_uvm performance ppe_load_mix_perf_test "${seed}"
     done
 }
 
 cd "${ROOT_DIR}"
-echo "Building ${DUT} regression image: ${BUILD_NAME}" | tee -a "${SUMMARY_LOG}"
+echo "Building four-FE regression image: ${BUILD_NAME}" | tee -a "${SUMMARY_LOG}"
 lint_cmd=("${VERILATOR}" --lint-only --Wall -Wno-fatal -Wno-DECLFILENAME
           --top-module "${RTL_TOP}" -f "${RTL_FILELIST}")
 if ! "${lint_cmd[@]}" >> "${BUILD_LOG}" 2>&1; then
@@ -186,8 +136,8 @@ if [[ "${TARGET}" == "performance" || "${TARGET}" == "all" ]]; then
     run_performance
 fi
 
-printf 'SUMMARY dut=%s target=%s pass=%d fail=%d\n' \
-    "${DUT}" "${TARGET}" "${pass_count}" "${fail_count}" \
+printf 'SUMMARY dut=four_fe target=%s pass=%d fail=%d\n' \
+    "${TARGET}" "${pass_count}" "${fail_count}" \
     | tee -a "${SUMMARY_LOG}"
 if [[ "${TARGET}" == "performance" || "${TARGET}" == "all" ]]; then
     echo "Performance metrics: ${METRICS_LOG}" | tee -a "${SUMMARY_LOG}"

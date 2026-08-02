@@ -36,14 +36,6 @@ module PPE_TOP_SV #(
     wire [`PPE_N*`PPE_SEQ_W-1:0]              dep_status_target_seq_tag;
     wire [`PPE_N-1:0]                         dep_status_available;
 
-    wire [`PPE_CAND_WINDOW_DEPTH-1:0]         candidate_valid;
-    wire [`PPE_CAND_WINDOW_DEPTH*`PPE_SEQ_W-1:0]
-                                                candidate_seq_tag;
-    wire [`PPE_CAND_WINDOW_DEPTH*`PPE_DELAY_W-1:0]
-                                                candidate_delay;
-    wire [`PPE_FE_NUM-1:0]                    select_valid;
-    wire [`PPE_FE_NUM*`PPE_CAND_WINDOW_DEPTH-1:0]
-                                                select_candidate_onehot;
     wire [`PPE_FE_NUM-1:0]                    completion_valid;
     wire [`PPE_FE_NUM*`PPE_SEQ_W-1:0]         completion_seq_tag;
 
@@ -52,12 +44,12 @@ module PPE_TOP_SV #(
     wire [`PPE_FE_NUM*`PPE_DELAY_W-1:0]       issue_delay;
     wire [`PPE_FE_NUM-1:0]                    issue_dep_required;
     wire [`PPE_FE_NUM*PACKET_W-1:0]           issue_dep_data;
-    wire [`PPE_FE_NUM-1:0]                    prefetch_valid;
-    wire [`PPE_FE_NUM*`PPE_SEQ_W-1:0]         prefetch_seq_tag;
-    wire [`PPE_FE_NUM-1:0]                    prefetch_dep_required;
-    wire [`PPE_FE_NUM*`PPE_SEQ_W-1:0]         prefetch_target_seq_tag;
-    wire [`PPE_FE_NUM*PACKET_W-1:0]           prefetch_packet;
-    wire [`PPE_FE_NUM*PACKET_W-1:0]           prefetch_dep_data;
+    wire [`PPE_FE_NUM-1:0]                    gather_valid;
+    wire [`PPE_FE_NUM*`PPE_SEQ_W-1:0]         gather_seq_tag;
+    wire [`PPE_FE_NUM-1:0]                    gather_dep_required;
+    wire [`PPE_FE_NUM*`PPE_SEQ_W-1:0]         gather_target_seq_tag;
+    wire [`PPE_FE_NUM*PACKET_W-1:0]           gather_packet;
+    wire [`PPE_FE_NUM*PACKET_W-1:0]           gather_dep_data;
     wire [`PPE_FE_NUM-1:0]                    fe_out_valid;
     wire [`PPE_FE_NUM*PACKET_W-1:0]           fe_out_data;
 
@@ -93,9 +85,9 @@ module PPE_TOP_SV #(
         .alloc_dep_required_o     (alloc_dep_required)
     );
 
-    PPE_ISSUE_TABLE #(
+    PPE_SCHEDULER #(
         .PACKET_W (PACKET_W)
-    ) u_issue_table (
+    ) u_scheduler (
         .clk_i                       (clk),
         .rst_ni                      (internal_rst_n),
         .issue_alloc_valid_i         (alloc_commit_valid),
@@ -108,32 +100,17 @@ module PPE_TOP_SV #(
         .dep_status_available_i      (dep_status_available),
         .completion_valid_i          (completion_valid),
         .completion_seq_tag_i        (completion_seq_tag),
-        .candidate_valid_o           (candidate_valid),
-        .candidate_seq_tag_o         (candidate_seq_tag),
-        .candidate_delay_o           (candidate_delay),
-        .select_valid_i              (select_valid),
-        .select_candidate_onehot_i   (select_candidate_onehot),
-        .prefetch_valid_o            (prefetch_valid),
-        .prefetch_seq_tag_o          (prefetch_seq_tag),
-        .prefetch_dep_required_o     (prefetch_dep_required),
-        .prefetch_target_seq_tag_o   (prefetch_target_seq_tag),
-        .prefetch_packet_i           (prefetch_packet),
-        .prefetch_dep_data_i         (prefetch_dep_data),
+        .gather_valid_o              (gather_valid),
+        .gather_seq_tag_o            (gather_seq_tag),
+        .gather_dep_required_o       (gather_dep_required),
+        .gather_target_seq_tag_o     (gather_target_seq_tag),
+        .gather_packet_i             (gather_packet),
+        .gather_dep_data_i           (gather_dep_data),
         .issue_valid_o               (issue_valid),
         .issue_packet_o              (issue_packet),
         .issue_delay_o               (issue_delay),
         .issue_dep_required_o        (issue_dep_required),
-        .issue_dep_data_o            (issue_dep_data)
-    );
-
-    PPE_FE_SCHEDULER u_fe_scheduler (
-        .clk_i                       (clk),
-        .rst_ni                      (internal_rst_n),
-        .candidate_valid_i           (candidate_valid),
-        .candidate_seq_tag_i         (candidate_seq_tag),
-        .candidate_delay_i           (candidate_delay),
-        .select_valid_o              (select_valid),
-        .select_candidate_onehot_o   (select_candidate_onehot),
+        .issue_dep_data_o            (issue_dep_data),
         .fe_out_valid_i              (fe_out_valid),
         .completion_valid_o          (completion_valid),
         .completion_seq_tag_o        (completion_seq_tag)
@@ -173,12 +150,12 @@ module PPE_TOP_SV #(
         .dep_status_valid_i          (dep_status_valid),
         .dep_status_target_seq_tag_i (dep_status_target_seq_tag),
         .dep_status_available_o      (dep_status_available),
-        .prefetch_valid_i            (prefetch_valid),
-        .prefetch_seq_tag_i          (prefetch_seq_tag),
-        .prefetch_dep_required_i     (prefetch_dep_required),
-        .prefetch_target_seq_tag_i   (prefetch_target_seq_tag),
-        .prefetch_packet_o           (prefetch_packet),
-        .prefetch_dep_data_o         (prefetch_dep_data),
+        .gather_valid_i              (gather_valid),
+        .gather_seq_tag_i            (gather_seq_tag),
+        .gather_dep_required_i       (gather_dep_required),
+        .gather_target_seq_tag_i     (gather_target_seq_tag),
+        .gather_packet_o             (gather_packet),
+        .gather_dep_data_o           (gather_dep_data),
         .wb_valid_i                  (completion_valid),
         .wb_seq_tag_i                (completion_seq_tag),
         .wb_data_i                   (fe_out_data),

@@ -1,0 +1,7 @@
+debImport "-full64"
+wvCreateWindow
+wvOpenFile -win $_nWave2 \
+           {/home/wwh/github/pfe/sim/run/pipeline_stall_seed_1/waves.fsdb}
+verdiWindowResize -win $_Verdi_1 "1155" "117" "1122" "779"
+verdiWindowResize -win $_Verdi_1 "1155" "117" "1252" "920"
+debExit

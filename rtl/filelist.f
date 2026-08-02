@@ -1,7 +1,6 @@
 rtl/frontend/ppe_ingress.v
 
-rtl/scheduler/ppe_issue_table.v
-rtl/scheduler/ppe_fe_scheduler.v
+rtl/scheduler/ppe_scheduler.v
 
 rtl/backend/ppe_rob.v
 rtl/backend/ppe_retire_output.v

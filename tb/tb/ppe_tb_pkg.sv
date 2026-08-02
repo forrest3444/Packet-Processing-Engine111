@@ -15,15 +15,9 @@ package ppe_tb_pkg;
 
     parameter int PACKET_W = 128;
 
-`ifdef PPE_SV_ARCH
     parameter int TB_SEQ_W    = `PPE_SEQ_W;
     parameter int TB_ROB_ID_W = `PPE_ROB_ID_W;
     parameter int TB_OCC_W    = $clog2(`PPE_ROB_DEPTH + 1);
-`else
-    parameter int TB_SEQ_W    = 5;
-    parameter int TB_ROB_ID_W = 4;
-    parameter int TB_OCC_W    = 5;
-`endif
 
     typedef virtual ppe_if #(PACKET_W, TB_SEQ_W, TB_ROB_ID_W, TB_OCC_W)
             ppe_vif_t;
@@ -40,19 +34,18 @@ package ppe_tb_pkg;
     `include "ppe_basic_seq.sv"
     `include "ppe_dep_loss_seq.sv"
     `include "ppe_p0_perf_seq.sv"
-    `include "ppe_perf_seq.sv"
     `include "ppe_load_mix_perf_seq.sv"
-    `include "ppe_fe_pipeline_seq.sv"
     `include "ppe_rob32_wrap_seq.sv"
     `include "ppe_ingress_elastic_stress_seq.sv"
+    `include "ppe_uniform_random_delay_seq.sv"
     `include "ppe_basic_test.sv"
     `include "ppe_dep_loss_test.sv"
     `include "ppe_p0_perf_test.sv"
-    `include "ppe_perf_test.sv"
     `include "ppe_load_mix_perf_test.sv"
-    `include "ppe_fe_pipeline_test.sv"
+    `include "ppe_pipeline_stall_test.sv"
     `include "ppe_rob32_wrap_test.sv"
     `include "ppe_ingress_elastic_stress_test.sv"
+    `include "ppe_uniform_random_delay_test.sv"
 
 endpackage
 

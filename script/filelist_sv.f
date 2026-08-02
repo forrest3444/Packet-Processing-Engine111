@@ -1,7 +1,6 @@
 # =========================================================
 # SystemVerilog Design RTL
 # =========================================================
-+define+PPE_SV_ARCH
 -f rtl/filelist.f
 
 # =========================================================
@@ -14,9 +13,11 @@
 +incdir+tb/agent/slave
 +incdir+tb/seq_lib
 +incdir+tb/tests
++incdir+tb/probe
 
 tb/tb/ppe_if.sv
 tb/tb/ppe_tb_pkg.sv
+tb/probe/ppe_pipeline_stall_probe.sv
 
 # =========================================================
 # SystemVerilog DUT UVM Top

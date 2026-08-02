@@ -1,9 +1,6 @@
 //------------------------------------------------------------------------------
 // File        : tb_top_sv.sv
-// Description : UVM top for the new SystemVerilog PPE implementation.
-//
-// This top reuses the existing interface, agents, sequences, scoreboard, tests,
-// and FE probe. The legacy tb_top and legacy RTL hierarchy remain unchanged.
+// Description : UVM top for the maintained four-FE PPE implementation.
 //------------------------------------------------------------------------------
 
 `timescale 1ns/1ps
@@ -58,20 +55,35 @@ module tb_top_sv;
                        pif.out_packet1, pif.out_packet0})
     );
 
-    // Preserve the standalone FE contract test already present in the UVM
-    // environment. It is independent from the four FEs inside ppe_top_sv.
-    FE_MOCK #(
-        .PACKET_W (PACKET_W)
-    ) u_fe_probe (
-        .clk           (clk),
-        .rst_n         (rst_n),
-        .fe_in_valid   (pif.fe_probe_in_valid),
-        .fe_in_data    (pif.fe_probe_in_data),
-        .fe_dep_valid  (pif.fe_probe_dep_valid),
-        .fe_dep_data   (pif.fe_probe_dep_data),
-        .fe_desc_delay (pif.fe_probe_delay),
-        .fe_out_valid  (pif.fe_probe_out_valid),
-        .fe_out_data   (pif.fe_probe_out_data)
+    wire [63:0] probe_issue_state;
+    genvar probe_entry;
+    generate
+        for (probe_entry = 0; probe_entry < 32;
+             probe_entry = probe_entry + 1) begin : gen_probe_issue_state
+            assign probe_issue_state[probe_entry*2 +: 2] =
+                dut.u_scheduler.issue_state_q[probe_entry];
+        end
+    endgenerate
+
+    ppe_pipeline_stall_probe u_pipeline_stall_probe (
+        .clk             (clk),
+        .rst_n           (dut.internal_rst_n),
+        .in_valid        (dut.in_valid),
+        .bkps            (dut.bkps),
+        .issue_valid     (dut.issue_valid),
+        .completion_valid(dut.completion_valid),
+        .retire_valid    (dut.retire_valid),
+        .out_valid       (dut.out_valid),
+        .rob_occupancy   (dut.u_rob.occupancy_q),
+        .rob_head_ptr    (dut.u_rob.head_ptr_q),
+        .rob_valid       (dut.u_rob.rob_valid_q),
+        .rob_result_valid(dut.u_rob.rob_result_valid_q),
+        .issue_state     (probe_issue_state),
+        .candidate_valid (dut.u_scheduler.candidate_valid_q),
+        .candidate_pending(dut.u_scheduler.candidate_pending),
+        .candidate_legal (dut.u_scheduler.candidate_legal),
+        .shortlist_valid (dut.u_scheduler.shortlist_valid_d),
+        .grant_valid     (dut.u_scheduler.grant_valid_d)
     );
 
     // Shared performance/debug probes with direct equivalents in the new RTL.
@@ -101,14 +113,14 @@ module tb_top_sv;
     // Translate the unified two-bit issue state into the closest legacy debug
     // encoding so existing diagnostic messages remain readable.
     always_comb begin
-        unique case (dut.u_issue_table.issue_state_q[1])
+        unique case (dut.u_scheduler.issue_state_q[1])
             2'd0: pif.dbg_entry1_state = 3'd0;
             2'd1: pif.dbg_entry1_state = 3'd2;
             2'd2: pif.dbg_entry1_state =
-                      dut.u_issue_table.issue_dep_required_q[1]
+                      dut.u_scheduler.issue_dep_required_q[1]
                       ? 3'd4 : 3'd3;
             default: pif.dbg_entry1_state =
-                         dut.u_issue_table.issue_dep_required_q[1]
+                         dut.u_scheduler.issue_dep_required_q[1]
                          ? 3'd6 : 3'd5;
         endcase
     end
@@ -119,11 +131,11 @@ module tb_top_sv;
         if (dut.internal_rst_n) begin
             for (int unsigned fe_idx = 0; fe_idx < 4; fe_idx++) begin
                 if (dut.fe_out_valid[fe_idx] !==
-                    dut.u_fe_scheduler.future_valid_q[fe_idx][0]) begin
+                    dut.u_scheduler.future_valid_q[fe_idx][0]) begin
                     `uvm_error("FE_CALENDAR", $sformatf(
                         "FE%0d return valid=%0b future_slot0=%0b",
                         fe_idx, dut.fe_out_valid[fe_idx],
-                        dut.u_fe_scheduler.future_valid_q[fe_idx][0]))
+                        dut.u_scheduler.future_valid_q[fe_idx][0]))
                 end
             end
         end
@@ -149,5 +161,18 @@ module tb_top_sv;
             null, "uvm_test_top.env.slave_agent.*", "vif", pif);
         run_test();
     end
+
+`ifdef PPE_FSDB
+    initial begin : fsdb_dump_control
+        string fsdb_file;
+        if ($test$plusargs("FSDB")) begin
+            fsdb_file = "waves.fsdb";
+            void'($value$plusargs("FSDB_FILE=%s", fsdb_file));
+            $fsdbDumpfile(fsdb_file);
+            $fsdbDumpvars(0, tb_top_sv);
+            $fsdbDumpMDA();
+        end
+    end
+`endif
 
 endmodule : tb_top_sv

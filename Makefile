@@ -4,23 +4,11 @@ SHELL := /bin/bash
 ###############################################################################
 # Project / Test Configuration
 ###############################################################################
-DUT        ?= sv
-
-ifeq ($(DUT),sv)
 DUT_TB_TOP       := tb_top_sv
 DUT_FILELIST     := ./script/filelist_sv.f
 DUT_RTL_FILELIST := ./rtl/filelist.f
 DUT_RTL_TOP      := PPE_TOP_SV
 DUT_RTL_LANGUAGE := 1364-2001
-else ifeq ($(DUT),single_fe)
-DUT_TB_TOP       := tb_top_single_fe
-DUT_FILELIST     := ./script/filelist_single_fe.f
-DUT_RTL_FILELIST := ./rtl/filelist_single_fe.f
-DUT_RTL_TOP      := ppe_single_fe_inorder
-DUT_RTL_LANGUAGE := 1800-2017
-else
-$(error DUT must be 'sv' or 'single_fe')
-endif
 
 TB_TOP     ?= $(DUT_TB_TOP)
 TESTNAME   ?= ppe_basic_test
@@ -46,6 +34,8 @@ FILELIST ?= $(DUT_FILELIST)
 RTL_FILELIST ?= $(DUT_RTL_FILELIST)
 RTL_TOP ?= $(DUT_RTL_TOP)
 USER_SIM_OPTS ?=
+WAVE          ?= none
+FSDB_FILE     ?= $(RUN_DIR)/waves.fsdb
 
 ###############################################################################
 # Tools / Options
@@ -53,6 +43,12 @@ USER_SIM_OPTS ?=
 VCS       ?= vcs
 VERILATOR ?= verilator
 TIMESCALE ?= 1ns/1ps
+
+ORFS_ROOT       ?= /home/wwh/github/OpenROAD-flow-scripts
+ORFS_IMAGE      ?= openroad/orfs:latest
+ORFS_WORK_HOME  ?= /work/flow/orfs/work
+ORFS_FLOW_MAKE  := /OpenROAD-flow-scripts/flow/Makefile
+ORFS_DOCKER     := $(ORFS_ROOT)/flow/util/docker_shell --image $(ORFS_IMAGE)
 
 VCS_OPTS = -full64                 \
            -sverilog               \
@@ -66,6 +62,13 @@ SIM_OPTS = +ntb_random_seed=$(SEED)  \
            +UVM_VERBOSITY=$(VERB)    \
 	   $(USER_SIM_OPTS)
 
+ifeq ($(WAVE),fsdb)
+VERDI_PLI_DIR ?= $(VERDI_HOME)/share/PLI/VCS/linux64
+VCS_OPTS += -debug_access+all -kdb +define+PPE_FSDB \
+            -P $(VERDI_PLI_DIR)/novas.tab $(VERDI_PLI_DIR)/pli.a
+SIM_OPTS += +FSDB +FSDB_FILE=$(FSDB_FILE)
+endif
+
 VERILATOR_LINT_OPTS = --lint-only       \
                       --language $(DUT_RTL_LANGUAGE) \
                       --Wall            \
@@ -73,11 +76,21 @@ VERILATOR_LINT_OPTS = --lint-only       \
                       -Wno-DECLFILENAME \
                       --top-module $(RTL_TOP)
 
+define orfs_synth
+	sg docker -c '$(ORFS_DOCKER) make --file=$(ORFS_FLOW_MAKE) DESIGN_CONFIG=/work/flow/orfs/$(1) WORK_HOME=$(ORFS_WORK_HOME) synth'
+endef
+
+define orfs_module_report
+	sg docker -c '$(ORFS_DOCKER) env REPORT_DB=$(ORFS_WORK_HOME)/results/nangate45/$(1)/base/1_synth.odb REPORT_SDC=/work/flow/orfs/$(2) REPORT_OUT=/work/flow/orfs/$(3) REPORT_NAME=$(4) openroad -exit /work/flow/orfs/report_module_1p25ghz.tcl'
+endef
+
 ###############################################################################
 # Targets
 ###############################################################################
-.PHONY: all prepare_build prepare_run check_elab lint elab run sim \
-	regress regress-functional regress-performance clean clean_all help
+.PHONY: all prepare_build prepare_run check_elab lint elab run sim sim-fsdb \
+	regress regress-functional regress-performance \
+	synth synth-top synth-modules synth-ingress synth-scheduler synth-rob \
+	synth-retire-output clean clean_all help
 
 all: sim
 
@@ -111,24 +124,51 @@ run: check_elab prepare_run
 
 sim: elab run
 
+sim-fsdb:
+	$(MAKE) sim WAVE=fsdb BUILD_NAME=fsdb
+
 regress:
-	DUT="$(DUT)" BUILD_NAME="$(REGRESS_BUILD_NAME)" \
+	BUILD_NAME="$(REGRESS_BUILD_NAME)" \
 	FUNC_SEEDS="$(REGRESS_FUNC_SEEDS)" \
 	PERF_SEEDS="$(REGRESS_PERF_SEEDS)" \
 	RUN_TIME="$(RUN_TIME)" VERB="$(VERB)" \
 	./script/run_regression.sh all
 
 regress-functional:
-	DUT="$(DUT)" BUILD_NAME="$(REGRESS_BUILD_NAME)" \
+	BUILD_NAME="$(REGRESS_BUILD_NAME)" \
 	FUNC_SEEDS="$(REGRESS_FUNC_SEEDS)" \
 	RUN_TIME="$(RUN_TIME)" VERB="$(VERB)" \
 	./script/run_regression.sh functional
 
 regress-performance:
-	DUT="$(DUT)" BUILD_NAME="$(REGRESS_BUILD_NAME)" \
+	BUILD_NAME="$(REGRESS_BUILD_NAME)" \
 	PERF_SEEDS="$(REGRESS_PERF_SEEDS)" \
 	RUN_TIME="$(RUN_TIME)" VERB="$(VERB)" \
 	./script/run_regression.sh performance
+
+synth: synth-top
+
+synth-top:
+	$(call orfs_synth,config_top_sv_1p25ghz.mk)
+	sg docker -c '$(ORFS_DOCKER) openroad -exit /work/flow/orfs/report_top_sv_1p25ghz_functional.tcl'
+
+synth-modules: synth-ingress synth-scheduler synth-rob synth-retire-output
+
+synth-ingress:
+	$(call orfs_synth,config_ingress_1p25ghz.mk)
+	$(call orfs_module_report,ppe_ingress_1p25ghz,constraint_ingress_1p25ghz.sdc,ppe_ingress_current_1p25ghz_timing.rpt,PPE_INGRESS)
+
+synth-scheduler:
+	$(call orfs_synth,config_scheduler_local_pairs_1p25ghz.mk)
+	sg docker -c '$(ORFS_DOCKER) openroad -exit /work/flow/orfs/report_scheduler_local_pairs_1p25ghz.tcl'
+
+synth-rob:
+	$(call orfs_synth,config_rob_1p25ghz.mk)
+	$(call orfs_module_report,ppe_rob_1p25ghz,constraint_rob_1p25ghz.sdc,ppe_rob_current_1p25ghz_timing.rpt,PPE_ROB)
+
+synth-retire-output:
+	$(call orfs_synth,config_retire_output_1p25ghz.mk)
+	$(call orfs_module_report,ppe_retire_output_1p25ghz,constraint_retire_output_1p25ghz.sdc,ppe_retire_output_current_1p25ghz_timing.rpt,PPE_RETIRE_OUTPUT)
 
 clean:
 	rm -rf $(SIM)/run
@@ -142,11 +182,20 @@ help:
 	@echo "  make elab    Compile/elaborate UVM testbench"
 	@echo "  make run     Run existing elaboration"
 	@echo "  make sim     Compile and run"
+	@echo "  make sim-fsdb Compile and run with FSDB waveform dumping"
 	@echo "  make regress-functional  Run multi-seed functional regression"
-	@echo "  make regress-performance Run P0-P6 and mixed-load performance characterization"
+	@echo "  make regress-performance Run peak, random-delay, and mixed-load tests"
 	@echo "  make regress             Run functional and performance regressions"
+	@echo "  make synth               Synthesize the 1.25 GHz top and refresh its report"
+	@echo "  make synth-top           Synthesize the 1.25 GHz top and refresh its report"
+	@echo "  make synth-modules       Synthesize all standalone 1.25 GHz RTL modules"
+	@echo "  make synth-ingress       Synthesize ingress at 1.25 GHz"
+	@echo "  make synth-scheduler     Synthesize scheduler at 1.25 GHz"
+	@echo "  make synth-rob           Synthesize ROB at 1.25 GHz"
+	@echo "  make synth-retire-output Synthesize retire output at 1.25 GHz"
 	@echo "Variables:"
-	@echo "  DUT=$(DUT) (sv or single_fe)"
 	@echo "  VERILATOR=$(VERILATOR) RTL_FILELIST=$(RTL_FILELIST) RTL_TOP=$(RTL_TOP)"
 	@echo "  TESTNAME=$(TESTNAME) SEED=$(SEED) VERB=$(VERB) BUILD_NAME=$(BUILD_NAME) RUN_TAG=$(RUN_TAG)"
+	@echo "  WAVE=$(WAVE) FSDB_FILE=$(FSDB_FILE) VERDI_HOME=$(VERDI_HOME)"
 	@echo "  REGRESS_BUILD_NAME=$(REGRESS_BUILD_NAME) REGRESS_FUNC_SEEDS='$(REGRESS_FUNC_SEEDS)' REGRESS_PERF_SEEDS='$(REGRESS_PERF_SEEDS)'"
+	@echo "  ORFS_ROOT=$(ORFS_ROOT) ORFS_IMAGE=$(ORFS_IMAGE) ORFS_WORK_HOME=$(ORFS_WORK_HOME)"

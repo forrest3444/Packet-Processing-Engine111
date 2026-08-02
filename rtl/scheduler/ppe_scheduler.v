@@ -3,9 +3,9 @@
 `include "rtl/common/ppe_config.vh"
 
 //------------------------------------------------------------------------------
-// ROB-indexed pre-issue state, dependency wakeup, and local candidate banks.
+// Unified pre-issue state, candidate matching, operand gather, and FE calendar.
 //------------------------------------------------------------------------------
-module PPE_ISSUE_TABLE #(
+module PPE_SCHEDULER #(
     parameter integer PACKET_W = `PPE_DEFAULT_PACKET_W
 ) (
     input  wire                                      clk_i,
@@ -20,25 +20,20 @@ module PPE_ISSUE_TABLE #(
     input  wire [`PPE_N-1:0]                         dep_status_available_i,
     input  wire [`PPE_FE_NUM-1:0]                    completion_valid_i,
     input  wire [`PPE_FE_NUM*`PPE_SEQ_W-1:0]         completion_seq_tag_i,
-    output reg  [`PPE_CAND_WINDOW_DEPTH-1:0]         candidate_valid_o,
-    output reg  [`PPE_CAND_WINDOW_DEPTH*`PPE_SEQ_W-1:0]
-                                                    candidate_seq_tag_o,
-    output reg  [`PPE_CAND_WINDOW_DEPTH*`PPE_DELAY_W-1:0]
-                                                    candidate_delay_o,
-    input  wire [`PPE_FE_NUM-1:0]                    select_valid_i,
-    input  wire [`PPE_FE_NUM*`PPE_CAND_WINDOW_DEPTH-1:0]
-                                                    select_candidate_onehot_i,
-    output reg  [`PPE_FE_NUM-1:0]                    prefetch_valid_o,
-    output reg  [`PPE_FE_NUM*`PPE_SEQ_W-1:0]         prefetch_seq_tag_o,
-    output reg  [`PPE_FE_NUM-1:0]                    prefetch_dep_required_o,
-    output reg  [`PPE_FE_NUM*`PPE_SEQ_W-1:0]         prefetch_target_seq_tag_o,
-    input  wire [`PPE_FE_NUM*PACKET_W-1:0]           prefetch_packet_i,
-    input  wire [`PPE_FE_NUM*PACKET_W-1:0]           prefetch_dep_data_i,
+    output reg  [`PPE_FE_NUM-1:0]                    gather_valid_o,
+    output reg  [`PPE_FE_NUM*`PPE_SEQ_W-1:0]         gather_seq_tag_o,
+    output reg  [`PPE_FE_NUM-1:0]                    gather_dep_required_o,
+    output reg  [`PPE_FE_NUM*`PPE_SEQ_W-1:0]         gather_target_seq_tag_o,
+    input  wire [`PPE_FE_NUM*PACKET_W-1:0]           gather_packet_i,
+    input  wire [`PPE_FE_NUM*PACKET_W-1:0]           gather_dep_data_i,
     output reg  [`PPE_FE_NUM-1:0]                    issue_valid_o,
     output reg  [`PPE_FE_NUM*PACKET_W-1:0]           issue_packet_o,
     output reg  [`PPE_FE_NUM*`PPE_DELAY_W-1:0]       issue_delay_o,
     output reg  [`PPE_FE_NUM-1:0]                    issue_dep_required_o,
-    output reg  [`PPE_FE_NUM*PACKET_W-1:0]           issue_dep_data_o
+    output reg  [`PPE_FE_NUM*PACKET_W-1:0]           issue_dep_data_o,
+    input  wire [`PPE_FE_NUM-1:0]                    fe_out_valid_i,
+    output reg  [`PPE_FE_NUM-1:0]                    completion_valid_o,
+    output reg  [`PPE_FE_NUM*`PPE_SEQ_W-1:0]         completion_seq_tag_o
 );
 
     localparam integer N                 = `PPE_N;
@@ -61,6 +56,7 @@ module PPE_ISSUE_TABLE #(
     localparam integer ADMIT_BANK_W = 2;
     localparam integer ADMIT_ROWS   = ISSUE_DEPTH / ADMIT_BANKS;
     localparam integer ADMIT_ROW_W  = 3;
+    localparam integer RETURN_FUTURE_DEPTH = `PPE_RETURN_FUTURE_DEPTH;
 
     reg [1:0]         issue_state_q          [0:ISSUE_DEPTH-1];
     reg [SEQ_W-1:0]   issue_seq_tag_q        [0:ISSUE_DEPTH-1];
@@ -80,13 +76,6 @@ module PPE_ISSUE_TABLE #(
     reg [DELAY_W-1:0] candidate_delay_d [0:CAND_WINDOW_DEPTH-1];
     reg [CAND_WINDOW_DEPTH-1:0] candidate_dep_required_q;
     reg [CAND_WINDOW_DEPTH-1:0] candidate_dep_required_d;
-    reg [PACKET_W-1:0] candidate_packet_q [0:CAND_WINDOW_DEPTH-1];
-    reg [PACKET_W-1:0] candidate_dep_data_q
-        [0:CAND_WINDOW_DEPTH-1];
-    reg [CAND_WINDOW_DEPTH-1:0] candidate_data_valid_q;
-    reg [CAND_WINDOW_DEPTH-1:0] candidate_prefetch_visible;
-    reg [CAND_ID_W-1:0] prefetch_slot_q [0:ADMIT_BANKS-1];
-
     reg [ISSUE_DEPTH-1:0] candidate_present_q;
     reg [ISSUE_DEPTH-1:0] candidate_present_d;
     reg [ADMIT_ROW_W-1:0] ready_admit_row_rr_q [0:ADMIT_BANKS-1];
@@ -120,13 +109,9 @@ module PPE_ISSUE_TABLE #(
     reg [ISSUE_DEPTH-1:0] selected_release_hit;
     reg [ISSUE_DEPTH-1:0] eligible_ready;
     reg [CAND_WINDOW_DEPTH-1:0] candidate_remove;
+    reg [CAND_WINDOW_DEPTH-1:0] candidate_pending;
     reg [ISSUE_DEPTH-1:0] select_entry_hit;
-    reg [SEQ_W-1:0] select_seq_tag [0:FE_NUM-1];
-    reg [DELAY_W-1:0] select_delay [0:FE_NUM-1];
-    reg [FE_NUM-1:0] select_dep_required;
     reg [ROB_ID_W-1:0] select_entry_id [0:FE_NUM-1];
-    reg [PACKET_W-1:0] select_packet [0:FE_NUM-1];
-    reg [PACKET_W-1:0] select_dep_data [0:FE_NUM-1];
 
     reg [ADMIT_ROWS-1:0] bank_ready [0:ADMIT_BANKS-1];
     reg [ADMIT_BANKS-1:0] bank_winner_valid;
@@ -135,8 +120,78 @@ module PPE_ISSUE_TABLE #(
     reg [SEQ_W-1:0] bank_winner_target_seq_tag [0:ADMIT_BANKS-1];
     reg [DELAY_W-1:0] bank_winner_delay [0:ADMIT_BANKS-1];
     reg [ADMIT_BANKS-1:0] bank_winner_dep_required;
-    reg [ADMIT_BANKS-1:0] candidate_fill_valid;
-    reg [CAND_ID_W-1:0] candidate_fill_slot [0:ADMIT_BANKS-1];
+
+    reg [FE_NUM-1:0] shortlist_valid_d;
+    reg [FE_NUM*CAND_WINDOW_DEPTH-1:0] shortlist_onehot_d;
+    reg [SEQ_W-1:0] shortlist_seq_tag_d [0:FE_NUM-1];
+    reg [SEQ_W-1:0] shortlist_target_seq_tag_d [0:FE_NUM-1];
+    reg [DELAY_W-1:0] shortlist_delay_d [0:FE_NUM-1];
+    reg [FE_NUM-1:0] shortlist_dep_required_d;
+    reg [FE_NUM*2-1:0] shortlist_legal;
+    reg [FE_NUM*3-1:0] shortlist_pending_block;
+    reg [CAND_WINDOW_DEPTH*2-1:0] candidate_legal;
+    reg [CAND_WINDOW_DEPTH*3-1:0] candidate_pending_block;
+    reg [FE_NUM-1:0] grant_valid_d;
+    reg [CAND_WINDOW_DEPTH-1:0] grant_onehot_d;
+    reg [SEQ_W-1:0] grant_seq_tag_d [0:FE_NUM-1];
+    reg [SEQ_W-1:0] grant_target_seq_tag_d [0:FE_NUM-1];
+    reg [DELAY_W-1:0] grant_delay_d [0:FE_NUM-1];
+    reg [FE_NUM-1:0] grant_dep_required_d;
+    reg [FE_NUM*3-1:0] grant_pending_block_d;
+    reg [FE_NUM-1:0] grant_valid_q;
+    reg [CAND_WINDOW_DEPTH-1:0] grant_onehot_q;
+    reg [SEQ_W-1:0] grant_seq_tag_q [0:FE_NUM-1];
+    reg [SEQ_W-1:0] grant_target_seq_tag_q [0:FE_NUM-1];
+    reg [DELAY_W-1:0] grant_delay_q [0:FE_NUM-1];
+    reg [FE_NUM-1:0] grant_dep_required_q;
+    reg [FE_NUM*3-1:0] grant_pending_block_q;
+    reg [RETURN_FUTURE_DEPTH-1:0] future_valid_q [0:FE_NUM-1];
+    reg [FE_NUM*RETURN_FUTURE_DEPTH*SEQ_W-1:0] future_seq_tag_q;
+    reg [FE_NUM-1:0] candidate_way_rr_q;
+    reg [1:0] group_rr_q;
+
+    // {candidate1->FE1, candidate1->FE0,
+    //  candidate0->FE1, candidate0->FE0}
+    function [3:0] local_pair_match;
+        input       valid0;
+        input       valid1;
+        input [1:0] legal0;
+        input [1:0] legal1;
+        input       rr;
+        reg         straight;
+        reg         cross_map;
+        begin
+            local_pair_match = 4'b0000;
+            straight = valid0 && valid1 && legal0[0] && legal1[1];
+            cross_map = valid0 && valid1 && legal0[1] && legal1[0];
+
+            if (straight || cross_map) begin
+                if (straight && (!cross_map || !rr)) begin
+                    local_pair_match[0] = 1'b1;
+                    local_pair_match[3] = 1'b1;
+                end else begin
+                    local_pair_match[1] = 1'b1;
+                    local_pair_match[2] = 1'b1;
+                end
+            end else if (!rr) begin
+                if (valid0 && (|legal0)) begin
+                    if (legal0[0]) local_pair_match[0] = 1'b1;
+                    else           local_pair_match[1] = 1'b1;
+                end else if (valid1 && (|legal1)) begin
+                    if (legal1[1]) local_pair_match[3] = 1'b1;
+                    else           local_pair_match[2] = 1'b1;
+                end
+            end else begin
+                if (valid1 && (|legal1)) begin
+                    if (legal1[0]) local_pair_match[2] = 1'b1;
+                    else           local_pair_match[3] = 1'b1;
+                end else if (valid0 && (|legal0)) begin
+                    if (legal0[1]) local_pair_match[1] = 1'b1;
+                    else           local_pair_match[0] = 1'b1;
+                end
+            end
+        end
+    endfunction
 
     function [ADMIT_ROW_W:0] select_ready_row;
         input [ADMIT_ROWS-1:0] ready;
@@ -404,47 +459,196 @@ module PPE_ISSUE_TABLE #(
         end
     end
 
+    always @* begin : candidate_way_legality
+        integer bank;
+        integer slot;
+        integer way;
+        integer fe;
+        reg [1:0] legal;
+
+        candidate_legal         = {CAND_WINDOW_DEPTH*2{1'b0}};
+        candidate_pending_block = {CAND_WINDOW_DEPTH*3{1'b0}};
+        legal                   = 2'b00;
+
+        for (bank = 0; bank < FE_NUM; bank = bank + 1) begin
+            for (way = 0; way < 2; way = way + 1) begin
+                slot  = (way * FE_NUM) + bank;
+                legal = 2'b00;
+                case (candidate_delay_q[slot])
+                    2'd0: begin
+                        for (fe = 0; fe < 2; fe = fe + 1) begin
+                            if ((bank == 0) || (bank == 2)) begin
+                                legal[fe] = !future_valid_q[fe][3]
+                                    && !grant_pending_block_q[fe*3+0];
+                            end else begin
+                                legal[fe] = !future_valid_q[fe+2][3]
+                                    && !grant_pending_block_q[(fe+2)*3+0];
+                            end
+                        end
+                    end
+                    2'd1: begin
+                        candidate_pending_block[slot*3+0] = 1'b1;
+                        for (fe = 0; fe < 2; fe = fe + 1) begin
+                            if ((bank == 0) || (bank == 2)) begin
+                                legal[fe] = !future_valid_q[fe][4]
+                                    && !grant_pending_block_q[fe*3+1];
+                            end else begin
+                                legal[fe] = !future_valid_q[fe+2][4]
+                                    && !grant_pending_block_q[(fe+2)*3+1];
+                            end
+                        end
+                    end
+                    2'd2: begin
+                        candidate_pending_block[slot*3+1] = 1'b1;
+                        for (fe = 0; fe < 2; fe = fe + 1) begin
+                            if ((bank == 0) || (bank == 2)) begin
+                                legal[fe] = !future_valid_q[fe][5]
+                                    && !grant_pending_block_q[fe*3+2];
+                            end else begin
+                                legal[fe] = !future_valid_q[fe+2][5]
+                                    && !grant_pending_block_q[(fe+2)*3+2];
+                            end
+                        end
+                    end
+                    default: begin
+                        legal = 2'b11;
+                        candidate_pending_block[slot*3+2] = 1'b1;
+                    end
+                endcase
+                candidate_legal[slot*2 +: 2] = legal;
+            end
+        end
+    end
+
+    always @* begin : candidate_shortlist
+        integer bank;
+        integer slot;
+        reg way0_available;
+        reg way1_available;
+        reg way0_legal;
+        reg way1_legal;
+
+        shortlist_valid_d        = {FE_NUM{1'b0}};
+        shortlist_onehot_d       = {FE_NUM*CAND_WINDOW_DEPTH{1'b0}};
+        shortlist_dep_required_d = {FE_NUM{1'b0}};
+        shortlist_legal          = {FE_NUM*2{1'b0}};
+        shortlist_pending_block  = {FE_NUM*3{1'b0}};
+        candidate_pending        = grant_onehot_q;
+        way0_available           = 1'b0;
+        way1_available           = 1'b0;
+        way0_legal               = 1'b0;
+        way1_legal               = 1'b0;
+
+        for (bank = 0; bank < FE_NUM; bank = bank + 1) begin
+            shortlist_seq_tag_d[bank]        = {SEQ_W{1'b0}};
+            shortlist_target_seq_tag_d[bank] = {SEQ_W{1'b0}};
+            shortlist_delay_d[bank]          = {DELAY_W{1'b0}};
+            way0_available = candidate_valid_q[bank]
+                && !candidate_pending[bank];
+            way1_available = candidate_valid_q[FE_NUM+bank]
+                && !candidate_pending[FE_NUM+bank];
+            way0_legal = way0_available
+                && (|candidate_legal[bank*2 +: 2]);
+            way1_legal = way1_available
+                && (|candidate_legal[(FE_NUM+bank)*2 +: 2]);
+            slot = bank;
+            if (way1_legal
+                && (!way0_legal || candidate_way_rr_q[bank])) begin
+                slot = FE_NUM + bank;
+            end
+
+            if (way0_legal || way1_legal) begin
+                shortlist_valid_d[bank] = 1'b1;
+                shortlist_onehot_d[
+                    bank*CAND_WINDOW_DEPTH+slot] = 1'b1;
+                shortlist_seq_tag_d[bank] = candidate_seq_tag_q[slot];
+                shortlist_target_seq_tag_d[bank] =
+                    candidate_target_seq_tag_q[slot];
+                shortlist_delay_d[bank] = candidate_delay_q[slot];
+                shortlist_dep_required_d[bank] =
+                    candidate_dep_required_q[slot];
+                shortlist_legal[bank*2 +: 2] =
+                    candidate_legal[slot*2 +: 2];
+                shortlist_pending_block[bank*3 +: 3] =
+                    candidate_pending_block[slot*3 +: 3];
+            end
+        end
+    end
+
+    always @* begin : fixed_local_pair_match
+        integer candidate;
+        integer fe;
+        reg [FE_NUM*FE_NUM-1:0] accept;
+        reg [3:0] even_match;
+        reg [3:0] odd_match;
+
+        accept            = {FE_NUM*FE_NUM{1'b0}};
+        even_match        = local_pair_match(
+            shortlist_valid_d[0], shortlist_valid_d[2],
+            shortlist_legal[0*2 +: 2],
+            shortlist_legal[2*2 +: 2], group_rr_q[0]);
+        odd_match         = local_pair_match(
+            shortlist_valid_d[1], shortlist_valid_d[3],
+            shortlist_legal[1*2 +: 2],
+            shortlist_legal[3*2 +: 2], group_rr_q[1]);
+
+        accept[0*FE_NUM+0] = even_match[0];
+        accept[0*FE_NUM+1] = even_match[1];
+        accept[2*FE_NUM+0] = even_match[2];
+        accept[2*FE_NUM+1] = even_match[3];
+        accept[1*FE_NUM+2] = odd_match[0];
+        accept[1*FE_NUM+3] = odd_match[1];
+        accept[3*FE_NUM+2] = odd_match[2];
+        accept[3*FE_NUM+3] = odd_match[3];
+
+        grant_valid_d     = {FE_NUM{1'b0}};
+        grant_onehot_d    = {CAND_WINDOW_DEPTH{1'b0}};
+        grant_dep_required_d = {FE_NUM{1'b0}};
+        grant_pending_block_d = {FE_NUM*3{1'b0}};
+
+        for (fe = 0; fe < FE_NUM; fe = fe + 1) begin
+            grant_seq_tag_d[fe]        = {SEQ_W{1'b0}};
+            grant_target_seq_tag_d[fe] = {SEQ_W{1'b0}};
+            grant_delay_d[fe]          = {DELAY_W{1'b0}};
+        end
+
+        for (fe = 0; fe < FE_NUM; fe = fe + 1)
+            for (candidate = 0; candidate < FE_NUM;
+                 candidate = candidate + 1)
+                if (accept[candidate*FE_NUM+fe]) begin
+                    grant_valid_d[fe] = 1'b1;
+                    grant_onehot_d = grant_onehot_d
+                        | shortlist_onehot_d[
+                            candidate*CAND_WINDOW_DEPTH
+                            +: CAND_WINDOW_DEPTH];
+                    grant_pending_block_d[fe*3 +: 3] =
+                        shortlist_pending_block[candidate*3 +: 3];
+                    grant_seq_tag_d[fe] = shortlist_seq_tag_d[candidate];
+                    grant_target_seq_tag_d[fe] =
+                        shortlist_target_seq_tag_d[candidate];
+                    grant_delay_d[fe] = shortlist_delay_d[candidate];
+                    grant_dep_required_d[fe] =
+                        shortlist_dep_required_d[candidate];
+                end
+    end
+
     always @* begin : candidate_removal_decode
         integer fe;
-        integer slot;
         integer entry;
 
-        candidate_remove = {CAND_WINDOW_DEPTH{1'b0}};
+        candidate_remove = grant_onehot_q;
         select_entry_hit = {ISSUE_DEPTH{1'b0}};
         for (fe = 0; fe < FE_NUM; fe = fe + 1) begin
-            select_seq_tag[fe]        = {SEQ_W{1'b0}};
-            select_delay[fe]          = {DELAY_W{1'b0}};
-            select_dep_required[fe]   = 1'b0;
             select_entry_id[fe]       = {ROB_ID_W{1'b0}};
-            select_packet[fe]         = {PACKET_W{1'b0}};
-            select_dep_data[fe]       = {PACKET_W{1'b0}};
-            if (select_valid_i[fe]) begin
-                candidate_remove =
-                    candidate_remove
-                    | select_candidate_onehot_i[
-                        fe*CAND_WINDOW_DEPTH +: CAND_WINDOW_DEPTH];
-                for (slot = 0;
-                     slot < CAND_WINDOW_DEPTH;
-                     slot = slot + 1) begin
-                    if (select_candidate_onehot_i[
-                            fe*CAND_WINDOW_DEPTH+slot]) begin
-                        select_seq_tag[fe] = candidate_seq_tag_q[slot];
-                        select_entry_id[fe] =
-                            candidate_seq_tag_q[slot][ROB_ID_W-1:0];
-                        select_delay[fe] = candidate_delay_q[slot];
-                        select_dep_required[fe] =
-                            candidate_dep_required_q[slot];
-                        select_packet[fe] = candidate_packet_q[slot];
-                        select_dep_data[fe] =
-                            candidate_dep_data_q[slot];
-                    end
-                end
+            if (grant_valid_q[fe]) begin
+                select_entry_id[fe] =
+                    grant_seq_tag_q[fe][ROB_ID_W-1:0];
             end
         end
 
         for (entry = 0; entry < ISSUE_DEPTH; entry = entry + 1) begin
             for (fe = 0; fe < FE_NUM; fe = fe + 1) begin
-                if (select_valid_i[fe]
+                if (grant_valid_q[fe]
                     && (select_entry_id[fe]
                         == entry[ROB_ID_W-1:0])) begin
                     select_entry_hit[entry] = 1'b1;
@@ -518,6 +722,15 @@ module PPE_ISSUE_TABLE #(
                         issue_delay_q[winner_id];
                     bank_winner_dep_required[bank] =
                         issue_dep_required_q[winner_id];
+                end else if (alloc_bank_write_en[bank]
+                             && !alloc_bank_dep_required[bank]) begin
+                    bank_winner_valid[bank] = 1'b1;
+                    bank_winner_row[bank] = alloc_bank_row[bank];
+                    bank_winner_seq_tag[bank] =
+                        alloc_bank_seq_tag[bank];
+                    bank_winner_target_seq_tag[bank] = {SEQ_W{1'b0}};
+                    bank_winner_delay[bank] = alloc_bank_delay[bank];
+                    bank_winner_dep_required[bank] = 1'b0;
                 end
             end
         end
@@ -532,7 +745,6 @@ module PPE_ISSUE_TABLE #(
         candidate_valid_d = candidate_valid_q;
         candidate_present_d = candidate_present_q & ~select_entry_hit;
         candidate_dep_required_d = candidate_dep_required_q;
-        candidate_fill_valid = {ADMIT_BANKS{1'b0}};
         fill_slot  = {CAND_ID_W{1'b0}};
         fill_valid = 1'b0;
 
@@ -549,9 +761,7 @@ module PPE_ISSUE_TABLE #(
         for (bank = 0; bank < ADMIT_BANKS; bank = bank + 1) begin
             fill_slot  = bank[CAND_ID_W-1:0];
             fill_valid = 1'b0;
-            candidate_fill_slot[bank] = bank[CAND_ID_W-1:0];
-            ready_admit_row_rr_d[bank] =
-                ready_admit_row_rr_q[bank] + 3'd1;
+            ready_admit_row_rr_d[bank] = ready_admit_row_rr_q[bank];
 
             if (!candidate_valid_q[bank] || candidate_remove[bank]) begin
                 fill_slot  = bank[CAND_ID_W-1:0];
@@ -563,8 +773,8 @@ module PPE_ISSUE_TABLE #(
             end
 
             if (fill_valid) begin
-                candidate_fill_valid[bank] = 1'b1;
-                candidate_fill_slot[bank] = fill_slot;
+                ready_admit_row_rr_d[bank] =
+                    bank_winner_row[bank] + 3'd1;
                 candidate_valid_d[fill_slot] = 1'b1;
                 candidate_seq_tag_d[fill_slot] =
                     bank_winner_seq_tag[bank];
@@ -575,42 +785,34 @@ module PPE_ISSUE_TABLE #(
                 candidate_dep_required_d[fill_slot] =
                     bank_winner_dep_required[bank];
                 candidate_present_d[
-                    bank_winner_seq_tag[bank][ROB_ID_W-1:0]] = 1'b1;
+                    (bank_winner_row[bank] * ADMIT_BANKS) + bank] = 1'b1;
             end
         end
     end
 
     always @* begin : interface_outputs
-        integer slot;
         integer fe;
 
-        candidate_valid_o          = {CAND_WINDOW_DEPTH{1'b0}};
-        candidate_seq_tag_o        = {CAND_WINDOW_DEPTH*SEQ_W{1'b0}};
-        candidate_delay_o          = {CAND_WINDOW_DEPTH*DELAY_W{1'b0}};
-        issue_valid_o              = selected_valid_q;
-        issue_packet_o             = {FE_NUM*PACKET_W{1'b0}};
-        issue_delay_o              = {FE_NUM*DELAY_W{1'b0}};
-        issue_dep_required_o       = {FE_NUM{1'b0}};
-        issue_dep_data_o           = {FE_NUM*PACKET_W{1'b0}};
-        candidate_prefetch_visible = {CAND_WINDOW_DEPTH{1'b0}};
+        gather_valid_o          = grant_valid_q;
+        gather_seq_tag_o        = {FE_NUM*SEQ_W{1'b0}};
+        gather_dep_required_o   = grant_dep_required_q;
+        gather_target_seq_tag_o = {FE_NUM*SEQ_W{1'b0}};
+        issue_valid_o           = selected_valid_q;
+        issue_packet_o          = {FE_NUM*PACKET_W{1'b0}};
+        issue_delay_o           = {FE_NUM*DELAY_W{1'b0}};
+        issue_dep_required_o    = {FE_NUM{1'b0}};
+        issue_dep_data_o        = {FE_NUM*PACKET_W{1'b0}};
+        completion_valid_o      = {FE_NUM{1'b0}};
+        completion_seq_tag_o    = {FE_NUM*SEQ_W{1'b0}};
 
         for (fe = 0; fe < FE_NUM; fe = fe + 1) begin
-            if (prefetch_valid_o[fe]) begin
-                candidate_prefetch_visible[prefetch_slot_q[fe]] = 1'b1;
+            if (grant_valid_q[fe]) begin
+                gather_seq_tag_o[fe*SEQ_W +: SEQ_W] =
+                    grant_seq_tag_q[fe];
+                gather_target_seq_tag_o[fe*SEQ_W +: SEQ_W] =
+                    grant_dep_required_q[fe]
+                    ? grant_target_seq_tag_q[fe] : {SEQ_W{1'b0}};
             end
-        end
-        candidate_valid_o =
-            candidate_valid_q
-            & (candidate_data_valid_q | candidate_prefetch_visible);
-        for (slot = 0; slot < CAND_WINDOW_DEPTH; slot = slot + 1) begin
-            if (candidate_valid_q[slot]) begin
-                candidate_seq_tag_o[slot*SEQ_W +: SEQ_W] =
-                    candidate_seq_tag_q[slot];
-                candidate_delay_o[slot*DELAY_W +: DELAY_W] =
-                    candidate_delay_q[slot];
-            end
-        end
-        for (fe = 0; fe < FE_NUM; fe = fe + 1) begin
             if (selected_valid_q[fe]) begin
                 issue_packet_o[fe*PACKET_W +: PACKET_W] =
                     selected_packet_q[fe];
@@ -621,29 +823,12 @@ module PPE_ISSUE_TABLE #(
                 issue_dep_data_o[fe*PACKET_W +: PACKET_W] =
                     selected_dep_data_q[fe];
             end
-        end
-    end
-
-    always @(posedge clk_i or negedge rst_ni) begin : prefetch_request
-        integer bank;
-
-        if (!rst_ni) begin
-            prefetch_valid_o <= {FE_NUM{1'b0}};
-        end else begin
-            prefetch_valid_o <= candidate_fill_valid;
-            for (bank = 0; bank < ADMIT_BANKS; bank = bank + 1) begin
-                if (candidate_fill_valid[bank]) begin
-                    prefetch_slot_q[bank] <= candidate_fill_slot[bank];
-                    prefetch_seq_tag_o[bank*SEQ_W +: SEQ_W] <=
-                        bank_winner_seq_tag[bank];
-                    prefetch_dep_required_o[bank] <=
-                        bank_winner_dep_required[bank];
-                    prefetch_target_seq_tag_o[
-                        bank*SEQ_W +: SEQ_W] <=
-                        bank_winner_dep_required[bank]
-                        ? bank_winner_target_seq_tag[bank]
-                        : {SEQ_W{1'b0}};
-                end
+            completion_valid_o[fe] =
+                fe_out_valid_i[fe] && future_valid_q[fe][0];
+            if (future_valid_q[fe][0]) begin
+                completion_seq_tag_o[fe*SEQ_W +: SEQ_W] =
+                    future_seq_tag_q[
+                        (fe*RETURN_FUTURE_DEPTH)*SEQ_W +: SEQ_W];
             end
         end
     end
@@ -702,19 +887,110 @@ module PPE_ISSUE_TABLE #(
         if (!rst_ni) begin
             selected_valid_q <= {FE_NUM{1'b0}};
         end else begin
-            selected_valid_q <= select_valid_i;
+            selected_valid_q <= grant_valid_q;
             for (fe = 0; fe < FE_NUM; fe = fe + 1) begin
-                if (select_valid_i[fe]) begin
-                    selected_seq_tag_q[fe] <= select_seq_tag[fe];
-                    selected_delay_q[fe] <= select_delay[fe];
+                if (grant_valid_q[fe]) begin
+                    selected_seq_tag_q[fe] <= grant_seq_tag_q[fe];
+                    selected_delay_q[fe] <= grant_delay_q[fe];
                     selected_dep_required_q[fe] <=
-                        select_dep_required[fe];
-                    selected_packet_q[fe] <= select_packet[fe];
-                    selected_dep_data_q[fe] <= select_dep_data[fe];
+                        grant_dep_required_q[fe];
+                    selected_packet_q[fe] <=
+                        gather_packet_i[fe*PACKET_W +: PACKET_W];
+                    if (grant_dep_required_q[fe]) begin
+                        selected_dep_data_q[fe] <=
+                            gather_dep_data_i[fe*PACKET_W +: PACKET_W];
+                    end
                 end
             end
         end
     end
+
+    always @(posedge clk_i or negedge rst_ni) begin : grant_state
+        integer fe;
+
+        if (!rst_ni) begin
+            grant_valid_q         <= {FE_NUM{1'b0}};
+            grant_onehot_q        <= {CAND_WINDOW_DEPTH{1'b0}};
+            grant_dep_required_q  <= {FE_NUM{1'b0}};
+            grant_pending_block_q <= {FE_NUM*3{1'b0}};
+            candidate_way_rr_q    <= {FE_NUM{1'b0}};
+            group_rr_q            <= 2'b00;
+        end else begin
+            grant_valid_q         <= grant_valid_d;
+            grant_onehot_q        <= grant_onehot_d;
+            grant_pending_block_q <= grant_pending_block_d;
+            candidate_way_rr_q    <= ~candidate_way_rr_q;
+            group_rr_q            <= ~group_rr_q;
+            for (fe = 0; fe < FE_NUM; fe = fe + 1) begin
+                if (grant_valid_d[fe]) begin
+                    grant_seq_tag_q[fe] <= grant_seq_tag_d[fe];
+                    grant_target_seq_tag_q[fe] <=
+                        grant_target_seq_tag_d[fe];
+                    grant_delay_q[fe] <= grant_delay_d[fe];
+                    grant_dep_required_q[fe] <=
+                        grant_dep_required_d[fe];
+                end
+            end
+        end
+    end
+
+    genvar future_fe;
+    generate
+        for (future_fe = 0; future_fe < FE_NUM;
+             future_fe = future_fe + 1) begin : g_future_table
+            integer slot;
+
+            always @(posedge clk_i or negedge rst_ni) begin : state
+                if (!rst_ni) begin
+                    future_valid_q[future_fe] <=
+                        {RETURN_FUTURE_DEPTH{1'b0}};
+                end else begin
+                    for (slot = 0; slot < RETURN_FUTURE_DEPTH-1;
+                         slot = slot + 1) begin
+                        future_valid_q[future_fe][slot] <=
+                            future_valid_q[future_fe][slot+1];
+                        if (future_valid_q[future_fe][slot+1]) begin
+                            future_seq_tag_q[
+                                (future_fe*RETURN_FUTURE_DEPTH+slot)*SEQ_W
+                                +: SEQ_W] <= future_seq_tag_q[
+                                    (future_fe*RETURN_FUTURE_DEPTH+slot+1)
+                                    *SEQ_W +: SEQ_W];
+                        end
+                    end
+                    future_valid_q[future_fe]
+                        [RETURN_FUTURE_DEPTH-1] <= 1'b0;
+                    if (grant_valid_q[future_fe]) begin
+                        case (grant_delay_q[future_fe])
+                            2'd0: begin
+                                future_valid_q[future_fe][1] <= 1'b1;
+                                future_seq_tag_q[
+                                    (future_fe*RETURN_FUTURE_DEPTH+1)*SEQ_W
+                                    +: SEQ_W] <= grant_seq_tag_q[future_fe];
+                            end
+                            2'd1: begin
+                                future_valid_q[future_fe][2] <= 1'b1;
+                                future_seq_tag_q[
+                                    (future_fe*RETURN_FUTURE_DEPTH+2)*SEQ_W
+                                    +: SEQ_W] <= grant_seq_tag_q[future_fe];
+                            end
+                            2'd2: begin
+                                future_valid_q[future_fe][3] <= 1'b1;
+                                future_seq_tag_q[
+                                    (future_fe*RETURN_FUTURE_DEPTH+3)*SEQ_W
+                                    +: SEQ_W] <= grant_seq_tag_q[future_fe];
+                            end
+                            default: begin
+                                future_valid_q[future_fe][4] <= 1'b1;
+                                future_seq_tag_q[
+                                    (future_fe*RETURN_FUTURE_DEPTH+4)*SEQ_W
+                                    +: SEQ_W] <= grant_seq_tag_q[future_fe];
+                            end
+                        endcase
+                    end
+                end
+            end
+        end
+    endgenerate
 
     always @(posedge clk_i or negedge rst_ni) begin : candidate_state
         integer bank;
@@ -744,32 +1020,6 @@ module PPE_ISSUE_TABLE #(
                     candidate_target_seq_tag_q[slot] <=
                         candidate_target_seq_tag_d[slot];
                     candidate_delay_q[slot] <= candidate_delay_d[slot];
-                end
-            end
-        end
-    end
-
-    always @(posedge clk_i or negedge rst_ni) begin : candidate_data
-        integer bank;
-
-        if (!rst_ni) begin
-            candidate_data_valid_q <= {CAND_WINDOW_DEPTH{1'b0}};
-        end else begin
-            for (bank = 0; bank < ADMIT_BANKS; bank = bank + 1) begin
-                if (prefetch_valid_o[bank]) begin
-                    candidate_packet_q[prefetch_slot_q[bank]] <=
-                        prefetch_packet_i[bank*PACKET_W +: PACKET_W];
-                    if (prefetch_dep_required_o[bank]) begin
-                        candidate_dep_data_q[prefetch_slot_q[bank]] <=
-                            prefetch_dep_data_i[
-                                bank*PACKET_W +: PACKET_W];
-                    end
-                    candidate_data_valid_q[prefetch_slot_q[bank]] <=
-                        1'b1;
-                end
-                if (candidate_fill_valid[bank]) begin
-                    candidate_data_valid_q[
-                        candidate_fill_slot[bank]] <= 1'b0;
                 end
             end
         end
