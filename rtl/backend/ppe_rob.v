@@ -13,22 +13,23 @@ module PPE_ROB #(
     input  wire [`PPE_N-1:0]                         alloc_reserve_valid_i,
     output reg                                       alloc_reserve_ready_o,
     input  wire [`PPE_N-1:0]                         alloc_commit_valid_i,
-    input  wire [`PPE_N*`PPE_SEQ_W-1:0]              alloc_seq_tag_i,
-    input  wire [`PPE_N*PACKET_W-1:0]                alloc_packet_i,
+    input  wire [`PPE_SEQ_W-1:0]                     alloc_seq_tag_i [0:`PPE_N-1],
+    input  wire [PACKET_W-1:0]                       alloc_packet_i [0:`PPE_N-1],
     input  wire [`PPE_N-1:0]                         dep_status_valid_i,
-    input  wire [`PPE_N*`PPE_SEQ_W-1:0]              dep_status_target_seq_tag_i,
+    input  wire [`PPE_SEQ_W-1:0]                     dep_status_target_seq_tag_i [0:`PPE_N-1],
     output reg  [`PPE_N-1:0]                         dep_status_available_o,
     input  wire [`PPE_ISSUE_WIDTH-1:0]               gather_valid_i,
-    input  wire [`PPE_ISSUE_WIDTH*`PPE_SEQ_W-1:0]    gather_seq_tag_i,
+    input  wire [`PPE_SEQ_W-1:0]                     gather_seq_tag_i [0:`PPE_ISSUE_WIDTH-1],
     input  wire [`PPE_ISSUE_WIDTH-1:0]               gather_dep_required_i,
-    input  wire [`PPE_ISSUE_WIDTH*`PPE_SEQ_W-1:0]    gather_target_seq_tag_i,
-    output wire [`PPE_ISSUE_WIDTH*PACKET_W-1:0]      gather_packet_o,
-    output wire [`PPE_ISSUE_WIDTH*PACKET_W-1:0]      gather_dep_data_o,
+    input  wire [`PPE_SEQ_W-1:0]                     gather_target_seq_tag_i [0:`PPE_ISSUE_WIDTH-1],
+    output wire [PACKET_W-1:0]                       gather_packet_o [0:`PPE_ISSUE_WIDTH-1],
+    output wire [PACKET_W-1:0]                       gather_dep_data_o [0:`PPE_ISSUE_WIDTH-1],
     input  wire [`PPE_FE_NUM-1:0]                    wb_valid_i,
-    input  wire [`PPE_FE_NUM*`PPE_SEQ_W-1:0]         wb_seq_tag_i,
-    input  wire [`PPE_FE_NUM*PACKET_W-1:0]           wb_data_i,
+    input  wire [`PPE_SEQ_W-1:0]                     wb_seq_tag_i [0:`PPE_FE_NUM-1],
+    input  wire [PACKET_W-1:0]                       wb_data_i [0:`PPE_FE_NUM-1],
+    output wire [`PPE_ROB_BANK_ROW_W-1:0]            ready_bank_head_row_o [0:`PPE_N-1],
     output reg  [`PPE_N-1:0]                         retire_valid_o,
-    output reg  [`PPE_N*PACKET_W-1:0]                retire_data_o
+    output reg  [PACKET_W-1:0]                       retire_data_o [0:`PPE_N-1]
 );
 
     localparam integer N                = `PPE_N;
@@ -52,7 +53,7 @@ module PPE_ROB #(
     reg [ROB_DEPTH-1:0] rob_result_valid_q;
     reg [ROB_TAG_HI_W-1:0] rob_tag_hi_q [0:ROB_DEPTH-1];
     wire [SEQ_W-1:0] rob_seq_tag_q [0:ROB_DEPTH-1];
-    reg [DATA_ROW_NUM*PACKET_W-1:0] rob_data_q [0:DATA_BANK_NUM-1];
+    reg [PACKET_W-1:0] rob_data_q [0:DATA_BANK_NUM-1][0:DATA_ROW_NUM-1];
 
     reg [RESULT_BANKS-1:0] history_valid_q;
     reg [HISTORY_TAG_HI_W-1:0] history_tag_hi_q [0:RESULT_BANKS-1];
@@ -86,6 +87,15 @@ module PPE_ROB #(
     reg [ROB_ID_W-1:0] wb_rob_id [0:FE_NUM-1];
     reg [ROB_ID_W-1:0] alloc_rob_id [0:N-1];
     reg [ROB_ID_W-1:0] retire_rob_id [0:N-1];
+
+    genvar head_bank_idx;
+    generate
+        for (head_bank_idx = 0; head_bank_idx < DATA_BANK_NUM;
+             head_bank_idx = head_bank_idx + 1) begin : gen_ready_bank_head
+            assign ready_bank_head_row_o[head_bank_idx] =
+                retire_bank_row_q[head_bank_idx];
+        end
+    endgenerate
     reg [SEQ_W-1:0] retire_seq_tag [0:N-1];
     wire [N-1:0] alloc_commit;
     reg [N-1:0] retire_pending_valid_q;
@@ -110,17 +120,17 @@ module PPE_ROB #(
     reg [SEQ_W-1:0] history_write_seq_tag [0:RESULT_BANKS-1];
     reg [PACKET_W-1:0] history_write_data [0:RESULT_BANKS-1];
 
-    reg [DATA_BANK_NUM*PACKET_W-1:0] retire_bank_data;
-    reg [DATA_BANK_NUM*PACKET_W-1:0] retire_rotate_one_data;
+    reg [PACKET_W-1:0] retire_bank_data [0:DATA_BANK_NUM-1];
+    reg [PACKET_W-1:0] retire_rotate_one_data [0:DATA_BANK_NUM-1];
     reg [DATA_ROW_NUM-1:0] rob_done_bank [0:DATA_BANK_NUM-1];
     reg [DATA_BANK_NUM-1:0] retire_bank_done;
     reg [DATA_BANK_NUM-1:0] retire_rotate_one_done;
     reg [N-1:0] retire_raw_done;
-    reg [DATA_BANK_NUM*ROB_ID_W-1:0] retire_bank_rob_id;
-    reg [DATA_BANK_NUM*ROB_ID_W-1:0] retire_rotate_one_rob_id;
-    reg [DATA_BANK_NUM*ROB_TAG_HI_W-1:0] retire_bank_tag_hi;
-    reg [DATA_BANK_NUM*ROB_TAG_HI_W-1:0] retire_rotate_one_tag_hi;
-    reg [N*ROB_TAG_HI_W-1:0] retire_raw_tag_hi;
+    reg [ROB_ID_W-1:0] retire_bank_rob_id [0:DATA_BANK_NUM-1];
+    reg [ROB_ID_W-1:0] retire_rotate_one_rob_id [0:DATA_BANK_NUM-1];
+    reg [ROB_TAG_HI_W-1:0] retire_bank_tag_hi [0:DATA_BANK_NUM-1];
+    reg [ROB_TAG_HI_W-1:0] retire_rotate_one_tag_hi [0:DATA_BANK_NUM-1];
+    reg [ROB_TAG_HI_W-1:0] retire_raw_tag_hi [0:N-1];
     reg [DATA_BANK_NUM-1:0] retire_inverse_two_valid;
     reg [DATA_BANK_NUM-1:0] retire_bank_advance;
 
@@ -130,29 +140,19 @@ module PPE_ROB #(
     reg [ISSUE_WIDTH-1:0] issue_dep_active_match;
     reg [ISSUE_WIDTH-1:0] issue_dep_active_available;
     reg [ISSUE_WIDTH-1:0] issue_dep_history_match;
-    reg [ISSUE_WIDTH*PACKET_W-1:0] issue_dep_active_data;
-    reg [ISSUE_WIDTH*PACKET_W-1:0] issue_dep_history_data;
-    reg [ISSUE_WIDTH*FE_NUM-1:0] issue_dep_wb_match;
+    reg [PACKET_W-1:0] issue_dep_active_data [0:ISSUE_WIDTH-1];
+    reg [PACKET_W-1:0] issue_dep_history_data [0:ISSUE_WIDTH-1];
+    reg [FE_NUM-1:0] issue_dep_wb_match [0:ISSUE_WIDTH-1];
     reg [ISSUE_WIDTH-1:0] issue_dep_wb_any;
-    reg [ISSUE_WIDTH*PACKET_W-1:0] issue_dep_wb_data;
-    reg [ISSUE_WIDTH*PACKET_W-1:0] issue_packet_d;
-    reg [ISSUE_WIDTH*PACKET_W-1:0] issue_dep_data_d;
+    reg [PACKET_W-1:0] issue_dep_wb_data [0:ISSUE_WIDTH-1];
+    reg [PACKET_W-1:0] issue_packet_d [0:ISSUE_WIDTH-1];
+    reg [PACKET_W-1:0] issue_dep_data_d [0:ISSUE_WIDTH-1];
 
     reg [DATA_BANK_NUM-1:0] source_bank_req_valid;
     reg [DATA_ROW_W-1:0] source_bank_req_row [0:DATA_BANK_NUM-1];
     reg [ROB_TAG_HI_W-1:0] source_bank_req_tag_hi [0:DATA_BANK_NUM-1];
     reg [DATA_BANK_NUM-1:0] source_bank_data_valid;
     reg [PACKET_W-1:0] source_bank_data [0:DATA_BANK_NUM-1];
-
-    function [PACKET_W-1:0] rob_data_read;
-        input [ROB_ID_W-1:0] rob_id;
-        begin
-            rob_data_read =
-                rob_data_q[rob_id[DATA_BANK_W-1:0]][
-                    rob_id[ROB_ID_W-1:DATA_BANK_W]*PACKET_W
-                    +: PACKET_W];
-        end
-    endfunction
 
     integer done_bank;
     integer done_row;
@@ -178,7 +178,7 @@ module PPE_ROB #(
         integer lane_idx;
         for (lane_idx = 0; lane_idx < N; lane_idx = lane_idx + 1) begin
             alloc_rob_id[lane_idx] =
-                alloc_seq_tag_i[lane_idx*SEQ_W +: ROB_ID_W];
+                alloc_seq_tag_i[lane_idx][ROB_ID_W-1:0];
         end
     end
 
@@ -203,7 +203,7 @@ module PPE_ROB #(
                     alloc_rob_id[alloc_idx][
                         ROB_ID_W-1:DATA_BANK_W];
                 alloc_data_capture[alloc_bank] =
-                    alloc_packet_i[alloc_idx*PACKET_W +: PACKET_W];
+                    alloc_packet_i[alloc_idx];
             end
             if (alloc_commit[alloc_idx]) begin
                 alloc_data_capture_valid[alloc_bank] = 1'b1;
@@ -221,7 +221,7 @@ module PPE_ROB #(
         data_entry_write_en = {ROB_DEPTH{1'b0}};
         for (wb_idx = 0; wb_idx < FE_NUM; wb_idx = wb_idx + 1) begin
             wb_rob_id[wb_idx] =
-                wb_seq_tag_i[wb_idx*SEQ_W +: ROB_ID_W];
+                wb_seq_tag_i[wb_idx][ROB_ID_W-1:0];
             wb_lane_entry_commit[wb_idx] = {ROB_DEPTH{1'b0}};
         end
 
@@ -229,8 +229,8 @@ module PPE_ROB #(
              entry_idx = entry_idx + 1) begin
             entry_rob_id = entry_idx[ROB_ID_W-1:0];
             for (wb_idx = 0; wb_idx < FE_NUM; wb_idx = wb_idx + 1) begin
-                wb_tag_hi = wb_seq_tag_i[
-                    wb_idx*SEQ_W+ROB_ID_W +: ROB_TAG_HI_W];
+                wb_tag_hi = wb_seq_tag_i[wb_idx][
+                    ROB_ID_W +: ROB_TAG_HI_W];
                 if (((entry_idx & 1) == 0 && wb_idx < 2)
                     || ((entry_idx & 1) != 0 && wb_idx >= 2)) begin
                     wb_lane_entry_commit[wb_idx][entry_idx] =
@@ -248,18 +248,18 @@ module PPE_ROB #(
                 || wb_lane_entry_commit[3][entry_idx];
             if ((entry_idx & 1) == 0) begin
                 data_entry_write_data[entry_idx] =
-                    (wb_data_i[0*PACKET_W +: PACKET_W]
+                    (wb_data_i[0]
                      & {PACKET_W{
                          wb_lane_entry_commit[0][entry_idx]}})
-                    | (wb_data_i[1*PACKET_W +: PACKET_W]
+                    | (wb_data_i[1]
                        & {PACKET_W{
                            wb_lane_entry_commit[1][entry_idx]}});
             end else begin
                 data_entry_write_data[entry_idx] =
-                    (wb_data_i[2*PACKET_W +: PACKET_W]
+                    (wb_data_i[2]
                      & {PACKET_W{
                          wb_lane_entry_commit[2][entry_idx]}})
-                    | (wb_data_i[3*PACKET_W +: PACKET_W]
+                    | (wb_data_i[3]
                        & {PACKET_W{
                            wb_lane_entry_commit[3][entry_idx]}});
             end
@@ -279,12 +279,6 @@ module PPE_ROB #(
         retire_raw_done = {N{1'b0}};
         retire_valid_o = {N{1'b0}};
         retire_count = {LANE_COUNT_W{1'b0}};
-        retire_bank_rob_id = {DATA_BANK_NUM*ROB_ID_W{1'b0}};
-        retire_rotate_one_rob_id = {DATA_BANK_NUM*ROB_ID_W{1'b0}};
-        retire_bank_tag_hi = {DATA_BANK_NUM*ROB_TAG_HI_W{1'b0}};
-        retire_rotate_one_tag_hi =
-            {DATA_BANK_NUM*ROB_TAG_HI_W{1'b0}};
-        retire_raw_tag_hi = {N*ROB_TAG_HI_W{1'b0}};
         retire_inverse_two_valid = {DATA_BANK_NUM{1'b0}};
         retire_bank_advance = {DATA_BANK_NUM{1'b0}};
 
@@ -292,39 +286,39 @@ module PPE_ROB #(
              bank_idx = bank_idx + 1) begin
             retire_bank_done[bank_idx] =
                 rob_done_bank[bank_idx][retire_bank_row_q[bank_idx]];
-            retire_bank_rob_id[bank_idx*ROB_ID_W +: ROB_ID_W] =
+            retire_bank_rob_id[bank_idx] =
                 {retire_bank_row_q[bank_idx],
                  bank_idx[DATA_BANK_W-1:0]};
-            retire_bank_tag_hi[
-                bank_idx*ROB_TAG_HI_W +: ROB_TAG_HI_W] =
+            retire_bank_tag_hi[bank_idx] =
                 rob_tag_hi_q[
                     {retire_bank_row_q[bank_idx],
                      bank_idx[DATA_BANK_W-1:0]}];
+            retire_rotate_one_rob_id[bank_idx] =
+                retire_bank_rob_id[bank_idx];
+            retire_rotate_one_tag_hi[bank_idx] =
+                retire_bank_tag_hi[bank_idx];
         end
 
         retire_rotate_one_done = retire_bank_done;
-        retire_rotate_one_rob_id = retire_bank_rob_id;
-        retire_rotate_one_tag_hi = retire_bank_tag_hi;
         if (retire_head_bank_q[0]) begin
             retire_rotate_one_done =
                 {retire_bank_done[0], retire_bank_done[3:1]};
-            retire_rotate_one_rob_id =
-                {retire_bank_rob_id[ROB_ID_W-1:0],
-                 retire_bank_rob_id[4*ROB_ID_W-1:ROB_ID_W]};
-            retire_rotate_one_tag_hi =
-                {retire_bank_tag_hi[ROB_TAG_HI_W-1:0],
-                 retire_bank_tag_hi[
-                    4*ROB_TAG_HI_W-1:ROB_TAG_HI_W]};
+            for (retire_idx = 0; retire_idx < N;
+                 retire_idx = retire_idx + 1) begin
+                retire_rotate_one_rob_id[retire_idx] =
+                    retire_bank_rob_id[(retire_idx+1)%N];
+                retire_rotate_one_tag_hi[retire_idx] =
+                    retire_bank_tag_hi[(retire_idx+1)%N];
+            end
         end
 
         retire_raw_done = retire_rotate_one_done;
         for (retire_idx = 0; retire_idx < N;
              retire_idx = retire_idx + 1) begin
-            retire_rob_id[retire_idx] =
-                retire_rotate_one_rob_id[
-                    retire_idx*ROB_ID_W +: ROB_ID_W];
+            retire_rob_id[retire_idx] = retire_rotate_one_rob_id[retire_idx];
+            retire_raw_tag_hi[retire_idx] =
+                retire_rotate_one_tag_hi[retire_idx];
         end
-        retire_raw_tag_hi = retire_rotate_one_tag_hi;
         if (retire_head_bank_q[1]) begin
             retire_raw_done =
                 {retire_rotate_one_done[1:0],
@@ -332,13 +326,10 @@ module PPE_ROB #(
             for (retire_idx = 0; retire_idx < N;
                  retire_idx = retire_idx + 1) begin
                 retire_rob_id[retire_idx] =
-                    retire_rotate_one_rob_id[
-                        ((retire_idx+2)%N)*ROB_ID_W +: ROB_ID_W];
+                    retire_rotate_one_rob_id[(retire_idx+2)%N];
+                retire_raw_tag_hi[retire_idx] =
+                    retire_rotate_one_tag_hi[(retire_idx+2)%N];
             end
-            retire_raw_tag_hi =
-                {retire_rotate_one_tag_hi[2*ROB_TAG_HI_W-1:0],
-                 retire_rotate_one_tag_hi[
-                    4*ROB_TAG_HI_W-1:2*ROB_TAG_HI_W]};
         end
 
         retire_valid_o[0] = retire_raw_done[0];
@@ -368,8 +359,7 @@ module PPE_ROB #(
         for (retire_idx = 0; retire_idx < N;
              retire_idx = retire_idx + 1) begin
             retire_seq_tag[retire_idx] =
-                {retire_raw_tag_hi[
-                     retire_idx*ROB_TAG_HI_W +: ROB_TAG_HI_W],
+                {retire_raw_tag_hi[retire_idx],
                  retire_rob_id[retire_idx]};
         end
     end
@@ -377,25 +367,27 @@ module PPE_ROB #(
     always @* begin : retirement_data_read
         integer bank_idx;
 
-        retire_bank_data = {DATA_BANK_NUM*PACKET_W{1'b0}};
         for (bank_idx = 0; bank_idx < DATA_BANK_NUM;
              bank_idx = bank_idx + 1) begin
-            retire_bank_data[bank_idx*PACKET_W +: PACKET_W] =
-                rob_data_q[bank_idx][
-                    retire_bank_row_q[bank_idx]*PACKET_W +: PACKET_W];
+            retire_bank_data[bank_idx] =
+                rob_data_q[bank_idx][retire_bank_row_q[bank_idx]];
+            retire_rotate_one_data[bank_idx] = retire_bank_data[bank_idx];
         end
-        retire_rotate_one_data = retire_bank_data;
         if (retire_head_bank_q[0]) begin
-            retire_rotate_one_data =
-                {retire_bank_data[PACKET_W-1:0],
-                 retire_bank_data[4*PACKET_W-1:PACKET_W]};
+            for (bank_idx = 0; bank_idx < DATA_BANK_NUM;
+                 bank_idx = bank_idx + 1) begin
+                retire_rotate_one_data[bank_idx] =
+                    retire_bank_data[(bank_idx+1)%N];
+            end
         end
-        retire_data_o = retire_rotate_one_data;
-        if (retire_head_bank_q[1]) begin
-            retire_data_o =
-                {retire_rotate_one_data[2*PACKET_W-1:0],
-                 retire_rotate_one_data[
-                    4*PACKET_W-1:2*PACKET_W]};
+        for (bank_idx = 0; bank_idx < DATA_BANK_NUM;
+             bank_idx = bank_idx + 1) begin
+            if (retire_head_bank_q[1]) begin
+                retire_data_o[bank_idx] =
+                    retire_rotate_one_data[(bank_idx+2)%N];
+            end else begin
+                retire_data_o[bank_idx] = retire_rotate_one_data[bank_idx];
+            end
         end
     end
 
@@ -467,7 +459,6 @@ module PPE_ROB #(
 
         source_bank_req_valid = {DATA_BANK_NUM{1'b0}};
         source_bank_data_valid = {DATA_BANK_NUM{1'b0}};
-        issue_packet_d = {ISSUE_WIDTH*PACKET_W{1'b0}};
         source_rob_id = {ROB_ID_W{1'b0}};
         lane_hit = 1'b0;
         pair_base = 0;
@@ -481,20 +472,19 @@ module PPE_ROB #(
                  pair_lane = pair_lane + 1) begin
                 read_idx = pair_base + pair_lane;
                 lane_hit = gather_valid_i[read_idx]
-                    && (gather_seq_tag_i[
-                            read_idx*SEQ_W +: DATA_BANK_W]
+                    && (gather_seq_tag_i[read_idx][DATA_BANK_W-1:0]
                         == bank_idx[DATA_BANK_W-1:0]);
                 source_bank_req_valid[bank_idx] =
                     source_bank_req_valid[bank_idx] | lane_hit;
                 source_bank_req_row[bank_idx] =
                     source_bank_req_row[bank_idx]
-                    | (gather_seq_tag_i[
-                           read_idx*SEQ_W+DATA_BANK_W +: DATA_ROW_W]
+                    | (gather_seq_tag_i[read_idx][
+                           DATA_BANK_W +: DATA_ROW_W]
                        & {DATA_ROW_W{lane_hit}});
                 source_bank_req_tag_hi[bank_idx] =
                     source_bank_req_tag_hi[bank_idx]
-                    | (gather_seq_tag_i[
-                           read_idx*SEQ_W+ROB_ID_W +: ROB_TAG_HI_W]
+                    | (gather_seq_tag_i[read_idx][
+                           ROB_ID_W +: ROB_TAG_HI_W]
                        & {ROB_TAG_HI_W{lane_hit}});
             end
             source_rob_id =
@@ -512,37 +502,31 @@ module PPE_ROB #(
                     source_bank_data[bank_idx] = alloc_data_q[bank_idx];
                 end else begin
                     source_bank_data[bank_idx] =
-                        rob_data_q[bank_idx][
-                            source_bank_req_row[bank_idx]*PACKET_W
-                            +: PACKET_W];
+                        rob_data_q[bank_idx][source_bank_req_row[bank_idx]];
                 end
             end
         end
         for (read_idx = 0; read_idx < ISSUE_WIDTH;
              read_idx = read_idx + 1) begin
-            source_bank =
-                gather_seq_tag_i[read_idx*SEQ_W +: DATA_BANK_W];
+            issue_packet_d[read_idx] = {PACKET_W{1'b0}};
+            source_bank = gather_seq_tag_i[read_idx][DATA_BANK_W-1:0];
             if (read_idx < 2) begin
                 if (gather_valid_i[read_idx] && (source_bank == 2)
                     && source_bank_data_valid[2]) begin
-                    issue_packet_d[read_idx*PACKET_W +: PACKET_W] =
-                        source_bank_data[2];
+                    issue_packet_d[read_idx] = source_bank_data[2];
                 end else if (gather_valid_i[read_idx]
                              && (source_bank == 0)
                              && source_bank_data_valid[0]) begin
-                    issue_packet_d[read_idx*PACKET_W +: PACKET_W] =
-                        source_bank_data[0];
+                    issue_packet_d[read_idx] = source_bank_data[0];
                 end
             end else begin
                 if (gather_valid_i[read_idx] && (source_bank == 3)
                     && source_bank_data_valid[3]) begin
-                    issue_packet_d[read_idx*PACKET_W +: PACKET_W] =
-                        source_bank_data[3];
+                    issue_packet_d[read_idx] = source_bank_data[3];
                 end else if (gather_valid_i[read_idx]
                              && (source_bank == 1)
                              && source_bank_data_valid[1]) begin
-                    issue_packet_d[read_idx*PACKET_W +: PACKET_W] =
-                        source_bank_data[1];
+                    issue_packet_d[read_idx] = source_bank_data[1];
                 end
             end
         end
@@ -559,63 +543,55 @@ module PPE_ROB #(
         issue_dep_active_match = {ISSUE_WIDTH{1'b0}};
         issue_dep_active_available = {ISSUE_WIDTH{1'b0}};
         issue_dep_history_match = {ISSUE_WIDTH{1'b0}};
-        issue_dep_active_data = {ISSUE_WIDTH*PACKET_W{1'b0}};
-        issue_dep_history_data = {ISSUE_WIDTH*PACKET_W{1'b0}};
-
         for (query_idx = 0; query_idx < N; query_idx = query_idx + 1) begin
-            target_rob_id = dep_status_target_seq_tag_i[
-                query_idx*SEQ_W +: ROB_ID_W];
-            history_id = dep_status_target_seq_tag_i[
-                query_idx*SEQ_W +: HISTORY_ID_W];
+            target_rob_id = dep_status_target_seq_tag_i[query_idx][ROB_ID_W-1:0];
+            history_id = dep_status_target_seq_tag_i[query_idx][HISTORY_ID_W-1:0];
             if (dep_status_valid_i[query_idx]) begin
                 if (rob_valid_q[target_rob_id]
                     && (rob_tag_hi_q[target_rob_id]
-                        == dep_status_target_seq_tag_i[
-                            query_idx*SEQ_W+ROB_ID_W
-                            +: ROB_TAG_HI_W])) begin
+                        == dep_status_target_seq_tag_i[query_idx][
+                            ROB_ID_W +: ROB_TAG_HI_W])) begin
                     dep_status_active_match[query_idx] = 1'b1;
                     dep_status_active_available[query_idx] =
                         rob_result_valid_q[target_rob_id];
                 end
                 if (history_valid_q[history_id]
                     && (history_tag_hi_q[history_id]
-                        == dep_status_target_seq_tag_i[
-                            query_idx*SEQ_W+HISTORY_ID_W
-                            +: HISTORY_TAG_HI_W])) begin
+                        == dep_status_target_seq_tag_i[query_idx][
+                            HISTORY_ID_W +: HISTORY_TAG_HI_W])) begin
                     dep_status_history_match[query_idx] = 1'b1;
                 end
             end
         end
         for (query_idx = 0; query_idx < ISSUE_WIDTH;
              query_idx = query_idx + 1) begin
-            target_rob_id = gather_target_seq_tag_i[
-                query_idx*SEQ_W +: ROB_ID_W];
-            history_id = gather_target_seq_tag_i[
-                query_idx*SEQ_W +: HISTORY_ID_W];
+            issue_dep_active_data[query_idx] = {PACKET_W{1'b0}};
+            issue_dep_history_data[query_idx] = {PACKET_W{1'b0}};
+            target_rob_id = gather_target_seq_tag_i[query_idx][ROB_ID_W-1:0];
+            history_id = gather_target_seq_tag_i[query_idx][HISTORY_ID_W-1:0];
             if (gather_valid_i[query_idx]
                 && gather_dep_required_i[query_idx]) begin
                 if (rob_valid_q[target_rob_id]
                     && (rob_tag_hi_q[target_rob_id]
-                        == gather_target_seq_tag_i[
-                            query_idx*SEQ_W+ROB_ID_W
-                            +: ROB_TAG_HI_W])) begin
+                        == gather_target_seq_tag_i[query_idx][
+                            ROB_ID_W +: ROB_TAG_HI_W])) begin
                     issue_dep_active_match[query_idx] = 1'b1;
                     issue_dep_active_available[query_idx] =
                         rob_result_valid_q[target_rob_id];
                     if (rob_result_valid_q[target_rob_id]) begin
-                        issue_dep_active_data[
-                            query_idx*PACKET_W +: PACKET_W] =
-                            rob_data_read(target_rob_id);
+                        issue_dep_active_data[query_idx] =
+                            rob_data_q[
+                                target_rob_id[DATA_BANK_W-1:0]][
+                                target_rob_id[
+                                    ROB_ID_W-1:DATA_BANK_W]];
                     end
                 end
                 if (history_valid_q[history_id]
                     && (history_tag_hi_q[history_id]
-                        == gather_target_seq_tag_i[
-                            query_idx*SEQ_W+HISTORY_ID_W
-                            +: HISTORY_TAG_HI_W])) begin
+                        == gather_target_seq_tag_i[query_idx][
+                            HISTORY_ID_W +: HISTORY_TAG_HI_W])) begin
                     issue_dep_history_match[query_idx] = 1'b1;
-                    issue_dep_history_data[
-                        query_idx*PACKET_W +: PACKET_W] =
+                    issue_dep_history_data[query_idx] =
                         history_data_q[history_id];
                 end
             end
@@ -636,8 +612,7 @@ module PPE_ROB #(
         wb_idx = 0;
         for (query_idx = 0; query_idx < N; query_idx = query_idx + 1) begin
             source_resolved = 1'b0;
-            target_rob_id = dep_status_target_seq_tag_i[
-                query_idx*SEQ_W +: ROB_ID_W];
+            target_rob_id = dep_status_target_seq_tag_i[query_idx][ROB_ID_W-1:0];
             if (dep_status_valid_i[query_idx]) begin
                 pair_base = target_rob_id[0] ? 2 : 0;
                 for (pair_lane = 0; pair_lane < 2;
@@ -646,9 +621,8 @@ module PPE_ROB #(
                     if (!source_resolved
                         && wb_commit[wb_idx]
                         && (wb_rob_id[wb_idx] == target_rob_id)
-                        && (wb_seq_tag_i[wb_idx*SEQ_W +: SEQ_W]
-                            == dep_status_target_seq_tag_i[
-                                query_idx*SEQ_W +: SEQ_W])) begin
+                        && (wb_seq_tag_i[wb_idx]
+                            == dep_status_target_seq_tag_i[query_idx])) begin
                         source_resolved = 1'b1;
                         dep_status_available_o[query_idx] = 1'b1;
                     end
@@ -671,51 +645,49 @@ module PPE_ROB #(
         integer query_idx;
         integer wb_idx;
 
-        issue_dep_wb_match = {ISSUE_WIDTH*FE_NUM{1'b0}};
         issue_dep_wb_any = {ISSUE_WIDTH{1'b0}};
-        issue_dep_wb_data = {ISSUE_WIDTH*PACKET_W{1'b0}};
         for (query_idx = 0; query_idx < ISSUE_WIDTH;
              query_idx = query_idx + 1) begin
-            if (!gather_target_seq_tag_i[query_idx*SEQ_W]) begin
+            issue_dep_wb_match[query_idx] = {FE_NUM{1'b0}};
+            issue_dep_wb_data[query_idx] = {PACKET_W{1'b0}};
+            if (!gather_target_seq_tag_i[query_idx][0]) begin
                 for (wb_idx = 0; wb_idx < 2; wb_idx = wb_idx + 1) begin
-                    issue_dep_wb_match[query_idx*FE_NUM+wb_idx] =
+                    issue_dep_wb_match[query_idx][wb_idx] =
                         gather_valid_i[query_idx]
                         && gather_dep_required_i[query_idx]
                         && wb_commit[wb_idx]
-                        && (wb_seq_tag_i[wb_idx*SEQ_W +: SEQ_W]
-                            == gather_target_seq_tag_i[
-                                query_idx*SEQ_W +: SEQ_W]);
+                        && (wb_seq_tag_i[wb_idx]
+                            == gather_target_seq_tag_i[query_idx]);
                 end
                 issue_dep_wb_any[query_idx] =
-                    issue_dep_wb_match[query_idx*FE_NUM+0]
-                    || issue_dep_wb_match[query_idx*FE_NUM+1];
-                issue_dep_wb_data[query_idx*PACKET_W +: PACKET_W] =
-                    (wb_data_i[0*PACKET_W +: PACKET_W]
+                    issue_dep_wb_match[query_idx][0]
+                    || issue_dep_wb_match[query_idx][1];
+                issue_dep_wb_data[query_idx] =
+                    (wb_data_i[0]
                      & {PACKET_W{
-                         issue_dep_wb_match[query_idx*FE_NUM+0]}})
-                    | (wb_data_i[1*PACKET_W +: PACKET_W]
+                         issue_dep_wb_match[query_idx][0]}})
+                    | (wb_data_i[1]
                        & {PACKET_W{
-                           issue_dep_wb_match[query_idx*FE_NUM+1]}});
+                           issue_dep_wb_match[query_idx][1]}});
             end else begin
                 for (wb_idx = 2; wb_idx < 4; wb_idx = wb_idx + 1) begin
-                    issue_dep_wb_match[query_idx*FE_NUM+wb_idx] =
+                    issue_dep_wb_match[query_idx][wb_idx] =
                         gather_valid_i[query_idx]
                         && gather_dep_required_i[query_idx]
                         && wb_commit[wb_idx]
-                        && (wb_seq_tag_i[wb_idx*SEQ_W +: SEQ_W]
-                            == gather_target_seq_tag_i[
-                                query_idx*SEQ_W +: SEQ_W]);
+                        && (wb_seq_tag_i[wb_idx]
+                            == gather_target_seq_tag_i[query_idx]);
                 end
                 issue_dep_wb_any[query_idx] =
-                    issue_dep_wb_match[query_idx*FE_NUM+2]
-                    || issue_dep_wb_match[query_idx*FE_NUM+3];
-                issue_dep_wb_data[query_idx*PACKET_W +: PACKET_W] =
-                    (wb_data_i[2*PACKET_W +: PACKET_W]
+                    issue_dep_wb_match[query_idx][2]
+                    || issue_dep_wb_match[query_idx][3];
+                issue_dep_wb_data[query_idx] =
+                    (wb_data_i[2]
                      & {PACKET_W{
-                         issue_dep_wb_match[query_idx*FE_NUM+2]}})
-                    | (wb_data_i[3*PACKET_W +: PACKET_W]
+                         issue_dep_wb_match[query_idx][2]}})
+                    | (wb_data_i[3]
                        & {PACKET_W{
-                           issue_dep_wb_match[query_idx*FE_NUM+3]}});
+                           issue_dep_wb_match[query_idx][3]}});
             end
         end
     end
@@ -723,35 +695,34 @@ module PPE_ROB #(
     always @* begin : dependency_data_resolve
         integer query_idx;
 
-        issue_dep_data_d = {ISSUE_WIDTH*PACKET_W{1'b0}};
         for (query_idx = 0; query_idx < ISSUE_WIDTH;
              query_idx = query_idx + 1) begin
+            issue_dep_data_d[query_idx] = {PACKET_W{1'b0}};
             if (gather_valid_i[query_idx]
                 && gather_dep_required_i[query_idx]) begin
                 if (issue_dep_wb_any[query_idx]) begin
-                    issue_dep_data_d[
-                        query_idx*PACKET_W +: PACKET_W] =
-                        issue_dep_wb_data[
-                            query_idx*PACKET_W +: PACKET_W];
+                    issue_dep_data_d[query_idx] = issue_dep_wb_data[query_idx];
                 end else if (issue_dep_active_match[query_idx]) begin
                     if (issue_dep_active_available[query_idx]) begin
-                        issue_dep_data_d[
-                            query_idx*PACKET_W +: PACKET_W] =
-                            issue_dep_active_data[
-                                query_idx*PACKET_W +: PACKET_W];
+                        issue_dep_data_d[query_idx] =
+                            issue_dep_active_data[query_idx];
                     end
                 end else if (issue_dep_history_match[query_idx]) begin
-                    issue_dep_data_d[
-                        query_idx*PACKET_W +: PACKET_W] =
-                        issue_dep_history_data[
-                            query_idx*PACKET_W +: PACKET_W];
+                    issue_dep_data_d[query_idx] =
+                        issue_dep_history_data[query_idx];
                 end
             end
         end
     end
 
-    assign gather_packet_o = issue_packet_d;
-    assign gather_dep_data_o = issue_dep_data_d;
+    generate
+        genvar gather_lane;
+        for (gather_lane = 0; gather_lane < ISSUE_WIDTH;
+             gather_lane = gather_lane + 1) begin : gather_outputs
+            assign gather_packet_o[gather_lane] = issue_packet_d[gather_lane];
+            assign gather_dep_data_o[gather_lane] = issue_dep_data_d[gather_lane];
+        end
+    endgenerate
 
     always @(posedge clk_i or negedge rst_ni) begin : rob_metadata_update
         integer entry_idx;
@@ -778,8 +749,7 @@ module PPE_ROB #(
                 if (alloc_commit[alloc_idx]) begin
                     rob_valid_q[alloc_rob_id[alloc_idx]] <= 1'b1;
                     rob_tag_hi_q[alloc_rob_id[alloc_idx]] <=
-                        alloc_seq_tag_i[
-                            alloc_idx*SEQ_W+ROB_ID_W +: ROB_TAG_HI_W];
+                        alloc_seq_tag_i[alloc_idx][ROB_ID_W +: ROB_TAG_HI_W];
                     rob_result_valid_q[alloc_rob_id[alloc_idx]] <= 1'b0;
                 end
         end
@@ -811,7 +781,7 @@ module PPE_ROB #(
              retire_idx = retire_idx + 1)
             if (retire_valid_o[retire_idx])
                 retire_pending_data_q[retire_idx] <=
-                    retire_data_o[retire_idx*PACKET_W +: PACKET_W];
+                    retire_data_o[retire_idx];
     end
 
     always @(posedge clk_i or negedge rst_ni) begin : alloc_data_control
@@ -845,13 +815,13 @@ module PPE_ROB #(
                  row_idx = row_idx + 1) begin
                 if (data_entry_write_en[
                         row_idx*DATA_BANK_NUM+bank_idx])
-                    rob_data_q[bank_idx][row_idx*PACKET_W +: PACKET_W]
+                    rob_data_q[bank_idx][row_idx]
                         <= data_entry_write_data[
                             row_idx*DATA_BANK_NUM+bank_idx];
                 if (alloc_data_valid_q[bank_idx]
                     && (alloc_data_row_q[bank_idx]
                         == row_idx[DATA_ROW_W-1:0]))
-                    rob_data_q[bank_idx][row_idx*PACKET_W +: PACKET_W]
+                    rob_data_q[bank_idx][row_idx]
                         <= alloc_data_q[bank_idx];
             end
     end

@@ -16,6 +16,7 @@ class ppe_load_mix_perf_seq extends uvm_sequence #(ppe_item);
     bit [2:0] dep_pool[21];
     int unsigned dep_index = 21;
     int unsigned dep_block;
+    int unsigned dep_per_21 = 7;
 
     function new(string name = "ppe_load_mix_perf_seq");
         super.new(name);
@@ -30,6 +31,11 @@ class ppe_load_mix_perf_seq extends uvm_sequence #(ppe_item);
         bit [3:0] lane_mask;
 
         seq = 0;
+        void'($value$plusargs("MIXED_DEP_PER_21=%d", dep_per_21));
+        if (dep_per_21 > 21) begin
+            `uvm_fatal("LOAD_DEP_CONFIG", $sformatf(
+                "MIXED_DEP_PER_21=%0d must be in 0..21", dep_per_21))
+        end
 
         // Medium load: two of four input ports are valid on every source beat.
         for (beat = 0; beat < MEDIUM_BEATS; beat++) begin
@@ -119,11 +125,11 @@ class ppe_load_mix_perf_seq extends uvm_sequence #(ppe_item);
         int unsigned i;
         int unsigned j;
 
-        for (i = 0; i < 14; i++) begin
+        for (i = 0; i < (21 - dep_per_21); i++) begin
             dep_pool[i] = 3'd0;
         end
-        for (i = 14; i < 21; i++) begin
-            dep_pool[i] = i - 13;
+        for (i = 0; i < dep_per_21; i++) begin
+            dep_pool[(21 - dep_per_21) + i] = (i % 7) + 1;
         end
 
         // Keep the first group ordered so every nonzero offset has history.

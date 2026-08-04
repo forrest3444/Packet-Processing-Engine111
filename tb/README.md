@@ -35,6 +35,15 @@ The `PIPE_STALL` lines separate independent pressure indicators. They are not
 exclusive cycle classifications: for example, dependency waiting and ROB-head
 waiting can overlap in the same cycle.
 
+The mixed workload keeps seven dependent packets per 21 packets by default.
+Override the exact ratio with `MIXED_DEP_PER_21=0..21`; zero selects a fully
+dependency-free mixed workload:
+
+```sh
+make run BUILD_NAME=<build> TESTNAME=ppe_load_mix_perf_test SEED=1 \
+  USER_SIM_OPTS=+MIXED_DEP_PER_21=0
+```
+
 Compile and run the same test with an FSDB waveform using:
 
 ```sh

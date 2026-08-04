@@ -13,3 +13,6 @@ inter.vpd
 vcs.log
 tr_db.log
 novas_dump.log
+novas.conf
+novas.rc
+verdiLog/

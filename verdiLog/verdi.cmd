@@ -264,3 +264,45 @@ wvSetCursor -win $_nWave2 3404719.796856 -snap {("G1" 7)}
 wvSetCursor -win $_nWave2 3415582.746153 -snap {("G1" 7)}
 wvSetCursor -win $_nWave2 3424408.892456 -snap {("G1" 7)}
 wvSetCursor -win $_nWave2 3433235.038759 -snap {("G1" 7)}
+verdiWindowResize -win $_Verdi_1 "513" "19" "1708" "1135"
+wvSetCursor -win $_nWave2 74343.309247 -snap {("G1" 1)}
+wvSelectSignal -win $_nWave2 {( "G1" 1 )} 
+wvSelectSignal -win $_nWave2 {( "G1" 1 )} 
+wvSetRadix -win $_nWave2 -format Bin
+wvSetCursor -win $_nWave2 84527.324212 -snap {("G1" 1)}
+wvSetCursor -win $_nWave2 76040.645074 -snap {("G1" 1)}
+wvSetCursor -win $_nWave2 84866.791378 -snap {("G1" 1)}
+wvSetCursor -win $_nWave2 95390.273508 -snap {("G1" 1)}
+wvSetCursor -win $_nWave2 104555.886977 -snap {("G1" 1)}
+wvSetCursor -win $_nWave2 113382.033281 -snap {("G1" 1)}
+wvSetCursor -win $_nWave2 75022.243578 -snap {("G1" 1)}
+wvSetCursor -win $_nWave2 84187.857047 -snap {("G1" 1)}
+wvSetCursor -win $_nWave2 94711.339177 -snap {("G1" 1)}
+wvSetCursor -win $_nWave2 104895.354143 -snap {("G1" 1)}
+wvSetCursor -win $_nWave2 115758.303439 -snap {("G1" 1)}
+wvSetCursor -win $_nWave2 123905.515411 -snap {("G1" 1)}
+wvSetCursor -win $_nWave2 135786.866204 -snap {("G1" 1)}
+wvSetCursor -win $_nWave2 143594.611011 -snap {("G1" 1)}
+wvSetCursor -win $_nWave2 103537.485481 -snap {("G1" 4)}
+wvSelectSignal -win $_nWave2 {( "G1" 1 )} 
+wvSetRadix -win $_nWave2 -format Hex
+wvSelectSignal -win $_nWave2 {( "G1" 1 )} 
+wvSetRadix -win $_nWave2 -format Bin
+wvSelectSignal -win $_nWave2 {( "G1" 1 )} 
+wvSetRadix -win $_nWave2 -format Ascii
+wvSelectSignal -win $_nWave2 {( "G1" 1 )} 
+wvSetRadix -win $_nWave2 -format Bin
+wvZoomIn -win $_nWave2
+wvZoom -win $_nWave2 106762.423553 152081.290149
+wvUndo -win $_nWave2
+wvSetPosition -win $_nWave2 {("G2" 0)}
+wvSetPosition -win $_nWave2 {("G1" 7)}
+wvUndo -win $_nWave2
+wvSetPosition -win $_nWave2 {("G1" 7)}
+wvSetPosition -win $_nWave2 {("G1" 8)}
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G2" 0)}
+wvSetPosition -win $_nWave2 {("G1" 7)}
+wvSelectSignal -win $_nWave2 {( "G1" 7 )} 
+wvZoomOut -win $_nWave2
+wvZoomOut -win $_nWave2

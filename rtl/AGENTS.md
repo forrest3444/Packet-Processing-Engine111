@@ -1,10 +1,11 @@
-# Verilog-2001 RTL Design Guidelines
+# Synthesizable RTL Design Guidelines
 
 ## Scope
 
-These rules apply to the maintained four-FE RTL. The single-FE baseline remains
-SystemVerilog until it is migrated as a separate task; it shares only the
-Verilog configuration header with the maintained RTL.
+These rules apply to the maintained four-FE RTL. The maintained RTL uses
+SystemVerilog unpacked arrays for repeated multi-bit channels while retaining a
+conservative Verilog-style coding subset elsewhere. The single-FE baseline is
+outside this scope and shares only the configuration header.
 
 ## File Organization
 
@@ -103,9 +104,10 @@ external protocol.
   ``default_nettype none``; restore ``default_nettype wire`` at end of file.
 - Use a concise file header stating the file, block, responsibility, and
   governing design references when applicable.
-- Express repeated channels as flat vectors. Slice `k` occupies
-  `[k*WIDTH +: WIDTH]`, so logical index zero is always the least-significant
-  slice.
+- Express repeated multi-bit channels as unpacked arrays, for example
+  `wire [WIDTH-1:0] data [0:CHANNELS-1]`. Logical channel zero occupies array
+  element zero. Keep one-bit valid, enable, and mask collections as packed
+  vectors when bitwise operations are useful.
 - Keep shared dimensions in the guarded configuration header; derive private
   widths with `localparam integer`.
 - Use block-local `integer` declarations only for static loop indices.

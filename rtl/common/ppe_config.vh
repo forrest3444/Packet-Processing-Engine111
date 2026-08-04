@@ -1,7 +1,7 @@
 `ifndef PPE_CONFIG_VH
 `define PPE_CONFIG_VH
 
-// PPE configuration shared by Verilog-2001 design modules.
+// PPE configuration shared by synthesizable design modules.
 `define PPE_N                    4
 `define PPE_FE_NUM               4
 `define PPE_ROB_DEPTH            32
@@ -21,5 +21,6 @@
 // Widths derived from the maintained configuration.
 `define PPE_SEQ_W                6
 `define PPE_HISTORY_ID_W         3
+`define PPE_ROB_BANK_ROW_W       (`PPE_ROB_ID_W - 2)
 
 `endif

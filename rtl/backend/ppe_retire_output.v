@@ -11,9 +11,9 @@ module PPE_RETIRE_OUTPUT #(
     input  wire                              clk_i,
     input  wire                              rst_ni,
     input  wire [`PPE_N-1:0]                 retire_valid_i,
-    input  wire [`PPE_N*PACKET_W-1:0]        retire_data_i,
+    input  wire [PACKET_W-1:0]               retire_data_i [0:`PPE_N-1],
     output reg  [`PPE_N-1:0]                 out_valid_o,
-    output reg  [`PPE_N*PACKET_W-1:0]        out_packet_o
+    output reg  [PACKET_W-1:0]               out_packet_o [0:`PPE_N-1]
 );
 
     localparam integer N              = `PPE_N;
@@ -23,29 +23,37 @@ module PPE_RETIRE_OUTPUT #(
     reg [LANE_ID_W-1:0]               start_lane_q;
     reg [RETIRE_COUNT_W-1:0]          retire_count;
     reg [N-1:0]                       rotate_one_valid;
-    reg [N*PACKET_W-1:0]              rotate_one_data;
+    reg [PACKET_W-1:0]                rotate_one_data [0:N-1];
     reg [N-1:0]                       mapped_valid;
-    reg [N*PACKET_W-1:0]              mapped_data;
+    reg [PACKET_W-1:0]                mapped_data [0:N-1];
 
     always @* begin : retirement_lane_mapping
         rotate_one_valid = retire_valid_i;
-        rotate_one_data  = retire_data_i;
+        rotate_one_data[0] = retire_data_i[0];
+        rotate_one_data[1] = retire_data_i[1];
+        rotate_one_data[2] = retire_data_i[2];
+        rotate_one_data[3] = retire_data_i[3];
         if (start_lane_q[0]) begin
             rotate_one_valid =
                 {retire_valid_i[2:0], retire_valid_i[3]};
-            rotate_one_data =
-                {retire_data_i[3*PACKET_W-1:0],
-                 retire_data_i[4*PACKET_W-1:3*PACKET_W]};
+            rotate_one_data[0] = retire_data_i[3];
+            rotate_one_data[1] = retire_data_i[0];
+            rotate_one_data[2] = retire_data_i[1];
+            rotate_one_data[3] = retire_data_i[2];
         end
 
         mapped_valid = rotate_one_valid;
-        mapped_data  = rotate_one_data;
+        mapped_data[0] = rotate_one_data[0];
+        mapped_data[1] = rotate_one_data[1];
+        mapped_data[2] = rotate_one_data[2];
+        mapped_data[3] = rotate_one_data[3];
         if (start_lane_q[1]) begin
             mapped_valid =
                 {rotate_one_valid[1:0], rotate_one_valid[3:2]};
-            mapped_data =
-                {rotate_one_data[2*PACKET_W-1:0],
-                 rotate_one_data[4*PACKET_W-1:2*PACKET_W]};
+            mapped_data[0] = rotate_one_data[2];
+            mapped_data[1] = rotate_one_data[3];
+            mapped_data[2] = rotate_one_data[0];
+            mapped_data[3] = rotate_one_data[1];
         end
 
         case (retire_valid_i)
@@ -68,8 +76,7 @@ module PPE_RETIRE_OUTPUT #(
             out_valid_o <= mapped_valid;
             for (lane_idx = 0; lane_idx < N; lane_idx = lane_idx + 1) begin
                 if (mapped_valid[lane_idx]) begin
-                    out_packet_o[lane_idx*PACKET_W +: PACKET_W] <=
-                        mapped_data[lane_idx*PACKET_W +: PACKET_W];
+                    out_packet_o[lane_idx] <= mapped_data[lane_idx];
                 end
             end
 

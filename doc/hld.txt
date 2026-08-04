@@ -24,7 +24,7 @@ PPE按状态所有权划分为以下主要逻辑模块：
   3) scheduler：issue table、依赖等待、候选选择、FE匹配、operand gather和返回日历；
   4) backend：ROB、FE写回、依赖结果解析、保序退休、history和内部allocation容量判断。
 
-Verilog-2001实现可将scheduler和backend中的状态所有者、纯组合选择器进一步拆为独立
+RTL实现可将scheduler和backend中的状态所有者、纯组合选择器进一步拆为独立
 文件，但不得因此形成多模块共同写同一状态数组。具体文件和接口在LLD中定义。
 
 第一版基线配置：
@@ -37,7 +37,7 @@ Verilog-2001实现可将scheduler和backend中的状态所有者、纯组合选�
   ISSUE_DEPTH  = 32
   ROB_ID_W     = 5
   SEQ_W        = 6
-  RTL_LANGUAGE = Verilog-2001
+  RTL_LANGUAGE = SystemVerilog
 
 共享基线配置由受include guard保护的ppe_config.vh统一定义，跨模块使用且必须保持一致的结构参数不得在子模块
 例化处重复硬编码。ISSUE_DEPTH由ROB_DEPTH派生，ISSUE_WIDTH由FE_NUM派生；ROB_ID_W、
@@ -45,9 +45,9 @@ SEQ_W和history索引宽度继续由基础配置推导。只有直接定义可�
 PACKET_W/DESC_W保留为模块参数，并由顶层统一向下传递。模块私有存储深度和计数器宽度
 使用localparam，不向外暴露。
 
-可综合RTL统一位于rtl目录，使用小写文件名；设计模块名使用大写字母，并采用.v文件和
-可综合Verilog-2001语法。仓库不再保留旧版实现或自动生成镜像，避免形成两套设计源和
-维护分叉。
+可综合RTL统一位于rtl目录，使用小写文件名；设计模块名使用大写字母，并采用.v文件。
+重复多位通道使用SystemVerilog unpacked array，其余逻辑保持克制的Verilog风格。
+仓库不再保留旧版实现或自动生成镜像，避免形成两套设计源和维护分叉。
 
 1.1 设计优化优先级
 
@@ -112,6 +112,7 @@ typical Liberty、0.050 ns时钟不确定度和0.200 ns输入输出延迟，并�
   Ingress -> Top/Input：寄存全局bkps
   Top Input -> Ingress：仅连接输入捕获寄存器
   Backend -> Scheduler：依赖满足状态、依赖结果数据和retirement事件
+  Backend -> Scheduler：每个READY bank的最老未退休row
   Scheduler -> Backend：分配metadata、依赖目标请求和FE writeback关联信息
 
 ================================================================================
@@ -124,8 +125,9 @@ PPE_TOP_SV 保持轻量，负责：
 
   - 例化PPE_INGRESS、PPE_SCHEDULER、PPE_ROB、
     PPE_RETIRE_OUTPUT和4个FE；
-  - 顶层外部输入/输出lane和内部重复lane/FE通路均使用扁平向量表达，不展开固定编号
-    的独立lane端口；逻辑索引0固定对应最低位切片；
+  - 顶层外部输入/输出lane和内部重复多位lane/FE通路均使用unpacked array表达，
+    不展开固定编号的独立lane端口；逻辑索引0固定对应数组元素0；单比特valid、enable
+    和mask在需要按位运算时仍使用packed vector；
   - 实现唯一的两级复位同步器，将异步拉低、同步释放的内部复位同时分发给
     全部PPE子模块和FE；
   - 将ppe_retire_output的寄存器输出连接到顶层端口。
@@ -176,6 +178,10 @@ FE0/1组成的偶数组内匹配，Bank1/3只在FE2/3组成的
 奇数组内匹配；每组使用固定最大基数2x2网络，允许两个本地bank在组内借用FE，但不
 允许跨组匹配。匹配结果不可撤销。
 
+READY提名以ROB输出的4个bank-local退休row为扫描起点，在每个bank中优先发现最老的
+可派发entry。该row直接来自ROB退休游标，不增加全局年龄比较；候选way和组内匹配仍
+保持原有轮询公平机制。
+
 Scheduler在D2A使用当周期calendar并行计算两个本地way的legal，选出至多一个合法way
 后执行固定2x2匹配。delay 3直接形成全合法向量，不读取future table。D2A捕获不可撤销grant；
 D2B消费grant时释放候选槽、将issue entry转为SELECTED并允许同bank补位。
@@ -186,6 +192,13 @@ Scheduler继续拥有per-FE 6项相对未来返回表和完整tag关联。Grant�
 已锁存seq tag/delay写入返回表；FE结果数据仍直达ROB，不经过Scheduler宽数据
 组合通路。返回表按FE静态分区，并由固定delay case选择写入槽，禁止用跨FE和跨槽的
 动态写索引实现。Scheduler不拥有报文的长期顺序、处理结果或输出状态。
+
+Scheduler按生产者ROB ID维护每项7 bit反向waiter关系。D0C确认依赖尚不可用时，
+以consumer与target完整seq tag之差登记offset 1..7；D2B消费不可撤销grant时读取对应
+窄waiter行并寄存early-wakeup token。token下一沿才更新WAIT_DEP状态，因此delay 3
+额外经过一拍窄token延迟，保证所有生产者在READY更新时均已进入距完成不超过3拍的
+安全窗口。D0C状态查询和实际completion唤醒继续作为晚到消费者及并发边界的正确性
+兜底；反向关系不保存或转发依赖数据。
 
 维护版调度允许同一delay的多个候选在同周期映射到不同FE，只要对应FE目标返回槽
 均合法；不按delay固定绑定FE。该多发策略属于维护版微架构与吞吐目标，不属于外部
@@ -279,8 +292,8 @@ fallback或replay状态。
 
 ISSUE_READY报文按ROB ID低2位进入4个8项交错bank，每bank维护两个固定窄候选槽。
 每bank每周期最多提名1项；若D2B消费寄存grant并释放一个槽，同沿可以从沿前READY集合补入一项。
-各bank扫描指针仅在winner实际写入候选槽时更新到winner后一row；没有admission时保持，
-避免空转改变下一次扫描起点。
+各bank从ROB对应bank的最老未退休row开始环形扫描，优先提名最接近退休头的READY项；
+不保存独立READY扫描指针。
 无依赖allocation在没有旧READY winner时可直接进入空槽。Completion和D0C更新不组合
 直通提名。
 
@@ -378,7 +391,9 @@ ROB持续每周期退休4项、FIFO持续非空时，可保持4-wide内部alloca
 
   Dependency Event Path：
       D0C以active ROB/history状态及completion/retirement bypass更新entry；后续
-      completion tag唤醒ISSUE_WAIT_DEP entry。该通路不允许同沿直通FE。
+      D0C未命中时登记7 bit反向waiter。D2B不可撤销grant读取waiter并寄存提前唤醒
+      token，下一沿更新ISSUE_WAIT_DEP entry；completion tag保留兜底唤醒。该通路
+      不允许同沿直通FE。
 
 D2A、D2B和D3必须保持逻辑分离。READY发现和队列入队不进入匹配关键路径；
 D2A末端捕获窄grant metadata，D2B执行ROB gather和返回预约，D3只从
@@ -485,6 +500,7 @@ clock-gating推断机会并抑制无效lane宽数据翻转。
   4) W0奇偶组局部写回的entry decode和数据扇出；
   5) R0单级退休和输出旋转的组合深度；
   6) FE_NUM=4下的实际FE利用率和服务能力。
+  7) 反向waiter行读取、wake token展开相对32项completion广播扫描的时序和面积收益。
 
 ================================================================================
 7. 首版基线与后续优化边界

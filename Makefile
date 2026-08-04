@@ -8,7 +8,7 @@ DUT_TB_TOP       := tb_top_sv
 DUT_FILELIST     := ./script/filelist_sv.f
 DUT_RTL_FILELIST := ./rtl/filelist.f
 DUT_RTL_TOP      := PPE_TOP_SV
-DUT_RTL_LANGUAGE := 1364-2001
+DUT_RTL_LANGUAGE := 1800-2017
 
 TB_TOP     ?= $(DUT_TB_TOP)
 TESTNAME   ?= ppe_basic_test

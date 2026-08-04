@@ -38,6 +38,7 @@ class ppe_load_mix_perf_test extends uvm_test;
     int unsigned delay_hist[4];
     int unsigned latency_sum;
     int unsigned latency_max;
+    int unsigned dep_per_21 = 7;
     int unsigned accept_cycle_q[$];
     bit          measuring;
     bit          completed;
@@ -58,6 +59,11 @@ class ppe_load_mix_perf_test extends uvm_test;
         ppe_load_mix_perf_seq seq;
 
         phase.raise_objection(this);
+        void'($value$plusargs("MIXED_DEP_PER_21=%d", dep_per_21));
+        if (dep_per_21 > 21) begin
+            `uvm_fatal("LOAD_DEP_CONFIG", $sformatf(
+                "MIXED_DEP_PER_21=%0d must be in 0..21", dep_per_21))
+        end
         seq = ppe_load_mix_perf_seq::type_id::create("seq");
         fork
             seq.start(env.master_agent.seqr);
@@ -172,6 +178,7 @@ class ppe_load_mix_perf_test extends uvm_test;
     task check_results();
         int unsigned dep;
         int unsigned delay;
+        int unsigned expected_dep_count;
 
         if (!completed) begin
             `uvm_error("LOAD_TIMEOUT", $sformatf(
@@ -190,14 +197,19 @@ class ppe_load_mix_perf_test extends uvm_test;
                 "medium=%0d/%0d heavy=%0d/%0d", medium_accept_beats,
                 MEDIUM_BEATS, heavy_accept_beats, HEAVY_BEATS))
         end
-        if (dep_hist[0] != 756) begin
+        expected_dep_count = (21 - dep_per_21) * 54;
+        if (dep_hist[0] != expected_dep_count) begin
             `uvm_error("LOAD_DEP_DIST", $sformatf(
-                "no-dependency count=%0d expected=756", dep_hist[0]))
+                "no-dependency count=%0d expected=%0d", dep_hist[0],
+                expected_dep_count))
         end
         for (dep = 1; dep < 8; dep++) begin
-            if (dep_hist[dep] != 54) begin
+            expected_dep_count = 54 * ((dep_per_21 / 7)
+                + ((dep <= (dep_per_21 % 7)) ? 1 : 0));
+            if (dep_hist[dep] != expected_dep_count) begin
                 `uvm_error("LOAD_DEP_DIST", $sformatf(
-                    "dep%0d count=%0d expected=54", dep, dep_hist[dep]))
+                    "dep%0d count=%0d expected=%0d", dep,
+                    dep_hist[dep], expected_dep_count))
             end
         end
         for (delay = 0; delay < 4; delay++) begin
@@ -253,7 +265,8 @@ class ppe_load_mix_perf_test extends uvm_test;
             TOTAL_PACKETS, measurement_cycles, issue_rate, retire_rate,
             avg_latency, latency_max), UVM_NONE)
         `uvm_info("LOAD_PERF", $sformatf(
-            "dependency_hist={%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d} delay_hist={%0d,%0d,%0d,%0d}",
+            "dep_per_21=%0d dependency_hist={%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d} delay_hist={%0d,%0d,%0d,%0d}",
+            dep_per_21,
             dep_hist[0], dep_hist[1], dep_hist[2], dep_hist[3], dep_hist[4],
             dep_hist[5], dep_hist[6], dep_hist[7], delay_hist[0],
             delay_hist[1], delay_hist[2], delay_hist[3]), UVM_NONE)

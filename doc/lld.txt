@@ -24,9 +24,11 @@ PPE Low-Level Design
   PACKET_W     = 128
   DESC_W       = 5
 
-新架构可综合RTL使用Verilog-2001。顶层外部报文端口和模块内部重复lane/FE通路均使用
-扁平向量表达；逻辑索引0固定对应最低位切片，不为固定lane展开独立编号端口。状态数组
-只能由一个明确的时序always进程拥有，纯组合选择器使用always @*并提供完整默认赋值。
+新架构可综合RTL使用SystemVerilog unpacked array表达顶层外部报文端口和模块内部重复
+多位lane/FE通路；逻辑索引0固定对应数组元素0，不为固定lane展开独立编号端口。单比特
+valid、enable和mask在需要按位运算时仍使用packed vector。其余RTL保持克制的Verilog
+风格；状态数组只能由一个明确的时序always进程拥有，纯组合选择器使用always @*并提供
+完整默认赋值。
 
 1.1 参数与类型组织
 
@@ -318,7 +320,7 @@ PPE_SCHEDULER维护4组两项本地窄候选缓冲；匹配时每bank组合形�
   candidate_delay[0..7][1:0]
   candidate_dep_required[0..7]
   candidate_present[ROB_DEPTH]
-  ready_admit_row_rr_ptr[0..3][2:0]
+  ready_bank_head_row[0..3][2:0]
   candidate_way_rr_ptr[0..3]
   shortlist_valid[0..3]
   shortlist_candidate_onehot[0..3][7:0]
@@ -329,9 +331,9 @@ PPE_SCHEDULER维护4组两项本地窄候选缓冲；匹配时每bank组合形�
 
 entry按ROB ID低2位分为4个交错bank，每bank包含8个row和两个固定候选槽。
 候选槽bank对应way0，槽4+bank对应way1。每个bank仅在至少一个本地槽沿前无效或
-本周期被D2B寄存grant删除时，从本地row轮询起点提名至多1项，并直接写入优先空闲way。
-各bank row指针仅在winner实际写入候选槽时更新为winner_row+1；无admission时保持。
-8项row以3 bit自然回卷。不同bank之间不存在候选compact、重排或共享
+本周期被D2B寄存grant删除时，从ROB提供的本bank最老未退休row开始环形扫描并提名
+至多1项，直接写入优先空闲way。8项row以3 bit自然回卷，不保存独立READY扫描指针。
+不同bank之间不存在候选compact、重排或共享
 写入仲裁；每bank每周期最多写一个候选槽。未进入候选缓冲的READY entry继续保存在
 issue状态表中。candidate_present只覆盖8个本地候选槽；提名时置位，D2B消费grant时清位。
 candidate_present按已确定的bank和3 bit row局部译码，不从完整ROB ID生成全局动态写索引。
@@ -346,7 +348,7 @@ candidate_present。D2A并行计算两个way的legal：仅一个way合法时选�
 均合法时按candidate_way_rr_ptr选择；每bank最多贡献一个shortlist项。未匹配项仍保留
 在本地候选槽，candidate_way_rr_ptr每周期翻转以避免固定way队头长期阻塞。
 
-四个FE的相对未来返回表在模块内部扁平为24项，索引为{fe_id, slot[0..5]}。Scheduler
+四个FE的相对未来返回表在模块内部组织为[fe_id][slot 0..5]二维数组。Scheduler
 为每个FE保存一组D2A grant：
 
   grant_valid
@@ -411,9 +413,16 @@ D2B沿后把grant写入slot[delay+1]，
 
 3.6 Dependency Control State
 
-Scheduler不保存非权威依赖数据副本，也不保存依赖数据fallback或replay状态。Completion并行
-比较32项窄target tag；依赖满足由ISSUE_WAIT_DEP/ISSUE_READY唯一表达。128 bit结果始终
-由backend active ROB或retired history拥有。
+Scheduler不保存非权威依赖数据副本，也不保存依赖数据fallback或replay状态。依赖满足
+仍由ISSUE_WAIT_DEP/ISSUE_READY唯一表达，128 bit结果始终由backend active ROB或
+retired history拥有。Scheduler额外维护：
+
+  waiter[ROB_DEPTH][MAX_DEP]
+  early_wake_hit[ISSUE_DEPTH]
+
+waiter行以producer ROB ID索引，bit k表示seq_tag=producer_seq_tag+(k+1)的消费者正在
+等待该生产者。该窄关系只用于提前产生entry-local状态写使能，不代表结果available，
+也不替代完整seq tag身份约束。early_wake_hit是寄存一拍的one-hot状态更新token。
 
 ================================================================================
 4. Backend内部数据结构
@@ -491,11 +500,11 @@ valid和保存的seq_tag高3位，低3位由被访问bank隐含。二者合并�
 
 5.0 Top输入寄存边界与寄存反压
 
-ppe_top将原始顶层in_valid、in_packet和in_desc扁平向量只连接到ppe_ingress输入
+ppe_top将原始顶层in_valid、in_packet和in_desc只连接到ppe_ingress输入
 捕获端口。其他PPE子模块不得读取这些原始端口。ppe_ingress的bkps_o由bkps_q寄存器
 直接驱动，不得由FIFO占用、ROB状态、retire前缀或当前in_valid组合赋值。
 
-Top外部lane端口使用扁平向量，以下方括号表示逻辑维度：
+Top外部多位lane端口使用unpacked array，以下方括号表示逻辑维度：
 
   in_valid_i[N]
   in_packet_i[N][127:0]
@@ -545,6 +554,13 @@ seq tag密集分配，因此无需backend向issue table返回allocation ID或acc
 
 5.3 Scheduler <-> Backend：Dependency Resolve and Gather
 
+ROB同时向Scheduler输出每个4-way interleaved bank的最老未退休row：
+
+  ready_bank_head_row[4][2:0]
+
+该信号直接来自ROB的bank-local退休游标。Scheduler只用它作为本bank READY环形扫描
+起点，不据此改变依赖状态、候选合法性或FE匹配规则。
+
 D0C为上一周期D0B提交的最多N个有依赖allocation发出小位宽状态请求：
 
   dep_status_valid[N]
@@ -577,6 +593,7 @@ dependency模块或额外流水边界。
 
 PPE_SCHEDULER接收D0B guaranteed commit bundle、D0C dependency status响应以及FE返回有效：
 
+  ready_bank_head_row[4][2:0]
   issue_alloc_valid[N]
   alloc_seq_tag[N][SEQ_W-1:0]
   alloc_target_seq_tag[N][SEQ_W-1:0]
@@ -603,7 +620,7 @@ PPE_SCHEDULER接收D0B guaranteed commit bundle、D0C dependency status响应以
 
 原Issue Table与FE Scheduler之间的candidate/select接口不存在。候选、匹配、grant、
 candidate_present和future table均由PPE_SCHEDULER内部拥有；跨模块只传递已经寄存的
-gather metadata和宽数据响应。Verilog-2001端口按最右维连续展平，低位切片对应索引0。
+gather metadata和宽数据响应。重复多位端口使用unpacked array，逻辑通道0对应数组元素0。
 
 D2A先从每bank两项候选中选取至多一项形成组合shortlist。Bank0/2只连接
 FE0/1，Bank1/3只连接FE2/3。
@@ -802,12 +819,28 @@ sequence allocation、ROB、Issue Table、FE或任何顶层输出。
   或复制128 bit依赖数据。D0B提交后到对应D0C响应前，该物理entry受状态所有权约束不得
   释放或重新分配，因此无需再次执行consumer完整tag反查。
 
-7.2 Reverse Waiter Wakeup
+7.2 Reverse Waiter Registration and Early Wakeup
 
-每路Completion tag为S时，并行检查32项issue entry；仅当entry处于
-ISSUE_WAIT_DEP且完整target_seq_tag等于S时，在本沿
-把entry状态置为ISSUE_READY。该路径不得读取或选择packet宽数据，也不保存producer到
-consumer的反向表。
+D0C查询返回not available时，以完整consumer seq tag和target seq tag计算模64差值K。
+合法输入保证K位于1..7；Scheduler设置：
+
+  waiter[target_seq_tag[ROB_ID_W-1:0]][K-1] <- 1
+
+同一周期最多4路登记按bit OR合并。生产者entry重新allocation或实际completion时清除
+对应waiter行；D2B读取已grant生产者的waiter行后清除已读取bit，同周期新登记具有保留
+优先级。waiter行的生产者身份由当前issue entry完整seq tag与grant seq tag一致保证，
+consumer身份由producer完整tag与offset唯一推导；ROB ID或offset均不得单独构成命中。
+
+D2B消费不可撤销grant时读取对应7 bit waiter行，将有效bit按producer seq tag加offset
+展开为ISSUE_DEPTH项one-hot。delay 0..2写入一拍early_wake_hit；delay 3先进入额外一拍
+窄token延迟。token生效沿仅对仍处于ISSUE_WAIT_DEP且不在D0C pending边界的entry置
+ISSUE_READY。生产者在D2B预约后的下一沿才由D3进入FE，因此上述分级保证READY更新时
+生产者距completion不超过3拍；消费者后续仍需经过D1、D2A、D2B gather和D3，故gather
+不早于生产者completion。
+
+实际Completion tag为S时仍并行检查32项issue entry作为兜底；仅当entry处于
+ISSUE_WAIT_DEP、完整target_seq_tag等于S且不在D0C pending边界时置ISSUE_READY。
+该兜底覆盖grant后才登记的消费者和所有并发边界，不读取或选择packet宽数据。
 
 READY bank提名只读取沿前issue_state，不组合读取completion wake hit。因此被唤醒entry
 最早下一周期写入本地候选槽，再由后续D2A选择。
@@ -823,6 +856,9 @@ Completion wakeup和D0C状态更新均在issue_state边界终止，不组合进�
 D0B allocation状态初始化具有最终优先权；D0C使用前一周期D0B提交并寄存的consumer
 物理entry ID直接更新状态。
 
+Early-wakeup token、completion wakeup和D0C available同时命中同一entry时均为幂等的
+READY更新。Allocation仍具有最终优先权，selected更新优先于各类READY更新。
+
 ================================================================================
 8. Scheduler D2A/D2B：候选匹配、原子消费和返回预约
 ================================================================================
@@ -831,13 +867,15 @@ D0B allocation状态初始化具有最终优先权；D0C使用前一周期D0B提
 
 ISSUE_READY且candidate_present=0的entry可被发现。发现只使用沿前状态；allocation、
 D0C状态更新和completion wakeup最早下一周期参与发现。entry按ROB ID低2位进入4个
-交错bank，每bank从8个row轮询提名至多1项。每bank候选槽固定为bank和4+bank。
+交错bank，每bank从ready_bank_head_row开始环形扫描8个row并提名至多1项。该起点是
+本bank最老未退休entry，因此优先级按全局退休年龄投影到各bank。每bank候选槽固定为
+bank和4+bank。
 
 若本bank有无效槽或本周期D2B消费grant删除槽，则允许一次提名。优先写入被删除或无效的way0，
 否则写way1。Grant删除和提名在同一candidate next-state内合并；旧entry仍受沿前
 candidate_present屏蔽，不能在同沿重新提名。无依赖allocation仅在没有沿前READY winner
-时可直接进入空槽；依赖allocation不得走该旁路。只有winner实际写入候选槽时，对应bank
-的ready_admit_row_rr_ptr才更新到winner_row+1；否则保持。
+时可直接进入空槽；依赖allocation不得走该旁路。winner实际写入候选槽时只更新对应
+candidate_present，不保存独立READY扫描指针。
 
 8.2 Shortlist and Legal Matrix
 
@@ -1203,8 +1241,8 @@ internal_rst_n。
 
   - ingress slot_count、读写指针，并将bkps_q置1；
   - issue table unified state；
-  - candidate valid、candidate_present、ready_admit_row_rr_ptr、
-    candidate_way_rr_ptr和group_rr_ptr；
+  - reverse waiter和early-wakeup token；
+  - candidate valid、candidate_present、candidate_way_rr_ptr和group_rr_ptr；
   - per-FE selected valid、grant valid和future valid；
   - ROB valid/result_valid/head/occupancy；
   - retired history valid；

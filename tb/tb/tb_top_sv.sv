@@ -15,6 +15,22 @@ module tb_top_sv;
 
     logic clk;
     logic rst_n;
+    wire [PACKET_W-1:0] dut_in_packet [0:`PPE_N-1];
+    wire [4:0] dut_in_desc [0:`PPE_N-1];
+    wire [PACKET_W-1:0] dut_out_packet [0:`PPE_N-1];
+
+    assign dut_in_packet[0] = pif.in_packet0;
+    assign dut_in_packet[1] = pif.in_packet1;
+    assign dut_in_packet[2] = pif.in_packet2;
+    assign dut_in_packet[3] = pif.in_packet3;
+    assign dut_in_desc[0] = pif.in_desc0;
+    assign dut_in_desc[1] = pif.in_desc1;
+    assign dut_in_desc[2] = pif.in_desc2;
+    assign dut_in_desc[3] = pif.in_desc3;
+    assign pif.out_packet0 = dut_out_packet[0];
+    assign pif.out_packet1 = dut_out_packet[1];
+    assign pif.out_packet2 = dut_out_packet[2];
+    assign pif.out_packet3 = dut_out_packet[3];
 
     // Verification-only baseline parameter consistency checks.
     initial begin
@@ -44,24 +60,41 @@ module tb_top_sv;
         .rst_n       (rst_n),
         .in_valid    ({pif.in_valid3, pif.in_valid2,
                        pif.in_valid1, pif.in_valid0}),
-        .in_packet   ({pif.in_packet3, pif.in_packet2,
-                       pif.in_packet1, pif.in_packet0}),
-        .in_desc     ({pif.in_desc3, pif.in_desc2,
-                       pif.in_desc1, pif.in_desc0}),
+        .in_packet   (dut_in_packet),
+        .in_desc     (dut_in_desc),
         .bkps        (pif.bkps),
         .out_valid   ({pif.out_valid3, pif.out_valid2,
                        pif.out_valid1, pif.out_valid0}),
-        .out_packet  ({pif.out_packet3, pif.out_packet2,
-                       pif.out_packet1, pif.out_packet0})
+        .out_packet  (dut_out_packet)
     );
 
     wire [63:0] probe_issue_state;
+    wire [15:0] probe_candidate_legal;
+    wire [(4*TB_SEQ_W)-1:0] probe_completion_seq_tag;
     genvar probe_entry;
     generate
         for (probe_entry = 0; probe_entry < 32;
              probe_entry = probe_entry + 1) begin : gen_probe_issue_state
             assign probe_issue_state[probe_entry*2 +: 2] =
                 dut.u_scheduler.issue_state_q[probe_entry];
+        end
+    endgenerate
+
+    genvar probe_candidate;
+    generate
+        for (probe_candidate = 0; probe_candidate < 8;
+             probe_candidate = probe_candidate + 1) begin : gen_probe_candidate
+            assign probe_candidate_legal[probe_candidate*2 +: 2] =
+                dut.u_scheduler.candidate_legal[probe_candidate];
+        end
+    endgenerate
+
+    genvar probe_fe;
+    generate
+        for (probe_fe = 0; probe_fe < 4;
+             probe_fe = probe_fe + 1) begin : gen_probe_completion
+            assign probe_completion_seq_tag[probe_fe*TB_SEQ_W +: TB_SEQ_W] =
+                dut.completion_seq_tag[probe_fe];
         end
     endgenerate
 
@@ -81,14 +114,14 @@ module tb_top_sv;
         .issue_state     (probe_issue_state),
         .candidate_valid (dut.u_scheduler.candidate_valid_q),
         .candidate_pending(dut.u_scheduler.candidate_pending),
-        .candidate_legal (dut.u_scheduler.candidate_legal),
+        .candidate_legal (probe_candidate_legal),
         .shortlist_valid (dut.u_scheduler.shortlist_valid_d),
         .grant_valid     (dut.u_scheduler.grant_valid_d)
     );
 
     // Shared performance/debug probes with direct equivalents in the new RTL.
     assign pif.dbg_wb_valid      = dut.completion_valid;
-    assign pif.dbg_wb_seq_tag    = dut.completion_seq_tag;
+    assign pif.dbg_wb_seq_tag    = probe_completion_seq_tag;
     assign pif.dbg_fe_in_valid   = dut.issue_valid;
     assign pif.dbg_rob_occupancy = dut.u_rob.occupancy_q;
     assign pif.dbg_rob0_valid    = dut.u_rob.rob_valid_q[0];

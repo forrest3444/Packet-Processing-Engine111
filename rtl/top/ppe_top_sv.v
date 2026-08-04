@@ -12,11 +12,11 @@ module PPE_TOP_SV #(
     input  wire                              clk,
     input  wire                              rst_n,
     input  wire [`PPE_N-1:0]                 in_valid,
-    input  wire [`PPE_N*PACKET_W-1:0]        in_packet,
-    input  wire [`PPE_N*DESC_W-1:0]          in_desc,
+    input  wire [PACKET_W-1:0]               in_packet [0:`PPE_N-1],
+    input  wire [DESC_W-1:0]                 in_desc [0:`PPE_N-1],
     output wire                              bkps,
     output wire [`PPE_N-1:0]                 out_valid,
-    output wire [`PPE_N*PACKET_W-1:0]        out_packet
+    output wire [PACKET_W-1:0]               out_packet [0:`PPE_N-1]
 );
 
     reg  [1:0] reset_sync_q;
@@ -26,35 +26,36 @@ module PPE_TOP_SV #(
     wire [`PPE_N-1:0]                         alloc_reserve_valid;
     wire                                      alloc_reserve_ready;
     wire [`PPE_N-1:0]                         alloc_commit_valid;
-    wire [`PPE_N*`PPE_SEQ_W-1:0]              alloc_seq_tag;
-    wire [`PPE_N*`PPE_SEQ_W-1:0]              alloc_target_seq_tag;
-    wire [`PPE_N*PACKET_W-1:0]                alloc_packet;
-    wire [`PPE_N*`PPE_DELAY_W-1:0]            alloc_delay;
+    wire [`PPE_SEQ_W-1:0]                     alloc_seq_tag [0:`PPE_N-1];
+    wire [`PPE_SEQ_W-1:0]                     alloc_target_seq_tag [0:`PPE_N-1];
+    wire [PACKET_W-1:0]                       alloc_packet [0:`PPE_N-1];
+    wire [`PPE_DELAY_W-1:0]                   alloc_delay [0:`PPE_N-1];
     wire [`PPE_N-1:0]                         alloc_dep_required;
 
     wire [`PPE_N-1:0]                         dep_status_valid;
-    wire [`PPE_N*`PPE_SEQ_W-1:0]              dep_status_target_seq_tag;
+    wire [`PPE_SEQ_W-1:0]                     dep_status_target_seq_tag [0:`PPE_N-1];
     wire [`PPE_N-1:0]                         dep_status_available;
 
     wire [`PPE_FE_NUM-1:0]                    completion_valid;
-    wire [`PPE_FE_NUM*`PPE_SEQ_W-1:0]         completion_seq_tag;
+    wire [`PPE_SEQ_W-1:0]                     completion_seq_tag [0:`PPE_FE_NUM-1];
 
     wire [`PPE_FE_NUM-1:0]                    issue_valid;
-    wire [`PPE_FE_NUM*PACKET_W-1:0]           issue_packet;
-    wire [`PPE_FE_NUM*`PPE_DELAY_W-1:0]       issue_delay;
+    wire [PACKET_W-1:0]                       issue_packet [0:`PPE_FE_NUM-1];
+    wire [`PPE_DELAY_W-1:0]                   issue_delay [0:`PPE_FE_NUM-1];
     wire [`PPE_FE_NUM-1:0]                    issue_dep_required;
-    wire [`PPE_FE_NUM*PACKET_W-1:0]           issue_dep_data;
+    wire [PACKET_W-1:0]                       issue_dep_data [0:`PPE_FE_NUM-1];
     wire [`PPE_FE_NUM-1:0]                    gather_valid;
-    wire [`PPE_FE_NUM*`PPE_SEQ_W-1:0]         gather_seq_tag;
+    wire [`PPE_SEQ_W-1:0]                     gather_seq_tag [0:`PPE_FE_NUM-1];
     wire [`PPE_FE_NUM-1:0]                    gather_dep_required;
-    wire [`PPE_FE_NUM*`PPE_SEQ_W-1:0]         gather_target_seq_tag;
-    wire [`PPE_FE_NUM*PACKET_W-1:0]           gather_packet;
-    wire [`PPE_FE_NUM*PACKET_W-1:0]           gather_dep_data;
+    wire [`PPE_SEQ_W-1:0]                     gather_target_seq_tag [0:`PPE_FE_NUM-1];
+    wire [PACKET_W-1:0]                       gather_packet [0:`PPE_FE_NUM-1];
+    wire [PACKET_W-1:0]                       gather_dep_data [0:`PPE_FE_NUM-1];
     wire [`PPE_FE_NUM-1:0]                    fe_out_valid;
-    wire [`PPE_FE_NUM*PACKET_W-1:0]           fe_out_data;
+    wire [PACKET_W-1:0]                       fe_out_data [0:`PPE_FE_NUM-1];
 
     wire [`PPE_N-1:0]                         retire_valid;
-    wire [`PPE_N*PACKET_W-1:0]                retire_data;
+    wire [PACKET_W-1:0]                       retire_data [0:`PPE_N-1];
+    wire [`PPE_ROB_BANK_ROW_W-1:0]            ready_bank_head_row [0:`PPE_N-1];
 
     always @(posedge clk or negedge rst_n) begin : reset_synchronizer
         if (!rst_n)
@@ -90,6 +91,7 @@ module PPE_TOP_SV #(
     ) u_scheduler (
         .clk_i                       (clk),
         .rst_ni                      (internal_rst_n),
+        .ready_bank_head_row_i       (ready_bank_head_row),
         .issue_alloc_valid_i         (alloc_commit_valid),
         .alloc_seq_tag_i             (alloc_seq_tag),
         .alloc_target_seq_tag_i      (alloc_target_seq_tag),
@@ -125,14 +127,13 @@ module PPE_TOP_SV #(
                 .clk           (clk),
                 .rst_n         (internal_rst_n),
                 .fe_in_valid   (issue_valid[fe_idx]),
-                .fe_in_data    (issue_packet[fe_idx*PACKET_W +: PACKET_W]),
+                .fe_in_data    (issue_packet[fe_idx]),
                 .fe_dep_valid  (issue_valid[fe_idx]
                                 && issue_dep_required[fe_idx]),
-                .fe_dep_data   (issue_dep_data[fe_idx*PACKET_W +: PACKET_W]),
-                .fe_desc_delay (issue_delay[fe_idx*`PPE_DELAY_W
-                                             +: `PPE_DELAY_W]),
+                .fe_dep_data   (issue_dep_data[fe_idx]),
+                .fe_desc_delay (issue_delay[fe_idx]),
                 .fe_out_valid  (fe_out_valid[fe_idx]),
-                .fe_out_data   (fe_out_data[fe_idx*PACKET_W +: PACKET_W])
+                .fe_out_data   (fe_out_data[fe_idx])
             );
         end
     endgenerate
@@ -159,6 +160,7 @@ module PPE_TOP_SV #(
         .wb_valid_i                  (completion_valid),
         .wb_seq_tag_i                (completion_seq_tag),
         .wb_data_i                   (fe_out_data),
+        .ready_bank_head_row_o       (ready_bank_head_row),
         .retire_valid_o              (retire_valid),
         .retire_data_o               (retire_data)
     );
