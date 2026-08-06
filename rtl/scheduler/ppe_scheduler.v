@@ -22,11 +22,11 @@ module PPE_SCHEDULER #(
     input  wire [`PPE_N-1:0]                         dep_status_available_i,
     input  wire [`PPE_FE_NUM-1:0]                    completion_valid_i,
     input  wire [`PPE_SEQ_W-1:0]                     completion_seq_tag_i [0:`PPE_FE_NUM-1],
-    output reg  [`PPE_FE_NUM-1:0]                    gather_valid_o,
-    output reg  [`PPE_SEQ_W-1:0]                     gather_seq_tag_o [0:`PPE_FE_NUM-1],
+    output reg  [`PPE_ROB_BANK_ROW_W-1:0]            source_bank_row_o [0:`PPE_N-1],
+    output reg  [`PPE_ROB_TAG_HI_W-1:0]              source_bank_tag_hi_o [0:`PPE_N-1],
+    input  wire [PACKET_W-1:0]                       source_bank_packet_i [0:`PPE_N-1],
     output reg  [`PPE_FE_NUM-1:0]                    gather_dep_required_o,
     output reg  [`PPE_SEQ_W-1:0]                     gather_target_seq_tag_o [0:`PPE_FE_NUM-1],
-    input  wire [PACKET_W-1:0]                       gather_packet_i [0:`PPE_FE_NUM-1],
     input  wire [PACKET_W-1:0]                       gather_dep_data_i [0:`PPE_FE_NUM-1],
     output reg  [`PPE_FE_NUM-1:0]                    issue_valid_o,
     output reg  [PACKET_W-1:0]                       issue_packet_o [0:`PPE_FE_NUM-1],
@@ -35,7 +35,10 @@ module PPE_SCHEDULER #(
     output reg  [PACKET_W-1:0]                       issue_dep_data_o [0:`PPE_FE_NUM-1],
     input  wire [`PPE_FE_NUM-1:0]                    fe_out_valid_i,
     output reg  [`PPE_FE_NUM-1:0]                    completion_valid_o,
-    output reg  [`PPE_SEQ_W-1:0]                     completion_seq_tag_o [0:`PPE_FE_NUM-1]
+    output reg  [`PPE_SEQ_W-1:0]                     completion_seq_tag_o [0:`PPE_FE_NUM-1],
+    output reg  [`PPE_FE_NUM-1:0]                    wb_pre_valid_o,
+    output reg  [`PPE_SEQ_W-1:0]                     wb_pre_seq_tag_o [0:`PPE_FE_NUM-1],
+    output reg  [`PPE_ROB_DEPTH-1:0]                 wb_pre_entry_onehot_o [0:`PPE_FE_NUM-1]
 );
 
     localparam integer N                 = `PPE_N;
@@ -47,6 +50,8 @@ module PPE_SCHEDULER #(
     localparam integer SEQ_W             = `PPE_SEQ_W;
     localparam integer DELAY_W           = `PPE_DELAY_W;
     localparam integer ROB_ID_W          = `PPE_ROB_ID_W;
+    localparam integer ROB_TAG_HI_W      = `PPE_ROB_TAG_HI_W;
+    localparam integer DATA_BANK_W       = 2;
     localparam integer MAX_DEP           = `PPE_MAX_DEP;
 
     localparam [1:0] ISSUE_FREE     = 2'd0;
@@ -159,6 +164,9 @@ module PPE_SCHEDULER #(
     reg [DELAY_W-1:0] grant_delay_q [0:FE_NUM-1];
     reg [FE_NUM-1:0] grant_dep_required_q;
     reg [2:0] grant_pending_block_q [0:FE_NUM-1];
+    reg [ADMIT_ROW_W-1:0] source_bank_row_d [0:ADMIT_BANKS-1];
+    reg [ROB_TAG_HI_W-1:0] source_bank_tag_hi_d [0:ADMIT_BANKS-1];
+    reg [ADMIT_BANKS-1:0] source_bank_update_en;
     reg [RETURN_FUTURE_DEPTH-1:0] future_valid_q [0:FE_NUM-1];
     reg [SEQ_W-1:0] future_seq_tag_q [0:FE_NUM-1]
                                      [0:RETURN_FUTURE_DEPTH-1];
@@ -764,6 +772,29 @@ module PPE_SCHEDULER #(
                 end
     end
 
+    always @* begin : source_bank_request_decode
+        integer bank;
+        integer fe;
+        reg [DATA_BANK_W-1:0] source_bank;
+
+        source_bank_update_en = {ADMIT_BANKS{1'b0}};
+        source_bank = {DATA_BANK_W{1'b0}};
+        for (bank = 0; bank < ADMIT_BANKS; bank = bank + 1) begin
+            source_bank_row_d[bank] = {ADMIT_ROW_W{1'b0}};
+            source_bank_tag_hi_d[bank] = {ROB_TAG_HI_W{1'b0}};
+        end
+        for (fe = 0; fe < FE_NUM; fe = fe + 1) begin
+            source_bank = grant_seq_tag_d[fe][DATA_BANK_W-1:0];
+            if (grant_valid_d[fe]) begin
+                source_bank_update_en[source_bank] = 1'b1;
+                source_bank_row_d[source_bank] =
+                    grant_seq_tag_d[fe][DATA_BANK_W +: ADMIT_ROW_W];
+                source_bank_tag_hi_d[source_bank] =
+                    grant_seq_tag_d[fe][ROB_ID_W +: ROB_TAG_HI_W];
+            end
+        end
+    end
+
     always @* begin : candidate_removal_decode
         integer fe;
         integer entry;
@@ -922,25 +953,17 @@ module PPE_SCHEDULER #(
     always @* begin : interface_outputs
         integer fe;
 
-        gather_valid_o          = grant_valid_q;
         gather_dep_required_o   = grant_dep_required_q;
         issue_valid_o           = selected_valid_q;
         issue_dep_required_o    = {FE_NUM{1'b0}};
         completion_valid_o      = {FE_NUM{1'b0}};
 
         for (fe = 0; fe < FE_NUM; fe = fe + 1) begin
-            gather_seq_tag_o[fe]        = {SEQ_W{1'b0}};
-            gather_target_seq_tag_o[fe] = {SEQ_W{1'b0}};
+            gather_target_seq_tag_o[fe] = grant_target_seq_tag_q[fe];
             issue_packet_o[fe]          = {PACKET_W{1'b0}};
             issue_delay_o[fe]           = {DELAY_W{1'b0}};
             issue_dep_data_o[fe]        = {PACKET_W{1'b0}};
             completion_seq_tag_o[fe]    = {SEQ_W{1'b0}};
-            if (grant_valid_q[fe]) begin
-                gather_seq_tag_o[fe] = grant_seq_tag_q[fe];
-                gather_target_seq_tag_o[fe] =
-                    grant_dep_required_q[fe]
-                    ? grant_target_seq_tag_q[fe] : {SEQ_W{1'b0}};
-            end
             if (selected_valid_q[fe]) begin
                 issue_packet_o[fe] = selected_packet_q[fe];
                 issue_delay_o[fe] = selected_delay_q[fe];
@@ -1017,21 +1040,23 @@ module PPE_SCHEDULER #(
         end else begin
             selected_valid_q <= grant_valid_q;
             for (fe = 0; fe < FE_NUM; fe = fe + 1) begin
-                if (grant_valid_q[fe]) begin
-                    selected_seq_tag_q[fe] <= grant_seq_tag_q[fe];
-                    selected_delay_q[fe] <= grant_delay_q[fe];
-                    selected_dep_required_q[fe] <=
-                        grant_dep_required_q[fe];
-                    selected_packet_q[fe] <= gather_packet_i[fe];
-                    if (grant_dep_required_q[fe]) begin
-                        selected_dep_data_q[fe] <= gather_dep_data_i[fe];
-                    end
-                end
+                selected_seq_tag_q[fe] <= grant_seq_tag_q[fe];
+                selected_delay_q[fe] <= grant_delay_q[fe];
+                selected_dep_required_q[fe] <= grant_dep_required_q[fe];
+                case (grant_seq_tag_q[fe][DATA_BANK_W-1:0])
+                    2'd0: selected_packet_q[fe] <= source_bank_packet_i[0];
+                    2'd1: selected_packet_q[fe] <= source_bank_packet_i[1];
+                    2'd2: selected_packet_q[fe] <= source_bank_packet_i[2];
+                    default:
+                        selected_packet_q[fe] <= source_bank_packet_i[3];
+                endcase
+                selected_dep_data_q[fe] <= gather_dep_data_i[fe];
             end
         end
     end
 
     always @(posedge clk_i or negedge rst_ni) begin : grant_state
+        integer bank;
         integer fe;
 
         if (!rst_ni) begin
@@ -1057,6 +1082,31 @@ module PPE_SCHEDULER #(
                     grant_delay_q[fe] <= grant_delay_d[fe];
                     grant_dep_required_q[fe] <=
                         grant_dep_required_d[fe];
+                end
+            end
+            for (bank = 0; bank < ADMIT_BANKS; bank = bank + 1) begin
+                if (source_bank_update_en[bank]) begin
+                    source_bank_row_o[bank] <= source_bank_row_d[bank];
+                    source_bank_tag_hi_o[bank] <=
+                        source_bank_tag_hi_d[bank];
+                end
+            end
+        end
+    end
+
+    always @(posedge clk_i or negedge rst_ni) begin : writeback_predecode
+        integer fe;
+
+        if (!rst_ni) begin
+            wb_pre_valid_o <= {FE_NUM{1'b0}};
+        end else begin
+            for (fe = 0; fe < FE_NUM; fe = fe + 1) begin
+                wb_pre_valid_o[fe] <= future_valid_q[fe][1];
+                if (future_valid_q[fe][1]) begin
+                    wb_pre_seq_tag_o[fe] <= future_seq_tag_q[fe][1];
+                    wb_pre_entry_onehot_o[fe] <=
+                        {{(ISSUE_DEPTH-1){1'b0}}, 1'b1}
+                        << future_seq_tag_q[fe][1][ROB_ID_W-1:0];
                 end
             end
         end

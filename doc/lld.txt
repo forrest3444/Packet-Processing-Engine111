@@ -569,22 +569,24 @@ D0C为上一周期D0B提交的最多N个有依赖allocation发出小位宽状态
 
 匹配grant后，PPE_SCHEDULER按FE形成寄存operand gather请求：
 
-  gather_valid[FE_NUM]
-  gather_seq_tag[FE_NUM][SEQ_W-1:0]
+  source_bank_row[4][ROB_BANK_ROW_W-1:0]
+  source_bank_tag_hi[4][SEQ_W-ROB_ID_W-1:0]
+  source_bank_packet[4][127:0]
   gather_dep_required[FE_NUM]
   gather_target_seq_tag[FE_NUM][SEQ_W-1:0]
-  gather_packet[FE_NUM][127:0]
   gather_dep_data[FE_NUM][127:0]
 
-Backend组合解析每路寄存请求。gather_seq_tag读原始packet；gather_dep_required时
+Scheduler在D2A锁存grant时按source seq tag低2位直接更新对应bank的row和tag-high，
+无新请求的bank保持旧地址。Backend对4个bank分别读取原始packet；Scheduler按
+grant seq tag低2位把bank响应送入对应FE operand寄存器。gather_dep_required时
 gather_target_seq_tag按completion bypass、active ROB和history的顺序读权威依赖结果。
 正常状态下两类读取必须命中，该路径不设ready、fallback或replay端口。
 
 请求无效时响应定义为：
 
   - dep_status_valid=0时，dep_status_available必须为0；
-  - gather_valid=0时，gather_packet和gather_dep_data不被采样；
-  - gather_valid=1且gather_dep_required=0时，gather_dep_data不被采样。
+  - 无对应grant时，source_bank_packet不被有效selected operand采样；
+  - gather_dep_required=0时，gather_dep_data不具有语义。
 
 PPE_SCHEDULER直接管理请求资格、completion wakeup比较和gather响应语义适配，不设置中间
 dependency模块或额外流水边界。
@@ -606,8 +608,9 @@ PPE_SCHEDULER接收D0B guaranteed commit bundle、D0C dependency status响应以
 
   dep_status_valid[N]
   dep_status_target_seq_tag[N][SEQ_W-1:0]
-  gather_valid[FE_NUM]
-  gather_seq_tag[FE_NUM][SEQ_W-1:0]
+  source_bank_row[4][ROB_BANK_ROW_W-1:0]
+  source_bank_tag_hi[4][SEQ_W-ROB_ID_W-1:0]
+  source_bank_packet[4][127:0]
   gather_dep_required[FE_NUM]
   gather_target_seq_tag[FE_NUM][SEQ_W-1:0]
   issue_valid[FE_NUM]
@@ -905,15 +908,17 @@ dep_required。grant锁存后不可取消；对应way在下一D2B沿从候选槽
   - 将issue entry转为ISSUE_SELECTED；
   - 允许各bank把一个沿前READY winner写入被释放槽。
 
-Grant一旦锁存不得取消。下一周期D2B以寄存metadata请求ROB gather，并在future表的
-slot[delay+1]写入完整seq tag。无法匹配的候选保持READY和candidate_present。
+Grant一旦锁存不得取消。D2A锁存grant的同一沿按source seq tag形成bank-local
+source row/tag-high请求。下一周期D2B以寄存target metadata请求ROB dependency gather，
+读取对应bank的source packet，并在future表的slot[delay+1]写入完整seq tag。无法匹配
+的候选保持READY和candidate_present。
 
 ================================================================================
 9. Scheduler D3：Operand Gather与FE Issue
 ================================================================================
 
-每路有效grant形成一条寄存gather请求。ROB按gather_seq_tag读取原始packet；需要依赖时，
-按completion bypass、active ROB、history优先级读取gather_target_seq_tag的权威结果。
+每路有效grant使用其seq tag低2位选择bank-local source packet；需要依赖时，按
+completion bypass、active ROB、history优先级读取gather_target_seq_tag的权威结果。
 请求不设置ready或重放，合法调度下读取必须命中。
 
 Gather响应在下一上升沿写入对应per-FE selected-operand寄存器。沿后issue_valid和
@@ -921,6 +926,21 @@ packet、delay、dep_required、dep_data直接驱动FE；同沿将上一份selec
 ISSUE_FREE。Selected释放和D2B候选删除使用完整有效FE集合检查对应物理entry。当前
 operand被消费时允许捕获下一份gather响应，因此不产生隔周期气泡。
 候选窗不保存packet或dependency，宽数据只存在于ROB和4份operand寄存器。
+
+grant metadata寄存器在grant_valid=0时保持旧值，跨模块gather tag不因valid=0而清零。
+ROB dependency读取可对该稳定tag持续形成候选数据，gather_dep_required定义依赖响应
+是否具有语义。selected_valid每周期捕获
+grant_valid；selected metadata和宽operand字段允许无条件捕获gather响应，且在
+selected_valid=0时内容不具有语义。该编码避免grant_valid进入dependency宽数据选择并
+扇出到selected宽寄存器CE，不改变有效周期的operand值。
+
+future slot1表示下一completion采样沿。Scheduler每沿以slot1为每个FE寄存
+wb_pre_valid、完整wb_pre_seq_tag和32 bit entry one-hot；slot1无效时仅清valid并保持
+宽字段。下一沿实际completion到达时，ROB要求wb_pre_valid、实际wb_valid、实际
+wb_seq_tag等于wb_pre_seq_tag、one-hot目标active tag匹配且result_valid=0，才产生
+entry-local write enable。预译码不代替实际completion写回资格检查。固定延迟FE协议下，
+它同时是本沿必返回entry的精确预测，可用于13章的head completion预测退休；
+实际writeback仍由wb_valid、完整tag及active entry状态独立确认。
 
 ================================================================================
 10. Backend A0/A1：ROB Allocation
@@ -944,12 +964,12 @@ A1在下一上升沿将各有效alloc_data_bank写入对应统一data槽。Grant
 数据内容不要求清零。alloc_commit_valid来自上一周期已经接受的reservation，不设置
 ready或重放端口。occupancy只在reservation沿增加，commit沿不再次增加。
 
-Source gather使用gather_seq_tag低位索引。ROB valid、完整tag匹配且result_valid=0是
+Source gather使用D2A寄存的bank-local row和tag-high索引。ROB valid、完整tag匹配且result_valid=0是
 合法gather的不变量；该条件区分原始packet与已经覆盖的结果，不允许把完成结果误作FE
 输入。物理比较使用低位索引隐含部分与entry保存的tag高位，语义仍为完整tag匹配。
-Bank0/2只归并FE0/1请求并只向FE0/1返回，Bank1/3只归并FE2/3请求并只向FE2/3返回；
-每bank和每FE均使用固定2路选择。协议保证同一bank每周期最多一条source请求，因此
-两路请求归并没有仲裁或覆盖语义。
+每bank直接产生一份packet响应；Scheduler按当前寄存grant的bank低位选择响应。
+协议保证同一bank每周期最多一条source请求，D2A对bank-local地址的更新没有仲裁或
+覆盖语义。
 
 ================================================================================
 11. Backend G0：依赖状态与数据解析
@@ -1068,10 +1088,10 @@ slot1..4，不会与本周期slot0消费冲突。
 
 从逻辑head开始检查最多4项：
 
-  raw_done0 = rob[head+0].valid && rob[head+0].result_valid
-  raw_done1 = rob[head+1].valid && rob[head+1].result_valid
-  raw_done2 = rob[head+2].valid && rob[head+2].result_valid
-  raw_done3 = rob[head+3].valid && rob[head+3].result_valid
+  predicted_done[i] = active_tag_match[i] && !result_valid[i]
+                      && |wb_pre_entry_onehot[*][head+i]
+  raw_done[i]       = rob[head+i].valid
+                      && (rob[head+i].result_valid || predicted_done[i])
 
   retire_valid = {
       raw_done0,
@@ -1096,6 +1116,8 @@ ppe_rob输出按报文序排列的逻辑退休bundle：
 
 retire_valid从slot 0开始连续有效，不得留洞；slot j对应head+j的沿前ROB结果。
 该bundle为组合退休事件，供ppe_retire_output在同一上升沿捕获，不使用ready或反压。
+若slot的DONE来自predicted_done，retire_data必须从命中该entry的唯一FE
+wb_data旁路；否则读取ROB data bank。同一entry不存在多路合法预测命中。
 
 固定4-bank result实现由每个bank直接使用bank_row_cursor[b]执行一次8:1选择，得到
 连续退休窗口中的四个数据，再由head_bank控制的rotate-by-1/rotate-by-2固定网络恢复
@@ -1145,7 +1167,10 @@ out_packet寄存器仍按物理lane使用mapped_valid作为公共clock-enable语
 
 13.4 Writeback Visibility
 
-W0在本周期刚写回的entry不参与同周期R0退休，最早下一周期被DONE scan看到。
+future-slot预测命中head时，W0在本沿写回的entry可在同一沿由R0退休，
+退休数据直接使用wb_data。非head或被前序未DONE entry阻塞的writeback仍落入ROB，
+后续由常规DONE scan看到。若FE实际返回与future-slot不一致，属于验证必须捕获的
+FE/calendar协议错误，RTL不设置可综合恢复通路。
 
 ================================================================================
 14. 全局反压
@@ -1159,7 +1184,9 @@ Backend只对FIFO寄存head计算内部allocation reservation ready：
                             && occupancy_after_retire <= ROB_DEPTH-reserve_count
 
 容量计算只借用已寄存且本沿必提交的pending-retire credit，避免当前retirement scan
-进入reservation ready路径。接受reservation的同一沿把reserve_count计入occupancy；
+进入reservation ready路径。head completion预测使对应retire_count比先写ROB result、
+再扫描的方案提前一沿进入该寄存，因而credit也提前一拍可见；不组合借用本周期
+retire_count。接受reservation的同一沿把reserve_count计入occupancy；
 下一周期commit因此不重新检查容量。实现按16种请求向量静态展开上述关系。
 
 Ingress以两项elastic FIFO吸收寄存反压延迟。定义：
@@ -1213,7 +1240,7 @@ A0、G0、W0和R0允许同周期作用于不同entry。W0不写history；R0是hi
     对沿后ROB valid、seq_tag和result_valid具有最终优先权；
   - allocation原始packet由A0按bank捕获并在A1提交；A1目标entry在正常流水下不可能
     同周期收到writeback，RTL仍以A1 packet写作为同址最终优先级；
-  - 新writeback entry不在同周期退休；
+  - 只有future-slot精确预测且位于连续head prefix的新writeback entry可同周期退休；
   - 已DONE退休entry不再次收到writeback；
   - 同周期4路writeback ID互不相同；
   - 同周期reservation和pending retirement数量统一合并更新occupancy；commit不再次

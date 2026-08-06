@@ -252,6 +252,24 @@ Completion bypass按dependency target的bank奇偶只检查对应FE pair：偶�
 FE0/1，奇数target检查FE2/3，并以固定2选1归并128 bit数据；
 后续只执行completion、active、history固定优先级选择，不使用跨四路串行greedy选择链。
 Gather结果写入per-FE selected operand寄存器，D3只从该寄存器送FE。
+为避免grant valid同时控制ROB宽数据查询并驱动selected operand大量寄存器CE，grant
+metadata在无效周期保持，ROB dependency datapath不使用gather valid门控；selected
+operand数据字段允许无条件捕获，只有selected valid定义其语义。该策略不改变流水边界，
+以少量潜在时钟功耗换取更低的valid控制扇出；无效周期地址稳定以限制无意义数据翻转。
+D2A在锁存grant的同一沿按seq tag低位形成4份bank-local source row/tag-high寄存请求；
+D2B的ROB source读取不再把per-FE grant valid和tag组合归并为bank地址。ROB按bank直接
+返回4份packet，Scheduler按寄存grant的bank选择对应数据，因此不增加流水级并切断
+grant valid到source packet宽数据通路。
+
+Scheduler利用future table中表示下一返回沿的slot提前一拍寄存每个FE的完整seq tag和
+ROB entry one-hot。实际FE返回沿，ROB以该预译码控制定位entry，并仍使用实际completion
+valid/tag、active ROB tag和result-valid状态完成最终资格检查。预测信息不单独提交写回，
+不改变completion或dependency bypass的功能时序。
+由于FE延迟固定且不支持取消，future slot对下一返回沿是精确信息。ROB还使用该
+寄存one-hot将本沿必完成的active entry纳入head DONE prefix；若退休项由该预测
+命中，退休数据从对应FE writeback data旁路，不等待result-valid落入ROB后再扫描。
+这使head completion、逻辑退休和retire-count寄存在同一沿发生，容量判断仍只借用
+沿前已寄存的retire-count credit，不引入当前退休扫描到reservation ready的组合通路。
 
 3.5 PPE_RETIRE_OUTPUT
 

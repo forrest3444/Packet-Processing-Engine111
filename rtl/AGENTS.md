@@ -123,9 +123,12 @@ external protocol.
   clock gating.
 - Reset valid bits, state, pointers, and other control state. Do not reset wide
   data arrays when their contents are ignored while valid is clear.
-- Hold wide registers when their valid/write enable is false, and drive invalid
-  combinational data outputs to zero when doing so suppresses meaningless
-  switching.
+- Hold wide registers when their valid/write enable is false by default, and
+  drive invalid combinational data outputs to zero when doing so suppresses
+  meaningless switching. A wide register may capture unconditionally when
+  implementation evidence identifies its valid/enable fanout as timing
+  critical, the invalid value is architecturally ignored, and the invalid
+  input remains stable enough to avoid material switching.
 - Keep protocol and consistency assertions in verification-only files unless
   the functional specification requires hardware handling.
 

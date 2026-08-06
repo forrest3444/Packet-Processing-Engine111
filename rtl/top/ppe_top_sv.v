@@ -38,17 +38,20 @@ module PPE_TOP_SV #(
 
     wire [`PPE_FE_NUM-1:0]                    completion_valid;
     wire [`PPE_SEQ_W-1:0]                     completion_seq_tag [0:`PPE_FE_NUM-1];
+    wire [`PPE_FE_NUM-1:0]                    wb_pre_valid;
+    wire [`PPE_SEQ_W-1:0]                     wb_pre_seq_tag [0:`PPE_FE_NUM-1];
+    wire [`PPE_ROB_DEPTH-1:0]                 wb_pre_entry_onehot [0:`PPE_FE_NUM-1];
 
     wire [`PPE_FE_NUM-1:0]                    issue_valid;
     wire [PACKET_W-1:0]                       issue_packet [0:`PPE_FE_NUM-1];
     wire [`PPE_DELAY_W-1:0]                   issue_delay [0:`PPE_FE_NUM-1];
     wire [`PPE_FE_NUM-1:0]                    issue_dep_required;
     wire [PACKET_W-1:0]                       issue_dep_data [0:`PPE_FE_NUM-1];
-    wire [`PPE_FE_NUM-1:0]                    gather_valid;
-    wire [`PPE_SEQ_W-1:0]                     gather_seq_tag [0:`PPE_FE_NUM-1];
+    wire [`PPE_ROB_BANK_ROW_W-1:0]            source_bank_row [0:`PPE_N-1];
+    wire [`PPE_ROB_TAG_HI_W-1:0]              source_bank_tag_hi [0:`PPE_N-1];
+    wire [PACKET_W-1:0]                       source_bank_packet [0:`PPE_N-1];
     wire [`PPE_FE_NUM-1:0]                    gather_dep_required;
     wire [`PPE_SEQ_W-1:0]                     gather_target_seq_tag [0:`PPE_FE_NUM-1];
-    wire [PACKET_W-1:0]                       gather_packet [0:`PPE_FE_NUM-1];
     wire [PACKET_W-1:0]                       gather_dep_data [0:`PPE_FE_NUM-1];
     wire [`PPE_FE_NUM-1:0]                    fe_out_valid;
     wire [PACKET_W-1:0]                       fe_out_data [0:`PPE_FE_NUM-1];
@@ -102,11 +105,11 @@ module PPE_TOP_SV #(
         .dep_status_available_i      (dep_status_available),
         .completion_valid_i          (completion_valid),
         .completion_seq_tag_i        (completion_seq_tag),
-        .gather_valid_o              (gather_valid),
-        .gather_seq_tag_o            (gather_seq_tag),
+        .source_bank_row_o           (source_bank_row),
+        .source_bank_tag_hi_o        (source_bank_tag_hi),
+        .source_bank_packet_i        (source_bank_packet),
         .gather_dep_required_o       (gather_dep_required),
         .gather_target_seq_tag_o     (gather_target_seq_tag),
-        .gather_packet_i             (gather_packet),
         .gather_dep_data_i           (gather_dep_data),
         .issue_valid_o               (issue_valid),
         .issue_packet_o              (issue_packet),
@@ -115,7 +118,10 @@ module PPE_TOP_SV #(
         .issue_dep_data_o            (issue_dep_data),
         .fe_out_valid_i              (fe_out_valid),
         .completion_valid_o          (completion_valid),
-        .completion_seq_tag_o        (completion_seq_tag)
+        .completion_seq_tag_o        (completion_seq_tag),
+        .wb_pre_valid_o              (wb_pre_valid),
+        .wb_pre_seq_tag_o            (wb_pre_seq_tag),
+        .wb_pre_entry_onehot_o       (wb_pre_entry_onehot)
     );
 
     genvar fe_idx;
@@ -151,14 +157,17 @@ module PPE_TOP_SV #(
         .dep_status_valid_i          (dep_status_valid),
         .dep_status_target_seq_tag_i (dep_status_target_seq_tag),
         .dep_status_available_o      (dep_status_available),
-        .gather_valid_i              (gather_valid),
-        .gather_seq_tag_i            (gather_seq_tag),
+        .source_bank_row_i           (source_bank_row),
+        .source_bank_tag_hi_i        (source_bank_tag_hi),
+        .source_bank_packet_o        (source_bank_packet),
         .gather_dep_required_i       (gather_dep_required),
         .gather_target_seq_tag_i     (gather_target_seq_tag),
-        .gather_packet_o             (gather_packet),
         .gather_dep_data_o           (gather_dep_data),
         .wb_valid_i                  (completion_valid),
         .wb_seq_tag_i                (completion_seq_tag),
+        .wb_pre_valid_i              (wb_pre_valid),
+        .wb_pre_seq_tag_i            (wb_pre_seq_tag),
+        .wb_pre_entry_onehot_i       (wb_pre_entry_onehot),
         .wb_data_i                   (fe_out_data),
         .ready_bank_head_row_o       (ready_bank_head_row),
         .retire_valid_o              (retire_valid),

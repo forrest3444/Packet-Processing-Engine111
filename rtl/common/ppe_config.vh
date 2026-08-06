@@ -22,5 +22,6 @@
 `define PPE_SEQ_W                6
 `define PPE_HISTORY_ID_W         3
 `define PPE_ROB_BANK_ROW_W       (`PPE_ROB_ID_W - 2)
+`define PPE_ROB_TAG_HI_W         (`PPE_SEQ_W - `PPE_ROB_ID_W)
 
 `endif
