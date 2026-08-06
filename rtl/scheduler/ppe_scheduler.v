@@ -36,7 +36,6 @@ module PPE_SCHEDULER #(
     input  wire [`PPE_FE_NUM-1:0]                    fe_out_valid_i,
     output reg  [`PPE_FE_NUM-1:0]                    completion_valid_o,
     output reg  [`PPE_SEQ_W-1:0]                     completion_seq_tag_o [0:`PPE_FE_NUM-1],
-    output reg  [`PPE_FE_NUM-1:0]                    wb_pre_valid_o,
     output reg  [`PPE_SEQ_W-1:0]                     wb_pre_seq_tag_o [0:`PPE_FE_NUM-1],
     output reg  [`PPE_ROB_DEPTH-1:0]                 wb_pre_entry_onehot_o [0:`PPE_FE_NUM-1]
 );
@@ -1098,15 +1097,18 @@ module PPE_SCHEDULER #(
         integer fe;
 
         if (!rst_ni) begin
-            wb_pre_valid_o <= {FE_NUM{1'b0}};
+            for (fe = 0; fe < FE_NUM; fe = fe + 1) begin
+                wb_pre_entry_onehot_o[fe] <= {ISSUE_DEPTH{1'b0}};
+            end
         end else begin
             for (fe = 0; fe < FE_NUM; fe = fe + 1) begin
-                wb_pre_valid_o[fe] <= future_valid_q[fe][1];
                 if (future_valid_q[fe][1]) begin
                     wb_pre_seq_tag_o[fe] <= future_seq_tag_q[fe][1];
                     wb_pre_entry_onehot_o[fe] <=
                         {{(ISSUE_DEPTH-1){1'b0}}, 1'b1}
                         << future_seq_tag_q[fe][1][ROB_ID_W-1:0];
+                end else begin
+                    wb_pre_entry_onehot_o[fe] <= {ISSUE_DEPTH{1'b0}};
                 end
             end
         end

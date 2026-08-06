@@ -38,7 +38,6 @@ module PPE_TOP_SV #(
 
     wire [`PPE_FE_NUM-1:0]                    completion_valid;
     wire [`PPE_SEQ_W-1:0]                     completion_seq_tag [0:`PPE_FE_NUM-1];
-    wire [`PPE_FE_NUM-1:0]                    wb_pre_valid;
     wire [`PPE_SEQ_W-1:0]                     wb_pre_seq_tag [0:`PPE_FE_NUM-1];
     wire [`PPE_ROB_DEPTH-1:0]                 wb_pre_entry_onehot [0:`PPE_FE_NUM-1];
 
@@ -119,7 +118,6 @@ module PPE_TOP_SV #(
         .fe_out_valid_i              (fe_out_valid),
         .completion_valid_o          (completion_valid),
         .completion_seq_tag_o        (completion_seq_tag),
-        .wb_pre_valid_o              (wb_pre_valid),
         .wb_pre_seq_tag_o            (wb_pre_seq_tag),
         .wb_pre_entry_onehot_o       (wb_pre_entry_onehot)
     );
@@ -165,7 +163,6 @@ module PPE_TOP_SV #(
         .gather_dep_data_o           (gather_dep_data),
         .wb_valid_i                  (completion_valid),
         .wb_seq_tag_i                (completion_seq_tag),
-        .wb_pre_valid_i              (wb_pre_valid),
         .wb_pre_seq_tag_i            (wb_pre_seq_tag),
         .wb_pre_entry_onehot_i       (wb_pre_entry_onehot),
         .wb_data_i                   (fe_out_data),

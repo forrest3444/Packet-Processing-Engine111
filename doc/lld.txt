@@ -935,8 +935,9 @@ selected_valid=0时内容不具有语义。该编码避免grant_valid进入depen
 扇出到selected宽寄存器CE，不改变有效周期的operand值。
 
 future slot1表示下一completion采样沿。Scheduler每沿以slot1为每个FE寄存
-wb_pre_valid、完整wb_pre_seq_tag和32 bit entry one-hot；slot1无效时仅清valid并保持
-宽字段。下一沿实际completion到达时，ROB要求wb_pre_valid、实际wb_valid、实际
+完整wb_pre_seq_tag和32 bit entry one-hot；slot1无效时one-hot清零并保持seq tag。
+one-hot全0表示无预测，不设置独立wb_pre_valid端口。下一沿实际completion到达时，
+ROB要求实际wb_valid、实际
 wb_seq_tag等于wb_pre_seq_tag、one-hot目标active tag匹配且result_valid=0，才产生
 entry-local write enable。预译码不代替实际completion写回资格检查。固定延迟FE协议下，
 它同时是本沿必返回entry的精确预测，可用于13章的head completion预测退休；
@@ -1088,17 +1089,15 @@ slot1..4，不会与本周期slot0消费冲突。
 
 从逻辑head开始检查最多4项：
 
-  predicted_done[i] = active_tag_match[i] && !result_valid[i]
+  predicted_done[i] = rob[head+i].valid && !result_valid[i]
                       && |wb_pre_entry_onehot[*][head+i]
   raw_done[i]       = rob[head+i].valid
                       && (rob[head+i].result_valid || predicted_done[i])
 
-  retire_valid = {
-      raw_done0,
-      raw_done0 && raw_done1,
-      raw_done0 && raw_done1 && raw_done2,
-      raw_done0 && raw_done1 && raw_done2 && raw_done3
-  }
+  done01 = raw_done0 && raw_done1
+  done23 = raw_done2 && raw_done3
+  retire_valid = {raw_done0, done01, done01 && raw_done2,
+                  done01 && done23}
 
   retire_count = decode_dense_prefix(retire_valid)
 
@@ -1130,7 +1129,7 @@ tag选择。数据置换不得改变dense-prefix valid。
 
 R0退休识别沿在ppe_rob内执行：
 
-  - head_bank按retire_count模4推进；
+  - 直接由dense retire-valid生成advance_mod4，head_bank按两位模4 next-state推进；
   - 将本周期退休的逻辑valid反向旋转为physical-bank advance，每个命中bank的
     bank_row_cursor加一；
   - 将retire valid、tag、data和count写入pending-retire寄存器；
@@ -1149,7 +1148,7 @@ Pending期间旧active entry保持有效；提交沿前由active提供依赖，�
 
   - 先将全4路out_valid的next value默认为0，再按start_lane映射K个退休slot；
   - 仅更新本周期out_valid=1的out_packet寄存器，其余out_packet保持；
-  - start_lane推进retire_count。
+  - start_lane按同一advance_mod4直接计算两位模4 next-state。
 
 第j个逻辑退休slot映射到lane=(start_lane+j) mod 4，使用沿前start_lane。ROB状态
 释放、history更新、输出寄存器装载和start_lane更新属于同一架构退休沿，不新增
@@ -1157,8 +1156,9 @@ Pending期间旧active entry保持有效；提交沿前由active提供依赖，�
 
 固定N=4实现使用两级barrel rotate：第一级由start_lane[0]选择旋转0或1，第二级由
 start_lane[1]选择继续旋转0或2。valid和128 bit data经过相同的固定连线置换，不使用
-变量物理lane索引。retire_valid合法编码仅为0000、0001、0011、0111和1111，retire_count
-直接译码为0..4；其他编码属于验证必须捕获的内部协议错误，不设置可综合恢复路径。
+变量物理lane索引。retire_valid合法编码仅为0000、0001、0011、0111和1111；ROB的
+retire_count支路直接译码为0..4，output的start_lane支路直接译码modulo-4 advance。
+其他编码属于验证必须捕获的内部协议错误，不设置可综合恢复路径。
 out_packet寄存器仍按物理lane使用mapped_valid作为公共clock-enable语义，RTL不手动
 例化ICG。
 

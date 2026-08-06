@@ -262,14 +262,21 @@ D2B的ROB source读取不再把per-FE grant valid和tag组合归并为bank地址
 grant valid到source packet宽数据通路。
 
 Scheduler利用future table中表示下一返回沿的slot提前一拍寄存每个FE的完整seq tag和
-ROB entry one-hot。实际FE返回沿，ROB以该预译码控制定位entry，并仍使用实际completion
+ROB entry one-hot。one-hot在future slot无效时寄存为全0，自身具备valid语义，避免独立
+valid广播到entry-local预测网络。实际FE返回沿，ROB以该预译码控制定位entry，并仍使用实际completion
 valid/tag、active ROB tag和result-valid状态完成最终资格检查。预测信息不单独提交写回，
 不改变completion或dependency bypass的功能时序。
 由于FE延迟固定且不支持取消，future slot对下一返回沿是精确信息。ROB还使用该
 寄存one-hot将本沿必完成的active entry纳入head DONE prefix；若退休项由该预测
 命中，退休数据从对应FE writeback data旁路，不等待result-valid落入ROB后再扫描。
+one-hot由完整future seq tag生成，且active entry在其completion之前不可退休复用；因此
+预测DONE只检查one-hot、active valid和result-valid，不重复完整tag比较。实际writeback
+路径仍执行完整tag及状态检查。
 这使head completion、逻辑退休和retire-count寄存在同一沿发生，容量判断仍只借用
 沿前已寄存的retire-count credit，不引入当前退休扫描到reservation ready的组合通路。
+退休DONE prefix以两组两项AND平衡生成；ROB head-bank和output start-lane直接从
+dense retire-valid译码两位modulo-4 advance并计算next-state，不串接3 bit retire-count
+编码和通用加法。retire-count仍在独立支路上寄存，仅供occupancy credit使用。
 
 3.5 PPE_RETIRE_OUTPUT
 
@@ -504,8 +511,8 @@ Active result的4-bank组织保证连续4个ROB ID分别落入不同bank。R0对
 直接形成，tag generation和DONE也按同一固定网络旋转，不从重建的完整head执行
 head+j加法或32项动态tag选择。
 ppe_retire_output在固定N=4基线下使用由start_lane两位分别控制的rotate-by-1和
-rotate-by-2两级barrel网络，不使用动态物理lane写索引。retire_count由合法dense-prefix
-valid的五种编码直接译码。每个物理输出lane继续使用公共packet寄存器使能，以保留自动
+rotate-by-2两级barrel网络，不使用动态物理lane写索引。start_lane由合法dense-prefix
+valid直接生成modulo-4 advance。每个物理输出lane继续使用公共packet寄存器使能，以保留自动
 clock-gating推断机会并抑制无效lane宽数据翻转。
 
 6.7 实现后的优化观察方向

@@ -18,10 +18,10 @@ module PPE_RETIRE_OUTPUT #(
 
     localparam integer N              = `PPE_N;
     localparam integer LANE_ID_W      = 2;
-    localparam integer RETIRE_COUNT_W = 3;
 
     reg [LANE_ID_W-1:0]               start_lane_q;
-    reg [RETIRE_COUNT_W-1:0]          retire_count;
+    reg [LANE_ID_W-1:0]               start_lane_next;
+    reg [LANE_ID_W-1:0]               retire_advance_mod4;
     reg [N-1:0]                       rotate_one_valid;
     reg [PACKET_W-1:0]                rotate_one_data [0:N-1];
     reg [N-1:0]                       mapped_valid;
@@ -56,14 +56,15 @@ module PPE_RETIRE_OUTPUT #(
             mapped_data[3] = rotate_one_data[1];
         end
 
-        case (retire_valid_i)
-            4'b0000: retire_count = 3'd0;
-            4'b0001: retire_count = 3'd1;
-            4'b0011: retire_count = 3'd2;
-            4'b0111: retire_count = 3'd3;
-            4'b1111: retire_count = 3'd4;
-            default: retire_count = 3'd0;
-        endcase
+        retire_advance_mod4[0] = ^retire_valid_i;
+        retire_advance_mod4[1] =
+            retire_valid_i[1] ^ retire_valid_i[3];
+        start_lane_next[0] =
+            start_lane_q[0] ^ retire_advance_mod4[0];
+        start_lane_next[1] =
+            start_lane_q[1]
+            ^ retire_advance_mod4[1]
+            ^ (start_lane_q[0] & retire_advance_mod4[0]);
     end
 
     always @(posedge clk_i or negedge rst_ni) begin : output_state_update
@@ -80,10 +81,7 @@ module PPE_RETIRE_OUTPUT #(
                 end
             end
 
-            if (retire_count != 3'd0) begin
-                start_lane_q <= start_lane_q
-                                + retire_count[LANE_ID_W-1:0];
-            end
+            start_lane_q <= start_lane_next;
         end
     end
 

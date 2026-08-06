@@ -26,7 +26,6 @@ module PPE_ROB #(
     output wire [PACKET_W-1:0]                       gather_dep_data_o [0:`PPE_ISSUE_WIDTH-1],
     input  wire [`PPE_FE_NUM-1:0]                    wb_valid_i,
     input  wire [`PPE_SEQ_W-1:0]                     wb_seq_tag_i [0:`PPE_FE_NUM-1],
-    input  wire [`PPE_FE_NUM-1:0]                    wb_pre_valid_i,
     input  wire [`PPE_SEQ_W-1:0]                     wb_pre_seq_tag_i [0:`PPE_FE_NUM-1],
     input  wire [`PPE_ROB_DEPTH-1:0]                 wb_pre_entry_onehot_i [0:`PPE_FE_NUM-1],
     input  wire [PACKET_W-1:0]                       wb_data_i [0:`PPE_FE_NUM-1],
@@ -79,6 +78,7 @@ module PPE_ROB #(
     endgenerate
 
     reg [DATA_BANK_W-1:0] retire_head_bank_q;
+    reg [DATA_BANK_W-1:0] retire_head_bank_next;
     reg [DATA_ROW_W-1:0] retire_bank_row_q [0:DATA_BANK_NUM-1];
     wire [ROB_ID_W-1:0] head_ptr_q;
     reg [OCCUPANCY_W-1:0] occupancy_q;
@@ -132,6 +132,9 @@ module PPE_ROB #(
     reg [DATA_BANK_NUM-1:0] retire_bank_done;
     reg [DATA_BANK_NUM-1:0] retire_rotate_one_done;
     reg [N-1:0] retire_raw_done;
+    reg retire_done01;
+    reg retire_done23;
+    reg [DATA_BANK_W-1:0] retire_advance_mod4;
     reg [ROB_ID_W-1:0] retire_bank_rob_id [0:DATA_BANK_NUM-1];
     reg [ROB_ID_W-1:0] retire_rotate_one_rob_id [0:DATA_BANK_NUM-1];
     reg [ROB_TAG_HI_W-1:0] retire_bank_tag_hi [0:DATA_BANK_NUM-1];
@@ -239,14 +242,13 @@ module PPE_ROB #(
                 if (((entry_idx & 1) == 0 && wb_idx < 2)
                     || ((entry_idx & 1) != 0 && wb_idx >= 2)) begin
                     wb_lane_entry_predict[wb_idx][entry_idx] =
-                        wb_pre_valid_i[wb_idx]
-                        && wb_pre_entry_onehot_i[wb_idx][entry_idx]
+                        wb_pre_entry_onehot_i[wb_idx][entry_idx]
                         && rob_valid_q[entry_idx]
-                        && (rob_tag_hi_q[entry_idx] == wb_tag_hi)
                         && !rob_result_valid_q[entry_idx];
                     wb_lane_entry_commit[wb_idx][entry_idx] =
                         wb_lane_entry_predict[wb_idx][entry_idx]
-                        && wb_actual_match;
+                        && wb_actual_match
+                        && (rob_tag_hi_q[entry_idx] == wb_tag_hi);
                 end
             end
             wb_entry_predict[entry_idx] =
@@ -304,6 +306,10 @@ module PPE_ROB #(
         retire_bank_done = {DATA_BANK_NUM{1'b0}};
         retire_rotate_one_done = {DATA_BANK_NUM{1'b0}};
         retire_raw_done = {N{1'b0}};
+        retire_done01 = 1'b0;
+        retire_done23 = 1'b0;
+        retire_advance_mod4 = {DATA_BANK_W{1'b0}};
+        retire_head_bank_next = retire_head_bank_q;
         retire_valid_o = {N{1'b0}};
         retire_count = {LANE_COUNT_W{1'b0}};
         retire_inverse_two_valid = {DATA_BANK_NUM{1'b0}};
@@ -359,10 +365,21 @@ module PPE_ROB #(
             end
         end
 
+        retire_done01 = retire_raw_done[0] && retire_raw_done[1];
+        retire_done23 = retire_raw_done[2] && retire_raw_done[3];
         retire_valid_o[0] = retire_raw_done[0];
-        retire_valid_o[1] = retire_valid_o[0] && retire_raw_done[1];
-        retire_valid_o[2] = retire_valid_o[1] && retire_raw_done[2];
-        retire_valid_o[3] = retire_valid_o[2] && retire_raw_done[3];
+        retire_valid_o[1] = retire_done01;
+        retire_valid_o[2] = retire_done01 && retire_raw_done[2];
+        retire_valid_o[3] = retire_done01 && retire_done23;
+        retire_advance_mod4[0] = ^retire_valid_o;
+        retire_advance_mod4[1] =
+            retire_valid_o[1] ^ retire_valid_o[3];
+        retire_head_bank_next[0] =
+            retire_head_bank_q[0] ^ retire_advance_mod4[0];
+        retire_head_bank_next[1] =
+            retire_head_bank_q[1]
+            ^ retire_advance_mod4[1]
+            ^ (retire_head_bank_q[0] & retire_advance_mod4[0]);
         case (retire_valid_o)
             4'b0000: retire_count = 3'd0;
             4'b0001: retire_count = 3'd1;
@@ -835,9 +852,7 @@ module PPE_ROB #(
                  bank_idx = bank_idx + 1)
                 retire_bank_row_q[bank_idx] <= {DATA_ROW_W{1'b0}};
         end else begin
-            if (retire_count != {LANE_COUNT_W{1'b0}})
-                retire_head_bank_q <= retire_head_bank_q
-                                      + retire_count[DATA_BANK_W-1:0];
+            retire_head_bank_q <= retire_head_bank_next;
             for (bank_idx = 0; bank_idx < DATA_BANK_NUM;
                  bank_idx = bank_idx + 1)
                 if (retire_bank_advance[bank_idx])
