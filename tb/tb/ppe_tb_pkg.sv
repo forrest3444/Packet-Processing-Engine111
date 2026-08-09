@@ -13,13 +13,19 @@ package ppe_tb_pkg;
     import uvm_pkg::*;
     `include "uvm_macros.svh"
 
-    parameter int PACKET_W = 128;
+    parameter int PACKET_W = `PPE_DEFAULT_PACKET_W;
+    // Verification dimensions are derived from the common design config.
+    parameter int TB_N      = `PPE_N;
+    parameter int TB_DESC_W = `PPE_DEFAULT_DESC_W;
+    parameter int TB_LANE_W = (TB_N <= 1) ? 1 : $clog2(TB_N);
+    parameter int TB_DELAY_CLASSES = (1 << `PPE_DELAY_W);
 
     parameter int TB_SEQ_W    = `PPE_SEQ_W;
     parameter int TB_ROB_ID_W = `PPE_ROB_ID_W;
     parameter int TB_OCC_W    = $clog2(`PPE_ROB_DEPTH + 1);
 
-    typedef virtual ppe_if #(PACKET_W, TB_SEQ_W, TB_ROB_ID_W, TB_OCC_W)
+    typedef virtual ppe_if #(PACKET_W, TB_DESC_W, TB_N,
+                             TB_SEQ_W, TB_ROB_ID_W, TB_OCC_W)
             ppe_vif_t;
 
     `include "ppe_item.sv"

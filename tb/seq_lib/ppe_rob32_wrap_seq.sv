@@ -13,7 +13,7 @@ class ppe_rob32_wrap_seq extends uvm_sequence #(ppe_item);
     `uvm_object_utils(ppe_rob32_wrap_seq)
 
     localparam int unsigned PACKET_COUNT = 128;
-    localparam int unsigned BATCH_COUNT  = PACKET_COUNT / 4;
+    localparam int unsigned BATCH_COUNT  = PACKET_COUNT / TB_N;
 
     function new(string name = "ppe_rob32_wrap_seq");
         super.new(name);
@@ -26,10 +26,10 @@ class ppe_rob32_wrap_seq extends uvm_sequence #(ppe_item);
             tr = ppe_item::type_id::create(
                 $sformatf("rob32_wrap_batch_%0d", batch));
             start_item(tr);
-            for (int unsigned lane = 0; lane < 4; lane++) begin
+            for (int unsigned lane = 0; lane < TB_N; lane++) begin
                 int unsigned packet_seq;
 
-                packet_seq = (batch * 4) + lane;
+                packet_seq = (batch * TB_N) + lane;
                 tr.valid[lane]  = 1'b1;
                 tr.seq[lane]    = packet_seq;
                 tr.packet[lane] = make_packet(packet_seq);

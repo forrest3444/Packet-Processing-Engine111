@@ -87,7 +87,7 @@ class ppe_dep_loss_test extends uvm_test;
             end
             wait_seen = 1'b1;
         end
-        for (fe = 0; fe < 4; fe++) begin
+        for (fe = 0; fe < TB_N; fe++) begin
             if (vif.dbg_wb_valid[fe] &&
                 (vif.dbg_wb_seq_tag[fe*TB_SEQ_W +: TB_SEQ_W] == '0)
                 && wait_seen) begin

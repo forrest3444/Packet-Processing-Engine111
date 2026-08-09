@@ -8,10 +8,11 @@
 class ppe_load_mix_perf_seq extends uvm_sequence #(ppe_item);
     `uvm_object_utils(ppe_load_mix_perf_seq)
 
-    localparam int unsigned MEDIUM_PACKETS = 378;
     localparam int unsigned MEDIUM_BEATS   = 189;
-    localparam int unsigned HEAVY_PACKETS  = 756;
     localparam int unsigned HEAVY_BEATS    = 210;
+    localparam int unsigned MEDIUM_PACKETS = MEDIUM_BEATS * (TB_N / 2);
+    localparam int unsigned HEAVY_PACKETS  = (HEAVY_BEATS / 5)
+                                           * ((5 * TB_N) - 2);
 
     bit [2:0] dep_pool[21];
     int unsigned dep_index = 21;
@@ -28,7 +29,7 @@ class ppe_load_mix_perf_seq extends uvm_sequence #(ppe_item);
         int unsigned lane;
         int unsigned seq;
         int unsigned valid_count;
-        bit [3:0] lane_mask;
+        bit [TB_N-1:0] lane_mask;
 
         seq = 0;
         void'($value$plusargs("MIXED_DEP_PER_21=%d", dep_per_21));
@@ -37,13 +38,13 @@ class ppe_load_mix_perf_seq extends uvm_sequence #(ppe_item);
                 "MIXED_DEP_PER_21=%0d must be in 0..21", dep_per_21))
         end
 
-        // Medium load: two of four input ports are valid on every source beat.
+        // Medium load: half of the input ports are valid on every source beat.
         for (beat = 0; beat < MEDIUM_BEATS; beat++) begin
-            lane_mask = choose_lane_mask(2);
+            lane_mask = choose_lane_mask(TB_N / 2);
             tr = ppe_item::type_id::create($sformatf("medium_beat_%0d", beat));
             start_item(tr);
             clear_item(tr);
-            for (lane = 0; lane < 4; lane++) begin
+            for (lane = 0; lane < TB_N; lane++) begin
                 if (lane_mask[lane]) begin
                     fill_lane(tr, lane, seq);
                     seq++;
@@ -54,12 +55,12 @@ class ppe_load_mix_perf_seq extends uvm_sequence #(ppe_item);
 
         // Three full beats and two 3-packet beats per five heavy source beats.
         for (beat = 0; beat < HEAVY_BEATS; beat++) begin
-            valid_count = ((beat % 5) < 3) ? 4 : 3;
+            valid_count = ((beat % 5) < 3) ? TB_N : (TB_N - 1);
             lane_mask = choose_lane_mask(valid_count);
             tr = ppe_item::type_id::create($sformatf("heavy_beat_%0d", beat));
             start_item(tr);
             clear_item(tr);
-            for (lane = 0; lane < 4; lane++) begin
+            for (lane = 0; lane < TB_N; lane++) begin
                 if (lane_mask[lane]) begin
                     fill_lane(tr, lane, seq);
                     seq++;
@@ -76,10 +77,10 @@ class ppe_load_mix_perf_seq extends uvm_sequence #(ppe_item);
     endtask
 
     function void clear_item(ppe_item tr);
-        tr.valid = '{1'b0, 1'b0, 1'b0, 1'b0};
-        tr.seq = '{0, 0, 0, 0};
-        tr.packet = '{'0, '0, '0, '0};
-        tr.desc = '{5'b0, 5'b0, 5'b0, 5'b0};
+        tr.valid = '{default: 1'b0};
+        tr.seq = '{default: '0};
+        tr.packet = '{default: '0};
+        tr.desc = '{default: '0};
     endfunction
 
     function void fill_lane(ppe_item tr, int unsigned lane,
@@ -88,22 +89,22 @@ class ppe_load_mix_perf_seq extends uvm_sequence #(ppe_item);
         bit [1:0] delay;
 
         dep_offset = next_dependency();
-        delay = $urandom_range(3, 0);
+        delay = $urandom_range(TB_DELAY_CLASSES - 1, 0);
         tr.valid[lane] = 1'b1;
         tr.seq[lane] = seq;
         tr.packet[lane] = make_packet(seq);
         tr.desc[lane] = {dep_offset, delay};
     endfunction
 
-    function bit [3:0] choose_lane_mask(int unsigned count);
-        bit [3:0] mask;
+    function bit [TB_N-1:0] choose_lane_mask(int unsigned count);
+        bit [TB_N-1:0] mask;
         int unsigned lane;
         int unsigned picked;
 
-        mask = 4'b0000;
+        mask = '0;
         picked = 0;
         while (picked < count) begin
-            lane = $urandom_range(3, 0);
+            lane = $urandom_range(TB_N - 1, 0);
             if (!mask[lane]) begin
                 mask[lane] = 1'b1;
                 picked++;

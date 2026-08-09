@@ -23,7 +23,7 @@ class ppe_p0_perf_test extends uvm_test;
     int unsigned bkps_cycles;
     int unsigned occupancy_sum;
     int unsigned occupancy_peak;
-    int unsigned issue_lane_cycles[4];
+    int unsigned issue_lane_cycles[TB_N];
     int unsigned first_accept_cycle;
     int unsigned last_accept_cycle;
     int unsigned latency_sum;
@@ -70,11 +70,9 @@ class ppe_p0_perf_test extends uvm_test;
         repeat (TIMEOUT_CYCLES) begin
             @(posedge vif.clk);
             cycle_count++;
-            accepted_now = !vif.bkps ? count4({vif.in_valid3, vif.in_valid2,
-                                               vif.in_valid1, vif.in_valid0}) : 0;
-            issued_now = count4(vif.dbg_fe_in_valid);
-            retired_now = count4({vif.out_valid3, vif.out_valid2,
-                                  vif.out_valid1, vif.out_valid0});
+            accepted_now = !vif.bkps ? count_n(vif.in_valid) : 0;
+            issued_now = count_n(vif.dbg_fe_in_valid);
+            retired_now = count_n(vif.out_valid);
 
             if (!measuring && (accepted_now != 0)) begin
                 measuring = 1'b1;
@@ -96,7 +94,7 @@ class ppe_p0_perf_test extends uvm_test;
                 if (vif.dbg_rob_occupancy > occupancy_peak) begin
                     occupancy_peak = vif.dbg_rob_occupancy;
                 end
-                for (lane = 0; lane < 4; lane++) begin
+                for (lane = 0; lane < TB_N; lane++) begin
                     if (vif.dbg_fe_in_valid[lane]) begin
                         issue_lane_cycles[lane]++;
                     end
@@ -128,9 +126,11 @@ class ppe_p0_perf_test extends uvm_test;
         end
     endtask
 
-    function int unsigned count4(bit [3:0] value);
-        count4 = {31'b0, value[0]} + {31'b0, value[1]} +
-                 {31'b0, value[2]} + {31'b0, value[3]};
+    function int unsigned count_n(bit [TB_N-1:0] value);
+        count_n = 0;
+        for (int unsigned lane = 0; lane < TB_N; lane++) begin
+            count_n += value[lane];
+        end
     endfunction
 
     task check_results();
@@ -173,7 +173,7 @@ class ppe_p0_perf_test extends uvm_test;
         real avg_latency;
         real bkps_ratio;
         real avg_occupancy;
-        real fe_util[4];
+        real fe_util[TB_N];
         int unsigned lane;
 
         accept_window_cycles = last_accept_cycle - first_accept_cycle + 1;
@@ -183,7 +183,7 @@ class ppe_p0_perf_test extends uvm_test;
         avg_latency = $itor(latency_sum) / $itor(retired_count);
         bkps_ratio = $itor(bkps_cycles) / $itor(measurement_cycles);
         avg_occupancy = $itor(occupancy_sum) / $itor(measurement_cycles);
-        for (lane = 0; lane < 4; lane++) begin
+        for (lane = 0; lane < TB_N; lane++) begin
             fe_util[lane] = $itor(issue_lane_cycles[lane]) /
                             $itor(measurement_cycles);
         end
@@ -200,9 +200,10 @@ class ppe_p0_perf_test extends uvm_test;
         `uvm_info("P0_PERF", $sformatf(
             "rob_occupancy_avg=%.2f rob_occupancy_peak=%0d fallback_cycles=%0d",
             avg_occupancy, occupancy_peak, fallback_cycles), UVM_NONE)
-        `uvm_info("P0_PERF", $sformatf(
-            "fe_utilization={%.4f,%.4f,%.4f,%.4f}",
-            fe_util[0], fe_util[1], fe_util[2], fe_util[3]), UVM_NONE)
+        for (lane = 0; lane < TB_N; lane++) begin
+            `uvm_info("P0_PERF", $sformatf(
+                "fe%0d_utilization=%.4f", lane, fe_util[lane]), UVM_NONE)
+        end
     endtask
 endclass
 

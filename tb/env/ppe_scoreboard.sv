@@ -66,9 +66,9 @@ class ppe_scoreboard extends uvm_component;
             `uvm_error("DATA", $sformatf("output data mismatch at seq=%0d", got_total))
         end
 
-        if (item.lane !== got_total[1:0]) begin
+        if (item.lane !== (got_total % TB_N)) begin
             `uvm_error("LANE", $sformatf("output lane got=%0d expected=%0d",
-                       item.lane, got_total[1:0]))
+                       item.lane, got_total % TB_N))
         end
 
         got_total++;

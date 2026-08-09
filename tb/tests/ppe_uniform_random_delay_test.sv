@@ -25,12 +25,12 @@ class ppe_uniform_random_delay_test extends uvm_test;
     int unsigned bkps_cycles;
     int unsigned occupancy_sum;
     int unsigned occupancy_peak;
-    int unsigned delay_hist[4];
-    int unsigned issue_width_hist[5];
-    int unsigned fe_issue_count[4];
+    int unsigned delay_hist[TB_DELAY_CLASSES];
+    int unsigned issue_width_hist[TB_N+1];
+    int unsigned fe_issue_count[TB_N];
     int unsigned steady_cycles;
     int unsigned steady_issue_count;
-    int unsigned steady_fe_issue_count[4];
+    int unsigned steady_fe_issue_count[TB_N];
     int unsigned latency_sum;
     int unsigned latency_max;
     int unsigned accept_cycle_q[$];
@@ -71,18 +71,14 @@ class ppe_uniform_random_delay_test extends uvm_test;
         int unsigned lane;
         int unsigned latency;
         bit          steady_sample;
-        bit [4:0]    accepted_desc;
+        bit [TB_DESC_W-1:0] accepted_desc;
 
         repeat (TIMEOUT_CYCLES) begin
             @(posedge vif.clk);
             cycle_count++;
-            accepted_now = !vif.bkps ? count4(
-                {vif.in_valid3, vif.in_valid2,
-                 vif.in_valid1, vif.in_valid0}) : 0;
-            issued_now = count4(vif.dbg_fe_in_valid);
-            retired_now = count4(
-                {vif.out_valid3, vif.out_valid2,
-                 vif.out_valid1, vif.out_valid0});
+            accepted_now = !vif.bkps ? count_n(vif.in_valid) : 0;
+            issued_now = count_n(vif.dbg_fe_in_valid);
+            retired_now = count_n(vif.out_valid);
 
             if (!measuring && (accepted_now != 0)) begin
                 measuring = 1'b1;
@@ -102,7 +98,7 @@ class ppe_uniform_random_delay_test extends uvm_test;
                 if (vif.dbg_rob_occupancy > occupancy_peak)
                     occupancy_peak = vif.dbg_rob_occupancy;
 
-                for (lane = 0; lane < 4; lane++) begin
+                for (lane = 0; lane < TB_N; lane++) begin
                     if (vif.dbg_fe_in_valid[lane])
                         fe_issue_count[lane]++;
                     if (steady_sample && vif.dbg_fe_in_valid[lane])
@@ -115,7 +111,7 @@ class ppe_uniform_random_delay_test extends uvm_test;
 
                 if (accepted_now != 0) begin
                     last_accept_cycle = cycle_count;
-                    for (lane = 0; lane < 4; lane++) begin
+                    for (lane = 0; lane < TB_N; lane++) begin
                         if (lane_valid(lane)) begin
                             accepted_desc = lane_desc(lane);
                             delay_hist[accepted_desc[1:0]]++;
@@ -145,26 +141,18 @@ class ppe_uniform_random_delay_test extends uvm_test;
     endtask
 
     function bit lane_valid(int unsigned lane);
-        case (lane)
-            0: lane_valid = vif.in_valid0;
-            1: lane_valid = vif.in_valid1;
-            2: lane_valid = vif.in_valid2;
-            default: lane_valid = vif.in_valid3;
-        endcase
+        lane_valid = vif.in_valid[lane];
     endfunction
 
-    function bit [4:0] lane_desc(int unsigned lane);
-        case (lane)
-            0: lane_desc = vif.in_desc0;
-            1: lane_desc = vif.in_desc1;
-            2: lane_desc = vif.in_desc2;
-            default: lane_desc = vif.in_desc3;
-        endcase
+    function bit [TB_DESC_W-1:0] lane_desc(int unsigned lane);
+        lane_desc = vif.in_desc[lane];
     endfunction
 
-    function int unsigned count4(bit [3:0] value);
-        count4 = {31'b0, value[0]} + {31'b0, value[1]} +
-                 {31'b0, value[2]} + {31'b0, value[3]};
+    function int unsigned count_n(bit [TB_N-1:0] value);
+        count_n = 0;
+        for (int unsigned lane = 0; lane < TB_N; lane++) begin
+            count_n += value[lane];
+        end
     endfunction
 
     task check_results();
@@ -181,7 +169,7 @@ class ppe_uniform_random_delay_test extends uvm_test;
                 "accepted=%0d issued=%0d retired=%0d expected=%0d",
                 accepted_count, issued_count, retired_count, PACKET_COUNT))
         end
-        for (delay = 0; delay < 4; delay++) begin
+        for (delay = 0; delay < TB_DELAY_CLASSES; delay++) begin
             if (delay_hist[delay] == 0) begin
                 `uvm_error("UNIFORM_DELAY", $sformatf(
                     "delay%0d was not observed", delay))
@@ -206,8 +194,8 @@ class ppe_uniform_random_delay_test extends uvm_test;
         real bkps_ratio;
         real avg_occupancy;
         real avg_latency;
-        real fe_util[4];
-        real steady_fe_util[4];
+        real fe_util[TB_N];
+        real steady_fe_util[TB_N];
         int unsigned lane;
         string mode;
 
@@ -215,11 +203,11 @@ class ppe_uniform_random_delay_test extends uvm_test;
         accept_rate = $itor(accepted_count) / $itor(accept_window_cycles);
         end_to_end_rate = $itor(retired_count) / $itor(measurement_cycles);
         steady_issue_rate = $itor(steady_issue_count) / $itor(steady_cycles);
-        theoretical_efficiency = steady_issue_rate / 4.0;
+        theoretical_efficiency = steady_issue_rate / TB_N;
         bkps_ratio = $itor(bkps_cycles) / $itor(measurement_cycles);
         avg_occupancy = $itor(occupancy_sum) / $itor(measurement_cycles);
         avg_latency = $itor(latency_sum) / $itor(retired_count);
-        for (lane = 0; lane < 4; lane++) begin
+        for (lane = 0; lane < TB_N; lane++) begin
             fe_util[lane] = $itor(fe_issue_count[lane]) /
                             $itor(measurement_cycles);
             steady_fe_util[lane] = $itor(steady_fe_issue_count[lane]) /
@@ -237,15 +225,17 @@ class ppe_uniform_random_delay_test extends uvm_test;
             steady_cycles, steady_issue_rate,
             theoretical_efficiency * 100.0), UVM_NONE)
         `uvm_info("UNIFORM_PERF", $sformatf(
-            "delay_hist={%0d,%0d,%0d,%0d} fe_util={%.4f,%.4f,%.4f,%.4f}",
-            delay_hist[0], delay_hist[1], delay_hist[2], delay_hist[3],
-            fe_util[0], fe_util[1], fe_util[2], fe_util[3]), UVM_NONE)
-        `uvm_info("UNIFORM_PERF", $sformatf(
-            "steady_fe_util={%.4f,%.4f,%.4f,%.4f} issue_width_hist={%0d,%0d,%0d,%0d,%0d}",
-            steady_fe_util[0], steady_fe_util[1],
-            steady_fe_util[2], steady_fe_util[3],
-            issue_width_hist[0], issue_width_hist[1], issue_width_hist[2],
-            issue_width_hist[3], issue_width_hist[4]), UVM_NONE)
+            "delay_hist={%0d,%0d,%0d,%0d}",
+            delay_hist[0], delay_hist[1], delay_hist[2], delay_hist[3]), UVM_NONE)
+        for (lane = 0; lane < TB_N; lane++) begin
+            `uvm_info("UNIFORM_PERF", $sformatf(
+                "fe%0d_util=%.4f steady_fe%0d_util=%.4f",
+                lane, fe_util[lane], lane, steady_fe_util[lane]), UVM_NONE)
+        end
+        for (lane = 0; lane <= TB_N; lane++) begin
+            `uvm_info("UNIFORM_PERF", $sformatf(
+                "issue_width_%0d=%0d", lane, issue_width_hist[lane]), UVM_NONE)
+        end
         `uvm_info("UNIFORM_PERF", $sformatf(
             "bkps_ratio=%.4f rob_avg=%.2f rob_peak=%0d latency_avg=%.2f latency_max=%0d",
             bkps_ratio, avg_occupancy, occupancy_peak,

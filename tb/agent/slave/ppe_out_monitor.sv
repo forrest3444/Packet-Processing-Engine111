@@ -12,7 +12,7 @@ class ppe_out_monitor extends uvm_component;
 
     ppe_vif_t vif;
     uvm_analysis_port #(ppe_out_item) out_ap;
-    bit [1:0] start_lane;
+    bit [TB_LANE_W-1:0] start_lane;
 
     function new(string name, uvm_component parent);
         super.new(name, parent);
@@ -29,28 +29,32 @@ class ppe_out_monitor extends uvm_component;
     task run_phase(uvm_phase phase);
         int unsigned valid_count;
         int unsigned index;
-        bit [1:0] lane;
+        bit [TB_LANE_W-1:0] lane;
 
         @(posedge vif.rst_n);
-        start_lane = 2'd0;
+        start_lane = '0;
         forever begin
             @(posedge vif.clk);
-            valid_count = vif.out_valid0 + vif.out_valid1 +
-                          vif.out_valid2 + vif.out_valid3;
-            for (index = 0; index < valid_count; index++) begin
-                lane = start_lane + index[1:0];
-                case (lane)
-                    2'd0: sample_lane(lane, vif.out_valid0, vif.out_packet0);
-                    2'd1: sample_lane(lane, vif.out_valid1, vif.out_packet1);
-                    2'd2: sample_lane(lane, vif.out_valid2, vif.out_packet2);
-                    default: sample_lane(lane, vif.out_valid3, vif.out_packet3);
-                endcase
+            valid_count = 0;
+            for (int unsigned lane_idx = 0; lane_idx < TB_N; lane_idx++) begin
+                valid_count += vif.out_valid[lane_idx];
             end
-            start_lane += valid_count[1:0];
+            for (index = 0; index < valid_count; index++) begin
+                lane = start_lane + index;
+                if (lane >= TB_N) begin
+                    lane -= TB_N;
+                end
+                sample_lane(lane, vif.out_valid[lane], vif.out_packet[lane]);
+            end
+            start_lane += valid_count;
+            if (start_lane >= TB_N) begin
+                start_lane -= TB_N;
+            end
         end
     endtask
 
-    task sample_lane(bit [1:0] lane, bit valid, bit [PACKET_W-1:0] packet);
+    task sample_lane(bit [TB_LANE_W-1:0] lane, bit valid,
+                     bit [PACKET_W-1:0] packet);
         ppe_out_item item;
         if (valid) begin
             item = ppe_out_item::type_id::create("item");

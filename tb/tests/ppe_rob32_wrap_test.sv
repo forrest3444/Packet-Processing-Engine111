@@ -74,7 +74,7 @@ class ppe_rob32_wrap_test extends uvm_test;
                 occupancy_peak = vif.dbg_rob_occupancy;
             end
 
-            for (int unsigned fe = 0; fe < 4; fe++) begin
+            for (int unsigned fe = 0; fe < TB_N; fe++) begin
                 if (vif.dbg_wb_valid[fe]) begin
                     if (vif.dbg_wb_seq_tag[fe*TB_SEQ_W +: TB_SEQ_W]
                         == {TB_SEQ_W{1'b1}}) begin
@@ -88,8 +88,7 @@ class ppe_rob32_wrap_test extends uvm_test;
                 end
             end
 
-            retired_count += count4({vif.out_valid3, vif.out_valid2,
-                                      vif.out_valid1, vif.out_valid0});
+            retired_count += count_n(vif.out_valid);
             if (retired_count >= PACKET_COUNT) begin
                 completed = 1'b1;
                 break;
@@ -97,9 +96,11 @@ class ppe_rob32_wrap_test extends uvm_test;
         end
     endtask
 
-    function int unsigned count4(bit [3:0] value);
-        count4 = {31'b0, value[0]} + {31'b0, value[1]} +
-                 {31'b0, value[2]} + {31'b0, value[3]};
+    function int unsigned count_n(bit [TB_N-1:0] value);
+        count_n = 0;
+        for (int unsigned lane = 0; lane < TB_N; lane++) begin
+            count_n += value[lane];
+        end
     endfunction
 
 endclass

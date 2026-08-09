@@ -8,10 +8,11 @@
 class ppe_load_mix_perf_test extends uvm_test;
     `uvm_component_utils(ppe_load_mix_perf_test)
 
-    localparam int unsigned MEDIUM_PACKETS = 378;
     localparam int unsigned MEDIUM_BEATS   = 189;
-    localparam int unsigned HEAVY_PACKETS  = 756;
     localparam int unsigned HEAVY_BEATS    = 210;
+    localparam int unsigned MEDIUM_PACKETS = MEDIUM_BEATS * (TB_N / 2);
+    localparam int unsigned HEAVY_PACKETS  = (HEAVY_BEATS / 5)
+                                           * ((5 * TB_N) - 2);
     localparam int unsigned TOTAL_PACKETS  = MEDIUM_PACKETS + HEAVY_PACKETS;
     localparam int unsigned TIMEOUT_CYCLES = 50000;
 
@@ -33,9 +34,9 @@ class ppe_load_mix_perf_test extends uvm_test;
     int unsigned d3_fallback_cycles;
     int unsigned occupancy_sum;
     int unsigned occupancy_peak;
-    int unsigned issue_width_hist[5];
+    int unsigned issue_width_hist[TB_N+1];
     int unsigned dep_hist[8];
-    int unsigned delay_hist[4];
+    int unsigned delay_hist[TB_DELAY_CLASSES];
     int unsigned latency_sum;
     int unsigned latency_max;
     int unsigned dep_per_21 = 7;
@@ -81,16 +82,14 @@ class ppe_load_mix_perf_test extends uvm_test;
         int unsigned retired_now;
         int unsigned latency;
         int unsigned lane;
-        bit [4:0] desc;
+        bit [TB_DESC_W-1:0] desc;
 
         repeat (TIMEOUT_CYCLES) begin
             @(posedge vif.clk);
             cycle_count++;
-            accepted_now = !vif.bkps ? count4({vif.in_valid3, vif.in_valid2,
-                                               vif.in_valid1, vif.in_valid0}) : 0;
-            issued_now = count4(vif.dbg_fe_in_valid);
-            retired_now = count4({vif.out_valid3, vif.out_valid2,
-                                  vif.out_valid1, vif.out_valid0});
+            accepted_now = !vif.bkps ? count_n(vif.in_valid) : 0;
+            issued_now = count_n(vif.dbg_fe_in_valid);
+            retired_now = count_n(vif.out_valid);
 
             if (!measuring && (accepted_now != 0)) begin
                 measuring = 1'b1;
@@ -123,7 +122,7 @@ class ppe_load_mix_perf_test extends uvm_test;
                     end else begin
                         heavy_accept_beats++;
                     end
-                    for (lane = 0; lane < 4; lane++) begin
+                    for (lane = 0; lane < TB_N; lane++) begin
                         if (lane_valid(lane)) begin
                             desc = lane_desc(lane);
                             dep_hist[desc[4:2]]++;
@@ -153,26 +152,18 @@ class ppe_load_mix_perf_test extends uvm_test;
     endtask
 
     function bit lane_valid(int unsigned lane);
-        case (lane)
-            0: lane_valid = vif.in_valid0;
-            1: lane_valid = vif.in_valid1;
-            2: lane_valid = vif.in_valid2;
-            default: lane_valid = vif.in_valid3;
-        endcase
+        lane_valid = vif.in_valid[lane];
     endfunction
 
-    function bit [4:0] lane_desc(int unsigned lane);
-        case (lane)
-            0: lane_desc = vif.in_desc0;
-            1: lane_desc = vif.in_desc1;
-            2: lane_desc = vif.in_desc2;
-            default: lane_desc = vif.in_desc3;
-        endcase
+    function bit [TB_DESC_W-1:0] lane_desc(int unsigned lane);
+        lane_desc = vif.in_desc[lane];
     endfunction
 
-    function int unsigned count4(bit [3:0] value);
-        count4 = {31'b0, value[0]} + {31'b0, value[1]} +
-                 {31'b0, value[2]} + {31'b0, value[3]};
+    function int unsigned count_n(bit [TB_N-1:0] value);
+        count_n = 0;
+        for (int unsigned lane = 0; lane < TB_N; lane++) begin
+            count_n += value[lane];
+        end
     endfunction
 
     task check_results();
@@ -212,7 +203,7 @@ class ppe_load_mix_perf_test extends uvm_test;
                     dep_hist[dep], expected_dep_count))
             end
         end
-        for (delay = 0; delay < 4; delay++) begin
+        for (delay = 0; delay < TB_DELAY_CLASSES; delay++) begin
             if (delay_hist[delay] == 0) begin
                 `uvm_error("LOAD_DELAY_DIST", $sformatf(
                     "random delay value %0d was not observed", delay))
@@ -240,9 +231,9 @@ class ppe_load_mix_perf_test extends uvm_test;
         real avg_occupancy;
 
         medium_port_util = $itor(MEDIUM_PACKETS) /
-                           $itor(MEDIUM_BEATS * 4);
+                           $itor(MEDIUM_BEATS * TB_N);
         heavy_port_util = $itor(HEAVY_PACKETS) /
-                          $itor(HEAVY_BEATS * 4);
+                          $itor(HEAVY_BEATS * TB_N);
         medium_accept_rate = $itor(MEDIUM_PACKETS) / $itor(medium_input_cycles);
         heavy_accept_rate = $itor(HEAVY_PACKETS) / $itor(heavy_input_cycles);
         medium_bkps_ratio = $itor(medium_bkps_cycles) / $itor(medium_input_cycles);
@@ -271,11 +262,14 @@ class ppe_load_mix_perf_test extends uvm_test;
             dep_hist[5], dep_hist[6], dep_hist[7], delay_hist[0],
             delay_hist[1], delay_hist[2], delay_hist[3]), UVM_NONE)
         `uvm_info("LOAD_PERF", $sformatf(
-            "rob_avg=%.2f rob_peak=%0d fallback=%0d d3_fallback=%0d issue_width_hist={%0d,%0d,%0d,%0d,%0d}",
+            "rob_avg=%.2f rob_peak=%0d fallback=%0d d3_fallback=%0d",
             avg_occupancy, occupancy_peak, fallback_cycles,
-            d3_fallback_cycles, issue_width_hist[0], issue_width_hist[1],
-            issue_width_hist[2], issue_width_hist[3], issue_width_hist[4]),
-            UVM_NONE)
+            d3_fallback_cycles), UVM_NONE)
+        for (int unsigned width = 0; width <= TB_N; width++) begin
+            `uvm_info("LOAD_PERF", $sformatf(
+                "issue_width_%0d=%0d", width, issue_width_hist[width]),
+                UVM_NONE)
+        end
     endtask
 endclass
 

@@ -174,7 +174,7 @@ clean:
 	rm -rf $(SIM)/run
 
 clean_all:
-	rm -rf $(SIM) csrc *.daidir vc_hdrs.h ucli.key
+	rm -rf $(SIM) verdiLog csrc *.daidir vc_hdrs.h ucli.key novas.conf novas_dump.log novas.rc tr_db.log
 
 help:
 	@echo "Targets:"

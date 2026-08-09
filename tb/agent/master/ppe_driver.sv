@@ -39,18 +39,11 @@ class ppe_driver extends uvm_driver #(ppe_item);
     task drive_item(ppe_item tr);
         wait (!vif.bkps);
 
-        vif.in_valid0  <= tr.valid[0];
-        vif.in_packet0 <= tr.packet[0];
-        vif.in_desc0   <= tr.desc[0];
-        vif.in_valid1  <= tr.valid[1];
-        vif.in_packet1 <= tr.packet[1];
-        vif.in_desc1   <= tr.desc[1];
-        vif.in_valid2  <= tr.valid[2];
-        vif.in_packet2 <= tr.packet[2];
-        vif.in_desc2   <= tr.desc[2];
-        vif.in_valid3  <= tr.valid[3];
-        vif.in_packet3 <= tr.packet[3];
-        vif.in_desc3   <= tr.desc[3];
+        for (int unsigned lane = 0; lane < TB_N; lane++) begin
+            vif.in_valid[lane]  <= tr.valid[lane];
+            vif.in_packet[lane] <= tr.packet[lane];
+            vif.in_desc[lane]   <= tr.desc[lane];
+        end
 
         do begin
             @(posedge vif.clk);

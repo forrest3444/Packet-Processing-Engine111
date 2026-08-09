@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// Four-wide, dependency-free traffic with independent uniform random delays.
+// N-wide, dependency-free traffic with independent uniform random delays.
 // -----------------------------------------------------------------------------
 
 `ifndef PPE_UNIFORM_RANDOM_DELAY_SEQ_SV
@@ -28,14 +28,16 @@ class ppe_uniform_random_delay_seq extends uvm_sequence #(ppe_item);
             tr = ppe_item::type_id::create(
                 $sformatf("uniform_delay_beat_%0d", beat));
             start_item(tr);
-            tr.valid  = '{1'b0, 1'b0, 1'b0, 1'b0};
-            tr.seq    = '{0, 0, 0, 0};
-            tr.packet = '{'0, '0, '0, '0};
-            tr.desc   = '{5'b0, 5'b0, 5'b0, 5'b0};
+            tr.valid  = '{default: 1'b0};
+            tr.seq    = '{default: '0};
+            tr.packet = '{default: '0};
+            tr.desc   = '{default: '0};
 
-            for (lane = 0; lane < 4; lane++) begin
+            for (lane = 0; lane < TB_N; lane++) begin
                 if (sent < PACKET_COUNT) begin
-                    delay = balanced_delay ? lane : $urandom_range(3, 0);
+                    delay = balanced_delay ? (lane % TB_DELAY_CLASSES)
+                                            : $urandom_range(
+                                                  TB_DELAY_CLASSES - 1, 0);
                     tr.valid[lane]  = 1'b1;
                     tr.seq[lane]    = sent;
                     tr.packet[lane] = make_packet(sent);

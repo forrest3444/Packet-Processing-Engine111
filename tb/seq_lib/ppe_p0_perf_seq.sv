@@ -9,7 +9,7 @@ class ppe_p0_perf_seq extends uvm_sequence #(ppe_item);
     `uvm_object_utils(ppe_p0_perf_seq)
 
     localparam int unsigned PACKET_COUNT = 1024;
-    localparam int unsigned BATCH_COUNT = PACKET_COUNT / 4;
+    localparam int unsigned BATCH_COUNT = PACKET_COUNT / TB_N;
 
     function new(string name = "ppe_p0_perf_seq");
         super.new(name);
@@ -19,16 +19,18 @@ class ppe_p0_perf_seq extends uvm_sequence #(ppe_item);
         ppe_item tr;
         int unsigned batch;
         int unsigned base_seq;
+        int unsigned lane;
 
         for (batch = 0; batch < BATCH_COUNT; batch++) begin
-            base_seq = batch * 4;
+            base_seq = batch * TB_N;
             tr = ppe_item::type_id::create($sformatf("p0_batch_%0d", batch));
             start_item(tr);
-            tr.valid = '{1'b1, 1'b1, 1'b1, 1'b1};
-            tr.seq = '{base_seq, base_seq + 1, base_seq + 2, base_seq + 3};
-            tr.packet = '{make_packet(base_seq), make_packet(base_seq + 1),
-                          make_packet(base_seq + 2), make_packet(base_seq + 3)};
-            tr.desc = '{5'b000_00, 5'b000_00, 5'b000_00, 5'b000_00};
+            for (lane = 0; lane < TB_N; lane++) begin
+                tr.valid[lane] = 1'b1;
+                tr.seq[lane] = base_seq + lane;
+                tr.packet[lane] = make_packet(tr.seq[lane]);
+                tr.desc[lane] = 5'b000_00;
+            end
             finish_item(tr);
         end
     endtask

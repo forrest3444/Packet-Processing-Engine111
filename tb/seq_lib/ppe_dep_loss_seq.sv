@@ -14,35 +14,40 @@ class ppe_dep_loss_seq extends uvm_sequence #(ppe_item);
 
     task body();
         ppe_item tr;
+        int unsigned lane;
 
         // S1 waits for long-latency S0. S2/S3 keep three FEs occupied.
         tr = ppe_item::type_id::create("s0_to_s3");
         start_item(tr);
-        tr.valid  = '{1'b1, 1'b1, 1'b1, 1'b1};
-        tr.seq    = '{0, 1, 2, 3};
-        tr.packet = '{make_packet(0), make_packet(1),
-                      make_packet(2), make_packet(3)};
-        tr.desc   = '{5'b000_11, 5'b001_00, 5'b000_11, 5'b000_11};
+        for (lane = 0; lane < TB_N; lane++) begin
+            tr.valid[lane]  = 1'b1;
+            tr.seq[lane]    = lane;
+            tr.packet[lane] = make_packet(lane);
+            tr.desc[lane]   = (lane == 1) ? 5'b001_00 : 5'b000_11;
+        end
         finish_item(tr);
 
         // S4-S7 all wait for S0, leaving the fourth FE available for S8.
         tr = ppe_item::type_id::create("s4_to_s7_wait_s0");
         start_item(tr);
-        tr.valid  = '{1'b1, 1'b1, 1'b1, 1'b1};
-        tr.seq    = '{4, 5, 6, 7};
-        tr.packet = '{make_packet(4), make_packet(5),
-                      make_packet(6), make_packet(7)};
-        tr.desc   = '{5'b100_00, 5'b101_00, 5'b110_00, 5'b111_00};
+        for (lane = 0; lane < TB_N; lane++) begin
+            tr.valid[lane]  = 1'b1;
+            tr.seq[lane]    = lane + 4;
+            tr.packet[lane] = make_packet(tr.seq[lane]);
+            tr.desc[lane]   = {lane + 4, 2'b00};
+        end
         finish_item(tr);
 
         // S8 shares history bank 0 with S0 and returns after S0. Its completion
         // must not overwrite the bank; only its later retirement may do so.
         tr = ppe_item::type_id::create("s8_cache_overwriter");
         start_item(tr);
-        tr.valid  = '{1'b1, 1'b0, 1'b0, 1'b0};
-        tr.seq    = '{8, 0, 0, 0};
-        tr.packet = '{make_packet(8), '0, '0, '0};
-        tr.desc   = '{5'b000_10, 5'b000_00, 5'b000_00, 5'b000_00};
+        for (lane = 0; lane < TB_N; lane++) begin
+            tr.valid[lane]  = (lane == 0);
+            tr.seq[lane]    = (lane == 0) ? 8 : 0;
+            tr.packet[lane] = (lane == 0) ? make_packet(8) : '0;
+            tr.desc[lane]   = (lane == 0) ? 5'b000_10 : 5'b000_00;
+        end
         finish_item(tr);
     endtask
 

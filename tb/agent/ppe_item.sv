@@ -8,10 +8,10 @@
 `define PPE_ITEM_SV
 
 class ppe_item extends uvm_sequence_item;
-    rand bit        valid[4];
-    rand bit [31:0] seq[4];
-    rand bit [127:0] packet[4];
-    rand bit [4:0]  desc[4];
+    rand bit          valid[TB_N];
+    rand bit [31:0]   seq[TB_N];
+    rand bit [PACKET_W-1:0] packet[TB_N];
+    rand bit [TB_DESC_W-1:0] desc[TB_N];
 
     `uvm_object_utils_begin(ppe_item)
         `uvm_field_sarray_int(valid, UVM_DEFAULT)
@@ -26,8 +26,8 @@ class ppe_item extends uvm_sequence_item;
 endclass
 
 class ppe_out_item extends uvm_sequence_item;
-    bit [1:0]  lane;
-    bit [127:0] packet;
+    bit [TB_LANE_W-1:0] lane;
+    bit [PACKET_W-1:0]  packet;
 
     `uvm_object_utils_begin(ppe_out_item)
         `uvm_field_int(lane, UVM_DEFAULT)

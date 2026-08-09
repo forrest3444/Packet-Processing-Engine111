@@ -15,22 +15,6 @@ module tb_top_sv;
 
     logic clk;
     logic rst_n;
-    wire [PACKET_W-1:0] dut_in_packet [0:`PPE_N-1];
-    wire [4:0] dut_in_desc [0:`PPE_N-1];
-    wire [PACKET_W-1:0] dut_out_packet [0:`PPE_N-1];
-
-    assign dut_in_packet[0] = pif.in_packet0;
-    assign dut_in_packet[1] = pif.in_packet1;
-    assign dut_in_packet[2] = pif.in_packet2;
-    assign dut_in_packet[3] = pif.in_packet3;
-    assign dut_in_desc[0] = pif.in_desc0;
-    assign dut_in_desc[1] = pif.in_desc1;
-    assign dut_in_desc[2] = pif.in_desc2;
-    assign dut_in_desc[3] = pif.in_desc3;
-    assign pif.out_packet0 = dut_out_packet[0];
-    assign pif.out_packet1 = dut_out_packet[1];
-    assign pif.out_packet2 = dut_out_packet[2];
-    assign pif.out_packet3 = dut_out_packet[3];
 
     // Verification-only baseline parameter consistency checks.
     initial begin
@@ -47,33 +31,31 @@ module tb_top_sv;
         end
     end
 
-    ppe_if #(PACKET_W, TB_SEQ_W, TB_ROB_ID_W, TB_OCC_W) pif (
+    ppe_if #(PACKET_W, TB_DESC_W, TB_N, TB_SEQ_W, TB_ROB_ID_W, TB_OCC_W) pif (
         .clk   (clk),
         .rst_n (rst_n)
     );
 
     PPE_TOP_SV #(
         .PACKET_W (PACKET_W),
-        .DESC_W   (5)
+        .DESC_W   (TB_DESC_W)
     ) dut (
         .clk         (clk),
         .rst_n       (rst_n),
-        .in_valid    ({pif.in_valid3, pif.in_valid2,
-                       pif.in_valid1, pif.in_valid0}),
-        .in_packet   (dut_in_packet),
-        .in_desc     (dut_in_desc),
+        .in_valid    (pif.in_valid),
+        .in_packet   (pif.in_packet),
+        .in_desc     (pif.in_desc),
         .bkps        (pif.bkps),
-        .out_valid   ({pif.out_valid3, pif.out_valid2,
-                       pif.out_valid1, pif.out_valid0}),
-        .out_packet  (dut_out_packet)
+        .out_valid   (pif.out_valid),
+        .out_packet  (pif.out_packet)
     );
 
-    wire [63:0] probe_issue_state;
-    wire [15:0] probe_candidate_legal;
-    wire [(4*TB_SEQ_W)-1:0] probe_completion_seq_tag;
+    wire [(`PPE_ISSUE_DEPTH*2)-1:0] probe_issue_state;
+    wire [(`PPE_CAND_WINDOW_DEPTH*2)-1:0] probe_candidate_legal;
+    wire [(TB_N*TB_SEQ_W)-1:0] probe_completion_seq_tag;
     genvar probe_entry;
     generate
-        for (probe_entry = 0; probe_entry < 32;
+        for (probe_entry = 0; probe_entry < `PPE_ISSUE_DEPTH;
              probe_entry = probe_entry + 1) begin : gen_probe_issue_state
             assign probe_issue_state[probe_entry*2 +: 2] =
                 dut.u_scheduler.issue_state_q[probe_entry];
@@ -82,7 +64,7 @@ module tb_top_sv;
 
     genvar probe_candidate;
     generate
-        for (probe_candidate = 0; probe_candidate < 8;
+        for (probe_candidate = 0; probe_candidate < `PPE_CAND_WINDOW_DEPTH;
              probe_candidate = probe_candidate + 1) begin : gen_probe_candidate
             assign probe_candidate_legal[probe_candidate*2 +: 2] =
                 dut.u_scheduler.candidate_legal[probe_candidate];
@@ -91,7 +73,7 @@ module tb_top_sv;
 
     genvar probe_fe;
     generate
-        for (probe_fe = 0; probe_fe < 4;
+        for (probe_fe = 0; probe_fe < TB_N;
              probe_fe = probe_fe + 1) begin : gen_probe_completion
             assign probe_completion_seq_tag[probe_fe*TB_SEQ_W +: TB_SEQ_W] =
                 dut.completion_seq_tag[probe_fe];
@@ -162,7 +144,7 @@ module tb_top_sv;
     // must exactly coincide with the scheduler's current relative slot zero.
     always @(posedge clk) begin
         if (dut.internal_rst_n) begin
-            for (int unsigned fe_idx = 0; fe_idx < 4; fe_idx++) begin
+            for (int unsigned fe_idx = 0; fe_idx < TB_N; fe_idx++) begin
                 if (dut.fe_out_valid[fe_idx] !==
                     dut.u_scheduler.future_valid_q[fe_idx][0]) begin
                     `uvm_error("FE_CALENDAR", $sformatf(

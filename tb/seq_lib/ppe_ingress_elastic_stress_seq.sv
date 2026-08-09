@@ -22,7 +22,7 @@ class ppe_ingress_elastic_stress_seq extends uvm_sequence #(ppe_item);
         ppe_item tr;
         int unsigned source_beat;
         int unsigned packet_seq;
-        bit [3:0] lane_mask;
+        bit [TB_N-1:0] lane_mask;
 
         source_beat = 0;
         packet_seq = 0;
@@ -36,13 +36,16 @@ class ppe_ingress_elastic_stress_seq extends uvm_sequence #(ppe_item);
             // Every seventh source beat is an all-invalid captured batch.
             if ((source_beat % 7) != 3) begin
                 unique case (source_beat % 4)
-                    0: lane_mask = 4'b1111;
-                    1: lane_mask = 4'b0101;
-                    2: lane_mask = 4'b1010;
-                    default: lane_mask = 4'b1001;
+                    0: lane_mask = '1;
+                    1: lane_mask = '0 | ((TB_N >= 1) ? (1 << 0) : 0)
+                                      | ((TB_N >= 3) ? (1 << 2) : 0);
+                    2: lane_mask = '0 | ((TB_N >= 2) ? (1 << 1) : 0)
+                                      | ((TB_N >= 4) ? (1 << 3) : 0);
+                    default: lane_mask = '0 | ((TB_N >= 1) ? (1 << 0) : 0)
+                                          | ((TB_N >= 4) ? (1 << 3) : 0);
                 endcase
 
-                for (int unsigned lane = 0; lane < 4; lane++) begin
+                for (int unsigned lane = 0; lane < TB_N; lane++) begin
                     if (lane_mask[lane] && (packet_seq < PACKET_COUNT)) begin
                         fill_valid_lane(tr, lane, packet_seq);
                         packet_seq++;
@@ -56,9 +59,9 @@ class ppe_ingress_elastic_stress_seq extends uvm_sequence #(ppe_item);
     endtask
 
     function void initialize_item(ppe_item tr, int unsigned source_beat);
-        for (int unsigned lane = 0; lane < 4; lane++) begin
+        for (int unsigned lane = 0; lane < TB_N; lane++) begin
             tr.valid[lane] = 1'b0;
-            tr.seq[lane] = 32'hde00_0000 | (source_beat << 2) | lane;
+            tr.seq[lane] = 32'hde00_0000 | (source_beat * TB_N) | lane;
             tr.packet[lane] = make_packet(tr.seq[lane])
                               ^ {4{32'hf00d_0000 | source_beat}};
             tr.desc[lane] = {source_beat[2:0], lane[1:0]};

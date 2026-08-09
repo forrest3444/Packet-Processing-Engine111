@@ -5,27 +5,33 @@
 `ifndef PPE_PIPELINE_STALL_PROBE_SV
 `define PPE_PIPELINE_STALL_PROBE_SV
 
+`include "rtl/common/ppe_config.vh"
+
 module ppe_pipeline_stall_probe #(
-    parameter int EXPECTED_PACKETS = 1134
+    parameter int EXPECTED_PACKETS = 1134,
+    parameter int LANES            = `PPE_N,
+    parameter int ROB_DEPTH        = `PPE_ROB_DEPTH,
+    parameter int ISSUE_DEPTH      = `PPE_ISSUE_DEPTH,
+    parameter int CAND_DEPTH       = `PPE_CAND_WINDOW_DEPTH
 ) (
     input logic        clk,
     input logic        rst_n,
-    input logic [3:0]  in_valid,
+    input logic [LANES-1:0] in_valid,
     input logic        bkps,
-    input logic [3:0]  issue_valid,
-    input logic [3:0]  completion_valid,
-    input logic [3:0]  retire_valid,
-    input logic [3:0]  out_valid,
+    input logic [LANES-1:0] issue_valid,
+    input logic [LANES-1:0] completion_valid,
+    input logic [LANES-1:0] retire_valid,
+    input logic [LANES-1:0] out_valid,
     input logic [5:0]  rob_occupancy,
     input logic [4:0]  rob_head_ptr,
-    input logic [31:0] rob_valid,
-    input logic [31:0] rob_result_valid,
-    input logic [63:0] issue_state,
-    input logic [7:0]  candidate_valid,
-    input logic [7:0]  candidate_pending,
-    input logic [15:0] candidate_legal,
-    input logic [3:0]  shortlist_valid,
-    input logic [3:0]  grant_valid
+    input logic [ROB_DEPTH-1:0] rob_valid,
+    input logic [ROB_DEPTH-1:0] rob_result_valid,
+    input logic [(ISSUE_DEPTH*2)-1:0] issue_state,
+    input logic [CAND_DEPTH-1:0] candidate_valid,
+    input logic [CAND_DEPTH-1:0] candidate_pending,
+    input logic [(CAND_DEPTH*2)-1:0] candidate_legal,
+    input logic [LANES-1:0] shortlist_valid,
+    input logic [LANES-1:0] grant_valid
 );
 
     localparam logic [1:0] ISSUE_WAIT_DEP = 2'd1;
@@ -55,20 +61,25 @@ module ppe_pipeline_stall_probe #(
     longint unsigned ready_entry_cycles;
     longint unsigned selected_entry_cycles;
     longint unsigned candidate_entry_cycles;
-    longint unsigned grant_width_hist [0:4];
-    longint unsigned issue_width_hist [0:4];
-    longint unsigned retire_width_hist [0:4];
+    longint unsigned grant_width_hist [0:LANES];
+    longint unsigned issue_width_hist [0:LANES];
+    longint unsigned retire_width_hist [0:LANES];
 
-    function automatic int unsigned popcount4(input logic [3:0] value);
-        popcount4 = value[0] + value[1] + value[2] + value[3];
+    function automatic int unsigned popcount_lanes(
+        input logic [LANES-1:0] value);
+        popcount_lanes = 0;
+        for (int unsigned index = 0; index < LANES; index++) begin
+            popcount_lanes += value[index];
+        end
     endfunction
 
-    function automatic int unsigned popcount8(input logic [7:0] value);
+    function automatic int unsigned popcount_candidates(
+        input logic [CAND_DEPTH-1:0] value);
         int unsigned index;
         begin
-            popcount8 = 0;
-            for (index = 0; index < 8; index++) begin
-                popcount8 += value[index];
+            popcount_candidates = 0;
+            for (index = 0; index < CAND_DEPTH; index++) begin
+                popcount_candidates += value[index];
             end
         end
     endfunction
@@ -97,15 +108,11 @@ module ppe_pipeline_stall_probe #(
                      matcher_ungranted_shortlists, wait_dep_entry_cycles,
                      ready_entry_cycles, selected_entry_cycles,
                      candidate_entry_cycles);
-            $display("PIPE_STALL widths grant={%0d,%0d,%0d,%0d,%0d} issue={%0d,%0d,%0d,%0d,%0d} rob_retire={%0d,%0d,%0d,%0d,%0d}",
-                     grant_width_hist[0], grant_width_hist[1],
-                     grant_width_hist[2], grant_width_hist[3],
-                     grant_width_hist[4], issue_width_hist[0],
-                     issue_width_hist[1], issue_width_hist[2],
-                     issue_width_hist[3], issue_width_hist[4],
-                     retire_width_hist[0], retire_width_hist[1],
-                     retire_width_hist[2], retire_width_hist[3],
-                     retire_width_hist[4]);
+            for (int unsigned width = 0; width <= LANES; width++) begin
+                $display("PIPE_STALL width=%0d grant=%0d issue=%0d rob_retire=%0d",
+                         width, grant_width_hist[width],
+                         issue_width_hist[width], retire_width_hist[width]);
+            end
         end
     endtask
 
@@ -133,7 +140,7 @@ module ppe_pipeline_stall_probe #(
         ready_entry_cycles = 0;
         selected_entry_cycles = 0;
         candidate_entry_cycles = 0;
-        for (width = 0; width <= 4; width++) begin
+        for (width = 0; width <= LANES; width++) begin
             grant_width_hist[width] = 0;
             issue_width_hist[width] = 0;
             retire_width_hist[width] = 0;
@@ -159,14 +166,14 @@ module ppe_pipeline_stall_probe #(
         int unsigned candidate_now;
         int unsigned shortlist_now;
         int unsigned grant_now;
-        logic [7:0] candidate_available;
+        logic [CAND_DEPTH-1:0] candidate_available;
 
         if (enabled && rst_n && !reported) begin
-            accepted_now = bkps ? 0 : popcount4(in_valid);
-            issued_now = popcount4(issue_valid);
-            completed_now = popcount4(completion_valid);
-            retired_now = popcount4(retire_valid);
-            output_now = popcount4(out_valid);
+            accepted_now = bkps ? 0 : popcount_lanes(in_valid);
+            issued_now = popcount_lanes(issue_valid);
+            completed_now = popcount_lanes(completion_valid);
+            retired_now = popcount_lanes(retire_valid);
+            output_now = popcount_lanes(out_valid);
 
             if (!measuring && (accepted_now != 0)) begin
                 measuring = 1'b1;
@@ -188,7 +195,7 @@ module ppe_pipeline_stall_probe #(
                 wait_dep_now = 0;
                 ready_now = 0;
                 selected_now = 0;
-                for (entry = 0; entry < 32; entry++) begin
+                for (entry = 0; entry < ISSUE_DEPTH; entry++) begin
                     case (issue_state[entry*2 +: 2])
                         ISSUE_WAIT_DEP: wait_dep_now++;
                         ISSUE_READY:    ready_now++;
@@ -202,18 +209,18 @@ module ppe_pipeline_stall_probe #(
                 ready_empty_cycles += (ready_now == 0);
 
                 candidate_available = candidate_valid & ~candidate_pending;
-                candidate_now = popcount8(candidate_available);
+                candidate_now = popcount_candidates(candidate_available);
                 candidate_entry_cycles += candidate_now;
                 candidate_empty_cycles += (candidate_now == 0);
-                for (slot = 0; slot < 8; slot++) begin
+                for (slot = 0; slot < CAND_DEPTH; slot++) begin
                     if (candidate_available[slot]
                         && (candidate_legal[slot*2 +: 2] == 2'b00)) begin
                         calendar_blocked_candidate_slots++;
                     end
                 end
 
-                shortlist_now = popcount4(shortlist_valid);
-                grant_now = popcount4(grant_valid);
+                shortlist_now = popcount_lanes(shortlist_valid);
+                grant_now = popcount_lanes(grant_valid);
                 if (shortlist_now > grant_now) begin
                     matcher_ungranted_shortlists += shortlist_now - grant_now;
                 end

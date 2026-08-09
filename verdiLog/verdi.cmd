@@ -1,12 +1,24 @@
 debImport "-full64"
+verdiWindowResize -win $_Verdi_1 "819" "261" "1507" "911"
 simSetSimulator "-vcssv" -exec \
            "/home/wwh/github/pfe/sim/build/fsdb/simv/tb_top_sv.simv" -args \
-           "+ntb_random_seed=1 +UVM_TESTNAME=ppe_pipeline_stall_test +UVM_VERBOSITY=UVM_MEDIUM +FSDB +FSDB_FILE=sim/run/pipeline_stall_seed_1/waves.fsdb"
+           "+ntb_random_seed=1 +UVM_TESTNAME=ppe_basic_test +UVM_VERBOSITY=UVM_MEDIUM +FSDB +FSDB_FILE=sim/run/ppe_basic_test_seed_1/waves.fsdb"
 nsMsgSwitchTab -tab general
 debImport "-dbdir" \
           "/home/wwh/github/pfe/sim/build/fsdb/simv/tb_top_sv.simv.daidir"
-debLoadSimResult /home/wwh/github/pfe/sim/run/pipeline_stall_seed_1/waves.fsdb
+debLoadSimResult /home/wwh/github/pfe/sim/run/ppe_basic_test_seed_1/waves.fsdb
 wvCreateWindow
+srcHBSelect "tb_top_sv.dut" -win $_nTrace1
+srcSetScope -win $_nTrace1 "tb_top_sv.dut" -delim "."
+srcHBSelect "tb_top_sv.dut" -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "in_valid" -line 14 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+wvSetCursor -win $_nWave2 44353.658815 -snap {("G2" 0)}
+wvZoomOut -win $_nWave2
+wvSetCursor -win $_nWave2 74459.870821 -snap {("G1" 1)}
+verdiWindowResize -win $_Verdi_1 "484" "114" "1777" "1063"
 srcHBSelect "tb_top_sv.dut.u_ingress" -win $_nTrace1
 srcSetScope -win $_nTrace1 "tb_top_sv.dut.u_ingress" -delim "."
 srcHBSelect "tb_top_sv.dut.u_ingress" -win $_nTrace1
@@ -14,184 +26,64 @@ srcDeselectAll -win $_nTrace1
 srcSelect -signal "in_valid_i" -line 14 -pos 1 -win $_nTrace1
 srcAddSelectedToWave -clipboard -win $_nTrace1
 wvDrop -win $_nWave2
-srcDeselectAll -win $_nTrace1
-srcSelect -signal "in_packet_i" -line 15 -pos 1 -win $_nTrace1
-wvSetCursor -win $_nWave2 73830.879427 -snap {("G1" 1)}
-wvSetCursor -win $_nWave2 86136.025998 -snap {("G1" 1)}
-wvSetCursor -win $_nWave2 95023.076300 -snap {("G1" 1)}
-wvSetCursor -win $_nWave2 75881.737189 -snap {("G1" 1)}
-srcDeselectAll -win $_nTrace1
-srcSelect -signal "bkps_o" -line 17 -pos 1 -win $_nTrace1
-srcAddSelectedToWave -clipboard -win $_nTrace1
-wvDrop -win $_nWave2
-srcHBSelect "tb_top_sv.dut" -win $_nTrace1
-srcSetScope -win $_nTrace1 "tb_top_sv.dut" -delim "."
-srcHBSelect "tb_top_sv.dut" -win $_nTrace1
-srcDeselectAll -win $_nTrace1
-srcSelect -signal "out_valid" -line 18 -pos 1 -win $_nTrace1
-srcAddSelectedToWave -clipboard -win $_nTrace1
-wvDrop -win $_nWave2
-srcHBSelect "tb_top_sv.dut.u_ingress.allocation_commit_outputs" -win $_nTrace1
-srcSetScope -win $_nTrace1 "tb_top_sv.dut.u_ingress.allocation_commit_outputs" \
-           -delim "."
-srcHBSelect "tb_top_sv.dut.u_ingress.allocation_commit_outputs" -win $_nTrace1
-srcHBSelect "tb_top_sv.dut.u_ingress.allocation_commit_state" -win $_nTrace1
-srcSetScope -win $_nTrace1 "tb_top_sv.dut.u_ingress.allocation_commit_state" \
-           -delim "."
-srcHBSelect "tb_top_sv.dut.u_ingress.allocation_commit_state" -win $_nTrace1
-srcHBSelect "tb_top_sv.dut.u_ingress.bkps_state_update" -win $_nTrace1
-srcSetScope -win $_nTrace1 "tb_top_sv.dut.u_ingress.bkps_state_update" -delim "."
-srcHBSelect "tb_top_sv.dut.u_ingress.bkps_state_update" -win $_nTrace1
-srcHBSelect "tb_top_sv.dut.u_ingress.occupancy_and_backpressure" -win $_nTrace1
-srcSetScope -win $_nTrace1 "tb_top_sv.dut.u_ingress.occupancy_and_backpressure" \
-           -delim "."
-srcHBSelect "tb_top_sv.dut.u_ingress.occupancy_and_backpressure" -win $_nTrace1
-srcHBSelect "tb_top_sv.dut.u_ingress.bkps_state_update" -win $_nTrace1
-srcSetScope -win $_nTrace1 "tb_top_sv.dut.u_ingress.bkps_state_update" -delim "."
-srcHBSelect "tb_top_sv.dut.u_ingress.bkps_state_update" -win $_nTrace1
-srcHBSelect "tb_top_sv.dut.u_ingress.allocation_commit_state" -win $_nTrace1
-srcSetScope -win $_nTrace1 "tb_top_sv.dut.u_ingress.allocation_commit_state" \
-           -delim "."
-srcHBSelect "tb_top_sv.dut.u_ingress.allocation_commit_state" -win $_nTrace1
-srcHBSelect "tb_top_sv.dut.u_ingress.allocation_commit_outputs" -win $_nTrace1
-srcSetScope -win $_nTrace1 "tb_top_sv.dut.u_ingress.allocation_commit_outputs" \
-           -delim "."
-srcHBSelect "tb_top_sv.dut.u_ingress.allocation_commit_outputs" -win $_nTrace1
-verdiWindowResize -win $_Verdi_1 "823" "19" "1574" "1010"
-verdiWindowResize -win $_Verdi_1 "823" "19" "1708" "1135"
-wvSetCursor -win $_nWave2 175843.991734 -snap {("G1" 3)}
-wvSetCursor -win $_nWave2 186706.941031 -snap {("G1" 3)}
-wvSetCursor -win $_nWave2 173807.188741 -snap {("G1" 3)}
-wvSetCursor -win $_nWave2 73324.907750 -snap {("G1" 1)}
-wvSetCursor -win $_nWave2 173807.188741 -snap {("G1" 3)}
-wvSetCursor -win $_nWave2 74682.776412 -snap {("G1" 1)}
-wvSetCursor -win $_nWave2 85545.725709 -snap {("G1" 1)}
-wvSetCursor -win $_nWave2 74003.842081 -snap {("G1" 1)}
-wvSetCursor -win $_nWave2 83508.922716 -snap {("G1" 1)}
-wvSetCursor -win $_nWave2 74003.842081 -snap {("G1" 1)}
-wvSetCursor -win $_nWave2 84866.791378 -snap {("G1" 1)}
-wvZoomIn -win $_nWave2
-wvZoomIn -win $_nWave2
+wvSelectSignal -win $_nWave2 {( "G1" 2 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G2" 0)}
+wvSetPosition -win $_nWave2 {("G1" 1)}
+verdiWindowResize -win $_Verdi_1 "170" "42" "1924" "1063"
 wvZoomOut -win $_nWave2
-srcHBSelect "tb_top_sv.pif" -win $_nTrace1
-srcSetScope -win $_nTrace1 "tb_top_sv.pif" -delim "."
-srcHBSelect "tb_top_sv.pif" -win $_nTrace1
-srcHBSelect "tb_top_sv.dut.u_scheduler" -win $_nTrace1
-srcSetScope -win $_nTrace1 "tb_top_sv.dut.u_scheduler" -delim "."
-srcHBSelect "tb_top_sv.dut.u_scheduler" -win $_nTrace1
-srcHBSelect "tb_top_sv.dut.u_scheduler.allocation_bank_route" -win $_nTrace1
-srcSetScope -win $_nTrace1 "tb_top_sv.dut.u_scheduler.allocation_bank_route" \
-           -delim "."
-srcHBSelect "tb_top_sv.dut.u_scheduler.allocation_bank_route" -win $_nTrace1
-srcHBSelect "tb_top_sv.dut.u_scheduler.g_future_table\[0\]" -win $_nTrace1
-srcSetScope -win $_nTrace1 "tb_top_sv.dut.u_scheduler.g_future_table\[0\]" -delim \
-           "."
-srcHBSelect "tb_top_sv.dut.u_scheduler.g_future_table\[0\]" -win $_nTrace1
-srcHBSelect "tb_top_sv.dut.u_scheduler.g_future_table\[0\]" -win $_nTrace1
-srcSetScope -win $_nTrace1 "tb_top_sv.dut.u_scheduler.g_future_table\[0\]" -delim \
-           "."
-srcHBSelect "tb_top_sv.dut.u_scheduler.g_future_table\[0\]" -win $_nTrace1
-srcHBSelect "tb_top_sv.dut.u_scheduler.g_future_table\[0\]" -win $_nTrace1
-srcSetScope -win $_nTrace1 "tb_top_sv.dut.u_scheduler.g_future_table\[0\]" -delim \
-           "."
-srcHBSelect "tb_top_sv.dut.u_scheduler.g_future_table\[0\]" -win $_nTrace1
+wvZoomOut -win $_nWave2
+wvZoomOut -win $_nWave2
 srcDeselectAll -win $_nTrace1
-srcSelect -signal "issue_state_q" -line 61 -pos 1 -win $_nTrace1
-srcAddSelectedToWave -clipboard -win $_nTrace1
-wvDrop -win $_nWave2
-wvSetCursor -win $_nWave2 105234.821308 -snap {("G1" 4)}
-wvSetCursor -win $_nWave2 114060.967612 -snap {("G1" 4)}
-wvSetCursor -win $_nWave2 126621.252735 -snap {("G1" 4)}
-wvSetCursor -win $_nWave2 134768.464708 -snap {("G1" 4)}
-wvSetCursor -win $_nWave2 145970.881170 -snap {("G1" 4)}
-wvSetCursor -win $_nWave2 155815.428969 -snap {("G1" 4)}
-wvSetCursor -win $_nWave2 265123.856264 -snap {("G1" 4)}
-wvSetCursor -win $_nWave2 255618.775629 -snap {("G1" 4)}
-wvSetCursor -win $_nWave2 264444.921933 -snap {("G1" 4)}
-wvSetCursor -win $_nWave2 274289.469733 -snap {("G1" 4)}
-wvSetCursor -win $_nWave2 285491.886194 -snap {("G1" 4)}
-wvSetCursor -win $_nWave2 294318.032498 -snap {("G1" 4)}
-wvSetCursor -win $_nWave2 304502.047463 -snap {("G1" 4)}
-wvSetCursor -win $_nWave2 315364.996759 -snap {("G1" 4)}
-wvSetCursor -win $_nWave2 254939.841298 -snap {("G1" 4)}
-wvSetCursor -win $_nWave2 104895.354143 -snap {("G1" 4)}
-wvSetCursor -win $_nWave2 74003.842081 -snap {("G1" 1)}
+srcSelect -signal "in_desc_i" -line 16 -pos 1 -win $_nTrace1
+wvSelectGroup -win $_nWave2 {G1}
 wvSelectSignal -win $_nWave2 {( "G1" 1 )} 
 wvSelectSignal -win $_nWave2 {( "G1" 1 )} 
-wvSetCursor -win $_nWave2 104555.886977 -snap {("G1" 4)}
-wvSetCursor -win $_nWave2 115079.369108 -snap {("G1" 4)}
-wvSetCursor -win $_nWave2 82829.988385 -snap {("G1" 1)}
-wvSetCursor -win $_nWave2 105574.288474 -snap {("G1" 4)}
-wvSetCursor -win $_nWave2 115418.836274 -snap {("G1" 4)}
-wvSetCursor -win $_nWave2 125263.384073 -snap {("G1" 4)}
-wvSetCursor -win $_nWave2 116437.237770 -snap {("G1" 4)}
-wvSetCursor -win $_nWave2 124244.982577 -snap {("G1" 4)}
-wvSetCursor -win $_nWave2 115758.303439 -snap {("G1" 4)}
-wvSetCursor -win $_nWave2 105234.821308 -snap {("G1" 4)}
-wvSetCursor -win $_nWave2 115079.369108 -snap {("G1" 4)}
+wvSetRadix -win $_nWave2 -format Bin
+wvZoomIn -win $_nWave2
+wvSetCursor -win $_nWave2 84262.858852 -snap {("G1" 1)}
+wvSetCursor -win $_nWave2 94837.021531 -snap {("G1" 1)}
 srcDeselectAll -win $_nTrace1
-srcSelect -signal "issue_seq_tag_q" -line 62 -pos 1 -win $_nTrace1
+srcSelect -signal "alloc_reserve_valid_o" -line 18 -pos 1 -win $_nTrace1
 srcAddSelectedToWave -clipboard -win $_nTrace1
 wvDrop -win $_nWave2
 srcDeselectAll -win $_nTrace1
-srcSelect -signal "issue_target_seq_tag_q" -line 63 -pos 1 -win $_nTrace1
-srcDeselectAll -win $_nTrace1
-srcSelect -signal "issue_seq_tag_q" -line 62 -pos 1 -win $_nTrace1
+srcSelect -signal "alloc_reserve_ready_i" -line 19 -pos 1 -win $_nTrace1
 srcAddSelectedToWave -clipboard -win $_nTrace1
 wvDrop -win $_nWave2
-wvSetCursor -win $_nWave2 103876.952646 -snap {("G1" 6)}
-wvSetCursor -win $_nWave2 115079.369108 -snap {("G1" 6)}
-wvSetCursor -win $_nWave2 125263.384073 -snap {("G1" 6)}
-wvSetCursor -win $_nWave2 137144.734866 -snap {("G1" 6)}
-wvSelectSignal -win $_nWave2 {( "G1" 6 )} 
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "alloc_commit_valid_o" -line 20 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "alloc_seq_tag_o" -line 21 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "alloc_target_seq_tag_o" -line 22 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "alloc_packet_o" -line 23 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "alloc_delay_o" -line 24 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "alloc_dep_required_o" -line 25 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+wvSelectGroup -win $_nWave2 {G2}
+wvSelectSignal -win $_nWave2 {( "G1" 9 )} 
 wvCut -win $_nWave2
 wvSetPosition -win $_nWave2 {("G2" 0)}
-wvSetPosition -win $_nWave2 {("G1" 5)}
-wvSelectSignal -win $_nWave2 {( "G1" 5 )} 
-wvSelectSignal -win $_nWave2 {( "G1" 5 )} 
+wvSetPosition -win $_nWave2 {("G1" 8)}
+wvSelectSignal -win $_nWave2 {( "G1" 8 )} 
 wvCut -win $_nWave2
 wvSetPosition -win $_nWave2 {("G2" 0)}
-wvSetPosition -win $_nWave2 {("G1" 4)}
-srcDeselectAll -win $_nTrace1
-srcSelect -signal "candidate_valid_q" -line 67 -pos 1 -win $_nTrace1
-srcAddSelectedToWave -clipboard -win $_nTrace1
-wvDrop -win $_nWave2
-wvSetCursor -win $_nWave2 105234.821308 -snap {("G1" 5)}
-srcDeselectAll -win $_nTrace1
-srcSelect -signal "candidate_valid_d" -line 68 -pos 1 -win $_nTrace1
-srcAddSelectedToWave -clipboard -win $_nTrace1
-wvDrop -win $_nWave2
-wvSetCursor -win $_nWave2 94711.339177 -snap {("G1" 6)}
-wvSetCursor -win $_nWave2 105234.821308 -snap {("G1" 6)}
-wvSetCursor -win $_nWave2 95729.740674 -snap {("G1" 6)}
-wvSetCursor -win $_nWave2 105913.755639 -snap {("G1" 6)}
-wvSelectSignal -win $_nWave2 {( "G1" 6 )} 
-wvCut -win $_nWave2
-wvSetPosition -win $_nWave2 {("G2" 0)}
-wvSetPosition -win $_nWave2 {("G1" 5)}
-srcDeselectAll -win $_nTrace1
-srcSelect -signal "candidate_valid_q" -line 67 -pos 1 -win $_nTrace1
-srcDeselectAll -win $_nTrace1
-srcDeselectAll -win $_nTrace1
-srcDeselectAll -win $_nTrace1
-wvSetCursor -win $_nWave2 2414208.539842 -snap {("G1" 2)}
-srcHBSelect "tb_top_sv.dut.u_scheduler" -win $_nTrace1
-srcHBSelect "tb_top_sv.dut.u_scheduler" -win $_nTrace1
-srcSetScope -win $_nTrace1 "tb_top_sv.dut.u_scheduler" -delim "."
-srcHBSelect "tb_top_sv.dut.u_scheduler" -win $_nTrace1
-srcDeselectAll -win $_nTrace1
-srcSelect -signal "issue_dep_required_q" -line 65 -pos 1 -win $_nTrace1
-srcAddSelectedToWave -clipboard -win $_nTrace1
-wvDrop -win $_nWave2
-wvSetCursor -win $_nWave2 224800.454820 -snap {("G1" 6)}
-wvSetCursor -win $_nWave2 795316.508206 -snap {("G1" 5)}
-srcHBSelect "tb_top_sv.dut.u_rob" -win $_nTrace1
-srcSetScope -win $_nTrace1 "tb_top_sv.dut.u_rob" -delim "."
-srcHBSelect "tb_top_sv.dut.u_rob" -win $_nTrace1
-srcDeselectAll -win $_nTrace1
-srcSelect -signal "rob_valid_q" -line 51 -pos 1 -win $_nTrace1
-srcAddSelectedToWave -clipboard -win $_nTrace1
-wvDrop -win $_nWave2
+wvSetPosition -win $_nWave2 {("G1" 7)}
 wvSelectSignal -win $_nWave2 {( "G1" 7 )} 
 wvCut -win $_nWave2
 wvSetPosition -win $_nWave2 {("G2" 0)}
@@ -200,109 +92,554 @@ wvSelectSignal -win $_nWave2 {( "G1" 6 )}
 wvCut -win $_nWave2
 wvSetPosition -win $_nWave2 {("G2" 0)}
 wvSetPosition -win $_nWave2 {("G1" 5)}
-srcHBSelect "tb_top_sv.dut.u_scheduler" -win $_nTrace1
-srcSetScope -win $_nTrace1 "tb_top_sv.dut.u_scheduler" -delim "."
-srcHBSelect "tb_top_sv.dut.u_scheduler" -win $_nTrace1
+wvSelectSignal -win $_nWave2 {( "G1" 5 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G2" 0)}
+wvSetPosition -win $_nWave2 {("G1" 4)}
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "alloc_commit_valid_o" -line 20 -pos 1 -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "slot_lane_valid_q" -line 38 -pos 1 -win $_nTrace1
+wvSelectSignal -win $_nWave2 {( "G1" 2 )} 
+wvSelectSignal -win $_nWave2 {( "G1" 2 )} 
+wvSetRadix -win $_nWave2 -format Bin
+wvSelectSignal -win $_nWave2 {( "G1" 2 )} 
+wvSetRadix -win $_nWave2 -format Hex
+wvSelectSignal -win $_nWave2 {( "G1" 1 )} 
+wvSelectSignal -win $_nWave2 {( "G1" 1 )} 
+wvSetRadix -win $_nWave2 -format Hex
+wvSetCursor -win $_nWave2 147046.949761 -snap {("G2" 0)}
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "alloc_reserve_ready_i" -line 19 -pos 1 -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "alloc_reserve_valid_o" -line 18 -pos 1 -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "alloc_reserve_ready_i" -line 19 -pos 1 -win $_nTrace1
+srcActiveTrace "tb_top_sv.dut.u_ingress.alloc_reserve_ready_i" -win $_nTrace1
+srcTraceLoad "tb_top_sv.dut.u_rob.alloc_reserve_ready_o" -win $_nTrace1
+srcHBSelect "tb_top_sv.dut.u_ingress.allocation_commit_outputs" -win $_nTrace1
+srcSetScope -win $_nTrace1 "tb_top_sv.dut.u_ingress.allocation_commit_outputs" \
+           -delim "."
+srcHBSelect "tb_top_sv.dut.u_ingress.allocation_commit_outputs" -win $_nTrace1
+srcHBSelect "tb_top_sv.dut.u_ingress.allocation_metadata_outputs\[0\]" -win \
+           $_nTrace1
+srcSetScope -win $_nTrace1 \
+           "tb_top_sv.dut.u_ingress.allocation_metadata_outputs\[0\]" -delim \
+           "."
+srcHBSelect "tb_top_sv.dut.u_ingress.allocation_metadata_outputs\[0\]" -win \
+           $_nTrace1
+srcHBSelect "tb_top_sv.dut.u_ingress.allocation_commit_state" -win $_nTrace1
+srcSetScope -win $_nTrace1 "tb_top_sv.dut.u_ingress.allocation_commit_state" \
+           -delim "."
+srcHBSelect "tb_top_sv.dut.u_ingress.allocation_commit_state" -win $_nTrace1
+srcHBSelect "tb_top_sv.dut.u_ingress.allocation_commit_outputs" -win $_nTrace1
+srcHBSelect "tb_top_sv.dut.u_ingress.allocation_metadata_outputs\[0\]" -win \
+           $_nTrace1
+srcSetScope -win $_nTrace1 \
+           "tb_top_sv.dut.u_ingress.allocation_metadata_outputs\[0\]" -delim \
+           "."
+srcHBSelect "tb_top_sv.dut.u_ingress.allocation_metadata_outputs\[0\]" -win \
+           $_nTrace1
+srcHBSelect "tb_top_sv.dut.u_ingress.allocation_metadata_outputs\[1\]" -win \
+           $_nTrace1
+srcSetScope -win $_nTrace1 \
+           "tb_top_sv.dut.u_ingress.allocation_metadata_outputs\[1\]" -delim \
+           "."
+srcHBSelect "tb_top_sv.dut.u_ingress.allocation_metadata_outputs\[1\]" -win \
+           $_nTrace1
+srcHBSelect "tb_top_sv.dut.u_ingress.allocation_metadata_outputs\[3\]" -win \
+           $_nTrace1
+srcSetScope -win $_nTrace1 \
+           "tb_top_sv.dut.u_ingress.allocation_metadata_outputs\[3\]" -delim \
+           "."
+srcHBSelect "tb_top_sv.dut.u_ingress.allocation_metadata_outputs\[3\]" -win \
+           $_nTrace1
+srcHBSelect "tb_top_sv.dut.u_ingress.allocation_metadata_outputs\[1\]" -win \
+           $_nTrace1
+srcSetScope -win $_nTrace1 \
+           "tb_top_sv.dut.u_ingress.allocation_metadata_outputs\[1\]" -delim \
+           "."
+srcHBSelect "tb_top_sv.dut.u_ingress.allocation_metadata_outputs\[1\]" -win \
+           $_nTrace1
+srcHBSelect "tb_top_sv.dut.u_ingress.allocation_metadata_outputs\[0\]" -win \
+           $_nTrace1
+srcHBSelect "tb_top_sv.dut.u_ingress.bkps_state_update" -win $_nTrace1
+srcSetScope -win $_nTrace1 "tb_top_sv.dut.u_ingress.bkps_state_update" -delim "."
+srcHBSelect "tb_top_sv.dut.u_ingress.bkps_state_update" -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "reserve_batch" -line 284 -pos 1 -win $_nTrace1
+srcTraceLoad "tb_top_sv.dut.u_ingress.reserve_batch" -win $_nTrace1
+srcActiveTrace "tb_top_sv.dut.u_ingress.reserve_batch" -win $_nTrace1
+srcActiveTrace "tb_top_sv.dut.u_ingress.reserve_batch" -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "slot_count_q" -line 106 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "head_nonempty" -line 107 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "alloc_reserve_ready_i" -line 108 -pos 1 -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "head_release" -line 109 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+wvSelectSignal -win $_nWave2 {( "G1" 7 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G2" 0)}
+wvSetPosition -win $_nWave2 {("G1" 6)}
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "head_nonempty" -line 107 -pos 1 -win $_nTrace1
+srcActiveTrace "tb_top_sv.dut.u_ingress.head_nonempty" -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "alloc_reserve_valid_o" -line 105 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+wvSelectSignal -win $_nWave2 {( "G1" 7 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G2" 0)}
+wvSetPosition -win $_nWave2 {("G1" 6)}
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "head_nonempty" -line 107 -pos 1 -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "head_packet_count" -line 80 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+wvSelectSignal -win $_nWave2 {( "G1" 7 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G2" 0)}
+wvSetPosition -win $_nWave2 {("G1" 6)}
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "head_lane_valid" -line 79 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "head_packet_count" -line 80 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "head_dep_required" -line 81 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "head_lane_valid" -line 79 -pos 1 -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "head_packet_count" -line 80 -pos 1 -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "head_dep_required" -line 81 -pos 1 -win $_nTrace1
+wvSelectSignal -win $_nWave2 {( "G1" 9 )} 
+wvSetRadix -win $_nWave2 -format Bin
+wvSelectSignal -win $_nWave2 {( "G1" 9 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G2" 0)}
+wvSetPosition -win $_nWave2 {("G1" 8)}
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "slot_count_q" -line 88 -pos 1 -win $_nTrace1
+srcActiveTrace "tb_top_sv.dut.u_ingress.slot_count_q\[1:0\]" -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "slot_count_d" -line 263 -pos 1 -win $_nTrace1
+srcActiveTrace "tb_top_sv.dut.u_ingress.slot_count_d\[1:0\]" -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "capture_batch" -line 118 -pos 1 -win $_nTrace1
+srcActiveTrace "tb_top_sv.dut.u_ingress.capture_batch" -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "bkps_q" -line 112 -pos 1 -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "capture_batch" -line 112 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "bkps_q" -line 112 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+wvSelectSignal -win $_nWave2 {( "G1" 10 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G2" 0)}
+wvSetPosition -win $_nWave2 {("G1" 9)}
+wvSelectSignal -win $_nWave2 {( "G1" 9 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G2" 0)}
+wvSetPosition -win $_nWave2 {("G1" 8)}
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "slot_lane_valid_q" -line 38 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+wvSetCursor -win $_nWave2 84262.858852 -snap {("G1" 9)}
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "slot_packet_q" -line 39 -pos 1 -win $_nTrace1
+wvSetCursor -win $_nWave2 95167.464115 -snap {("G1" 9)}
+wvSetCursor -win $_nWave2 106072.069378 -snap {("G1" 9)}
+wvSetCursor -win $_nWave2 114663.576555 -snap {("G1" 9)}
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "slot_desc_q" -line 40 -pos 1 -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "slot_lane_valid_q" -line 38 -pos 1 -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "slot_packet_q" -line 39 -pos 1 -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "slot_desc_q" -line 40 -pos 1 -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "slot_rd_ptr_q" -line 41 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "slot_rd_ptr_q" -line 41 -pos 1 -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "slot_wr_ptr_q" -line 42 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+wvSetCursor -win $_nWave2 84923.744019 -snap {("G1" 11)}
+srcActiveTrace "tb_top_sv.dut.u_ingress.slot_wr_ptr_q" -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "capture_batch" -line 257 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+wvSelectSignal -win $_nWave2 {( "G1" 12 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G2" 0)}
+wvSetPosition -win $_nWave2 {("G1" 11)}
+wvSelectSignal -win $_nWave2 {( "G1" 11 )} 
+srcDeselectAll -win $_nTrace1
+wvSelectSignal -win $_nWave2 {( "G1" 11 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G2" 0)}
+wvSetPosition -win $_nWave2 {("G1" 10)}
+wvSelectSignal -win $_nWave2 {( "G1" 10 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G2" 0)}
+wvSetPosition -win $_nWave2 {("G1" 9)}
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "slot_count_q" -line 88 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+wvSelectSignal -win $_nWave2 {( "G1" 10 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G2" 0)}
+wvSetPosition -win $_nWave2 {("G1" 9)}
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "head_lane_valid" -line 89 -pos 1 -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "head_packet_count" -line 90 -pos 1 -win $_nTrace1
+wvSelectSignal -win $_nWave2 {( "G1" 4 )} 
+wvShowOneTraceSignals -win $_nWave2 -signal \
+           "/tb_top_sv/dut/u_ingress/alloc_commit_valid_o\[3:0\]" -driver
+wvScrollDown -win $_nWave2 1
+wvScrollDown -win $_nWave2 1
+wvScrollDown -win $_nWave2 0
+wvScrollDown -win $_nWave2 0
+wvScrollUp -win $_nWave2 1
+wvScrollUp -win $_nWave2 1
+wvScrollDown -win $_nWave2 0
+wvSelectGroup -win $_nWave2 \
+           {G1//tb_top_sv/dut/u_ingress/alloc_commit_valid_o@0(1ps)#ActiveDriver}
+wvSelectSignal -win $_nWave2 \
+           {( "G1//tb_top_sv/dut/u_ingress/alloc_commit_valid_o@0(1ps)#ActiveDriver" \
+           1 )} 
+wvSetCursor -win $_nWave2 151342.703349 -snap \
+           {("/tb_top_sv/dut/u_ingress/alloc_commit_valid_o@0(1ps)#ActiveDriver" 2)}
+wvSelectGroup -win $_nWave2 \
+           {G1//tb_top_sv/dut/u_ingress/alloc_commit_valid_o@0(1ps)#ActiveDriver}
+wvScrollDown -win $_nWave2 2
+wvSelectGroup -win $_nWave2 \
+           {G1//tb_top_sv/dut/u_ingress/alloc_commit_valid_o@0(1ps)#ActiveDriver}
+wvSelectSignal -win $_nWave2 \
+           {( "G1//tb_top_sv/dut/u_ingress/alloc_commit_valid_o@0(1ps)#ActiveDriver" \
+           1 )} 
+wvSelectSignal -win $_nWave2 {( "G1" 8 )} 
+wvSelectSignal -win $_nWave2 {( "G1" 9 )} 
+wvSelectSignal -win $_nWave2 {( "G1" 11 )} 
+wvSelectSignal -win $_nWave2 {( "G1" 12 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G1" 4)}
+wvSelectSignal -win $_nWave2 {( "G1" 11 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G1" 4)}
+wvSelectSignal -win $_nWave2 {( "G1" 10 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G1" 4)}
+wvSelectSignal -win $_nWave2 {( "G1" 9 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G1" 4)}
+wvSelectSignal -win $_nWave2 {( "G1" 8 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G1" 4)}
+wvSelectSignal -win $_nWave2 \
+           {( "G1//tb_top_sv/dut/u_ingress/alloc_commit_valid_o@0(1ps)#ActiveDriver" \
+           2 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G1" 4)}
+wvSelectSignal -win $_nWave2 \
+           {( "G1//tb_top_sv/dut/u_ingress/alloc_commit_valid_o@0(1ps)#ActiveDriver" \
+           1 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G1" 4)}
+wvSelectGroup -win $_nWave2 \
+           {G1//tb_top_sv/dut/u_ingress/alloc_commit_valid_o@0(1ps)#ActiveDriver}
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G1" 4)}
+wvSelectSignal -win $_nWave2 {( "G1" 4 )} 
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "alloc_commit_valid_q" -line 217 -pos 1 -win $_nTrace1
+srcActiveTrace "tb_top_sv.dut.u_ingress.alloc_commit_valid_q\[3:0\]" -win \
+           $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "reserve_batch" -line 284 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "alloc_reserve_valid_o" -line 284 -pos 1 -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "reserve_batch" -line 284 -pos 1 -win $_nTrace1
 srcHBSelect "tb_top_sv.dut.u_rob" -win $_nTrace1
 srcSetScope -win $_nTrace1 "tb_top_sv.dut.u_rob" -delim "."
 srcHBSelect "tb_top_sv.dut.u_rob" -win $_nTrace1
 srcDeselectAll -win $_nTrace1
-srcSelect -signal "rob_valid_q" -line 51 -pos 1 -win $_nTrace1
+srcSelect -signal "alloc_reserve_valid_i" -line 13 -pos 1 -win $_nTrace1
 srcAddSelectedToWave -clipboard -win $_nTrace1
 wvDrop -win $_nWave2
-srcDeselectAll -win $_nTrace1
-srcSelect -signal "rob_result_valid_q" -line 52 -pos 1 -win $_nTrace1
-srcAddSelectedToWave -clipboard -win $_nTrace1
-wvDrop -win $_nWave2
-srcDeselectAll -win $_nTrace1
-srcSelect -signal "head_ptr_q" -line 173 -pos 1 -win $_nTrace1
-srcAddSelectedToWave -clipboard -win $_nTrace1
-wvDrop -win $_nWave2
-wvSetCursor -win $_nWave2 761369.791655 -snap {("G1" 8)}
-wvSelectSignal -win $_nWave2 {( "G1" 7 )} 
 wvSelectSignal -win $_nWave2 {( "G1" 6 )} 
-wvSetCursor -win $_nWave2 733533.484083 -snap {("G1" 6)}
-wvSetCursor -win $_nWave2 734891.352745 -snap {("G1" 7)}
-wvSetCursor -win $_nWave2 745075.367711 -snap {("G1" 7)}
-wvSetCursor -win $_nWave2 734551.885580 -snap {("G1" 7)}
-wvSetCursor -win $_nWave2 745075.367711 -snap {("G1" 7)}
-wvSetCursor -win $_nWave2 755598.849841 -snap {("G1" 7)}
-wvSetCursor -win $_nWave2 764424.996145 -snap {("G1" 7)}
-wvSetCursor -win $_nWave2 775287.945441 -snap {("G1" 7)}
-wvSetCursor -win $_nWave2 784453.558910 -snap {("G1" 7)}
-wvSetCursor -win $_nWave2 776306.346937 -snap {("G1" 7)}
-wvSetCursor -win $_nWave2 785471.960406 -snap {("G1" 7)}
-wvSetCursor -win $_nWave2 795316.508206 -snap {("G1" 7)}
-wvSetCursor -win $_nWave2 874412.357770 -snap {("G1" 7)}
-wvSetCursor -win $_nWave2 773590.609613 -snap {("G1" 6)}
-wvSetCursor -win $_nWave2 734212.418414 -snap {("G1" 6)}
-wvSetCursor -win $_nWave2 2765118.882508 -snap {("G1" 2)}
-wvSetCursor -win $_nWave2 2794991.993073 -snap {("G1" 6)}
-wvSetCursor -win $_nWave2 2823846.702141 -snap {("G1" 6)}
-wvSetCursor -win $_nWave2 2764100.481011 -snap {("G1" 6)}
-wvSetCursor -win $_nWave2 2794652.525907 -snap {("G1" 6)}
-wvSetCursor -win $_nWave2 2804157.606542 -snap {("G1" 7)}
-wvSetCursor -win $_nWave2 2814681.088673 -snap {("G1" 7)}
-wvSetCursor -win $_nWave2 2825204.570803 -snap {("G1" 7)}
-wvSetCursor -win $_nWave2 2835388.585769 -snap {("G1" 6)}
-wvSetCursor -win $_nWave2 2824186.169307 -snap {("G1" 6)}
-wvSetCursor -win $_nWave2 2835049.118603 -snap {("G1" 6)}
-wvSetCursor -win $_nWave2 2824186.169307 -snap {("G1" 6)}
-wvSetCursor -win $_nWave2 2834030.717107 -snap {("G1" 6)}
-wvSetCursor -win $_nWave2 3295750.836727 -snap {("G1" 2)}
-wvSetCursor -win $_nWave2 3304237.515865 -snap {("G1" 7)}
-wvSetCursor -win $_nWave2 3315100.465161 -snap {("G1" 7)}
-wvSetCursor -win $_nWave2 3324605.545796 -snap {("G1" 7)}
-wvSetCursor -win $_nWave2 3335468.495092 -snap {("G1" 7)}
-wvSetCursor -win $_nWave2 3344973.575726 -snap {("G1" 7)}
-wvSetCursor -win $_nWave2 3355157.590692 -snap {("G1" 7)}
-wvSetCursor -win $_nWave2 3364662.671326 -snap {("G1" 7)}
-wvSetCursor -win $_nWave2 3374507.219126 -snap {("G1" 7)}
-wvSetCursor -win $_nWave2 3386049.102753 -snap {("G1" 7)}
-wvSetCursor -win $_nWave2 3394196.314725 -snap {("G1" 7)}
-wvSetCursor -win $_nWave2 3404719.796856 -snap {("G1" 7)}
-wvSetCursor -win $_nWave2 3415582.746153 -snap {("G1" 7)}
-wvSetCursor -win $_nWave2 3424408.892456 -snap {("G1" 7)}
-wvSetCursor -win $_nWave2 3433235.038759 -snap {("G1" 7)}
-verdiWindowResize -win $_Verdi_1 "513" "19" "1708" "1135"
-wvSetCursor -win $_nWave2 74343.309247 -snap {("G1" 1)}
-wvSelectSignal -win $_nWave2 {( "G1" 1 )} 
-wvSelectSignal -win $_nWave2 {( "G1" 1 )} 
-wvSetRadix -win $_nWave2 -format Bin
-wvSetCursor -win $_nWave2 84527.324212 -snap {("G1" 1)}
-wvSetCursor -win $_nWave2 76040.645074 -snap {("G1" 1)}
-wvSetCursor -win $_nWave2 84866.791378 -snap {("G1" 1)}
-wvSetCursor -win $_nWave2 95390.273508 -snap {("G1" 1)}
-wvSetCursor -win $_nWave2 104555.886977 -snap {("G1" 1)}
-wvSetCursor -win $_nWave2 113382.033281 -snap {("G1" 1)}
-wvSetCursor -win $_nWave2 75022.243578 -snap {("G1" 1)}
-wvSetCursor -win $_nWave2 84187.857047 -snap {("G1" 1)}
-wvSetCursor -win $_nWave2 94711.339177 -snap {("G1" 1)}
-wvSetCursor -win $_nWave2 104895.354143 -snap {("G1" 1)}
-wvSetCursor -win $_nWave2 115758.303439 -snap {("G1" 1)}
-wvSetCursor -win $_nWave2 123905.515411 -snap {("G1" 1)}
-wvSetCursor -win $_nWave2 135786.866204 -snap {("G1" 1)}
-wvSetCursor -win $_nWave2 143594.611011 -snap {("G1" 1)}
-wvSetCursor -win $_nWave2 103537.485481 -snap {("G1" 4)}
-wvSelectSignal -win $_nWave2 {( "G1" 1 )} 
-wvSetRadix -win $_nWave2 -format Hex
-wvSelectSignal -win $_nWave2 {( "G1" 1 )} 
-wvSetRadix -win $_nWave2 -format Bin
-wvSelectSignal -win $_nWave2 {( "G1" 1 )} 
-wvSetRadix -win $_nWave2 -format Ascii
-wvSelectSignal -win $_nWave2 {( "G1" 1 )} 
-wvSetRadix -win $_nWave2 -format Bin
-wvZoomIn -win $_nWave2
-wvZoom -win $_nWave2 106762.423553 152081.290149
-wvUndo -win $_nWave2
+wvCut -win $_nWave2
 wvSetPosition -win $_nWave2 {("G2" 0)}
-wvSetPosition -win $_nWave2 {("G1" 7)}
-wvUndo -win $_nWave2
-wvSetPosition -win $_nWave2 {("G1" 7)}
-wvSetPosition -win $_nWave2 {("G1" 8)}
+wvSetPosition -win $_nWave2 {("G1" 5)}
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "alloc_reserve_ready_o" -line 14 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+wvSelectSignal -win $_nWave2 {( "G1" 6 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G2" 0)}
+wvSetPosition -win $_nWave2 {("G1" 5)}
+srcActiveTrace "tb_top_sv.dut.u_rob.alloc_reserve_ready_o" -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "occupancy_next" -line 476 -pos 1 -win $_nTrace1
+srcActiveTrace "tb_top_sv.dut.u_rob.occupancy_next\[5:0\]" -win $_nTrace1
+srcTraceLoad "tb_top_sv.dut.u_rob.occupancy_next\[5:0\]" -win $_nTrace1
+srcActiveTrace "tb_top_sv.dut.u_rob.occupancy_next\[5:0\]" -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "occupancy_next" -line 476 -pos 1 -win $_nTrace1
+srcTraceLoad "tb_top_sv.dut.u_rob.occupancy_next\[5:0\]" -win $_nTrace1
+srcActiveTrace "tb_top_sv.dut.u_rob.occupancy_next\[5:0\]" -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "occupancy_q" -line 474 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "retire_count_q" -line 475 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+wvSetCursor -win $_nWave2 174143.241627 -snap {("G1" 7)}
+wvSetCursor -win $_nWave2 195291.566986 -snap {("G1" 7)}
+wvSetCursor -win $_nWave2 174473.684211 -snap {("G1" 7)}
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "occupancy_after_retire" -line 473 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+wvSelectSignal -win $_nWave2 {( "G1" 8 )} 
 wvCut -win $_nWave2
 wvSetPosition -win $_nWave2 {("G2" 0)}
 wvSetPosition -win $_nWave2 {("G1" 7)}
-wvSelectSignal -win $_nWave2 {( "G1" 7 )} 
-wvZoomOut -win $_nWave2
-wvZoomOut -win $_nWave2
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "retire_count_q" -line 475 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+srcTraceLoad "tb_top_sv.dut.u_rob.retire_count_q\[2:0\]" -win $_nTrace1
+srcActiveTrace "tb_top_sv.dut.u_rob.retire_count_q\[2:0\]" -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -word -line 750 -pos 3 -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "retire_pending_valid_q" -line 754 -pos 1 -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "retire_count_q" -line 755 -pos 1 -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "retire_pending_valid_q" -line 757 -pos 1 -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "retire_valid_o" -line 757 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+wvSelectSignal -win $_nWave2 {( "G1" 9 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G2" 0)}
+wvSetPosition -win $_nWave2 {("G1" 8)}
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "retire_pending_valid_q" -line 757 -pos 1 -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "retire_valid_o" -line 757 -pos 1 -win $_nTrace1
+srcTraceLoad "tb_top_sv.dut.u_rob.retire_valid_o\[3:0\]" -win $_nTrace1
+srcActiveTrace "tb_top_sv.dut.u_rob.retire_valid_o\[3:0\]" -win $_nTrace1
+srcActiveTrace "tb_top_sv.dut.u_rob.retire_valid_o\[3:0\]" -win $_nTrace1
+srcHBSelect "tb_top_sv.dut.u_ingress" -win $_nTrace1
+srcSetScope -win $_nTrace1 "tb_top_sv.dut.u_ingress" -delim "."
+srcHBSelect "tb_top_sv.dut.u_ingress" -win $_nTrace1
+wvSelectSignal -win $_nWave2 {( "G1" 2 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G2" 0)}
+wvSetPosition -win $_nWave2 {("G1" 7)}
+wvSelectSignal -win $_nWave2 {( "G1" 2 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G2" 0)}
+wvSetPosition -win $_nWave2 {("G1" 6)}
+wvSelectSignal -win $_nWave2 {( "G1" 2 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G2" 0)}
+wvSetPosition -win $_nWave2 {("G1" 5)}
+wvSelectSignal -win $_nWave2 {( "G1" 2 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G2" 0)}
+wvSetPosition -win $_nWave2 {("G1" 4)}
+wvSelectSignal -win $_nWave2 {( "G1" 2 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G2" 0)}
+wvSetPosition -win $_nWave2 {("G1" 3)}
+wvSetPosition -win $_nWave2 {("G1" 2)}
+wvExpandBus -win $_nWave2 {("G1" 2)}
+wvSetPosition -win $_nWave2 {("G1" 6)}
+wvSelectSignal -win $_nWave2 {( "G1" 2 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G2" 0)}
+wvSetPosition -win $_nWave2 {("G1" 5)}
+wvSelectSignal -win $_nWave2 {( "G1" 2 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G2" 0)}
+wvSetPosition -win $_nWave2 {("G1" 4)}
+wvSelectSignal -win $_nWave2 {( "G1" 2 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G2" 0)}
+wvSetPosition -win $_nWave2 {("G1" 3)}
+wvSelectSignal -win $_nWave2 {( "G1" 2 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G2" 0)}
+wvSetPosition -win $_nWave2 {("G1" 2)}
+wvSelectSignal -win $_nWave2 {( "G1" 2 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G2" 0)}
+wvSetPosition -win $_nWave2 {("G1" 1)}
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "slot_count_q" -line 88 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+srcActiveTrace "tb_top_sv.dut.u_ingress.slot_count_q\[1:0\]" -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "slot_count_d" -line 263 -pos 1 -win $_nTrace1
+srcActiveTrace "tb_top_sv.dut.u_ingress.slot_count_d\[1:0\]" -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "slot_count_d" -line 125 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "capture_batch" -line 118 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "head_release" -line 118 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+srcActiveTrace "tb_top_sv.dut.u_ingress.head_release" -win $_nTrace1
+srcActiveTrace "tb_top_sv.dut.u_ingress.head_release" -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "alloc_commit_valid_o" -line 20 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+wvSetCursor -win $_nWave2 83271.531100 -snap {("G1" 2)}
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "alloc_reserve_valid_o" -line 18 -pos 1 -win $_nTrace1
+srcAddSelectedToWave -clipboard -win $_nTrace1
+wvDrop -win $_nWave2
+wvSetCursor -win $_nWave2 75671.351675 -snap {("G1" 1)}
+wvSetCursor -win $_nWave2 85915.071770 -snap {("G1" 7)}
+srcHBSelect "tb_top_sv.dut.u_ingress.allocation_metadata_outputs\[0\]" -win \
+           $_nTrace1
+srcSetScope -win $_nTrace1 \
+           "tb_top_sv.dut.u_ingress.allocation_metadata_outputs\[0\]" -delim \
+           "."
+srcHBSelect "tb_top_sv.dut.u_ingress.allocation_metadata_outputs\[0\]" -win \
+           $_nTrace1
+wvSelectSignal -win $_nWave2 {( "G1" 3 )} 
+wvSelectSignal -win $_nWave2 {( "G1" 3 )} 
+wvSelectSignal -win $_nWave2 {( "G1" 4 )} 
+wvSelectSignal -win $_nWave2 {( "G1" 3 )} 
+wvSelectSignal -win $_nWave2 {( "G1" 3 )} 
+srcDeselectAll -win $_nTrace1
+wvSelectSignal -win $_nWave2 {( "G1" 3 )} 
+srcHBSelect "tb_top_sv.dut.u_ingress" -win $_nTrace1
+wvSelectSignal -win $_nWave2 {( "G1" 2 )} 
+wvSelectSignal -win $_nWave2 {( "G1" 3 )} 
+srcHBSelect "tb_top_sv.dut.u_ingress" -win $_nTrace1
+srcSetScope -win $_nTrace1 "tb_top_sv.dut.u_ingress" -delim "."
+srcHBSelect "tb_top_sv.dut.u_ingress" -win $_nTrace1
+wvSelectSignal -win $_nWave2 {( "G1" 3 )} 
+wvSelectSignal -win $_nWave2 {( "G1" 2 )} 
+wvSelectSignal -win $_nWave2 {( "G1" 2 )} 
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "reserve_batch" -line 106 -pos 1 -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "head_release" -line 109 -pos 1 -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "head_nonempty" -line 105 -pos 1 -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "reserve_batch" -line 106 -pos 1 -win $_nTrace1
+srcTraceLoad "tb_top_sv.dut.u_ingress.reserve_batch" -win $_nTrace1
+srcTraceLoad "tb_top_sv.dut.u_ingress.reserve_batch" -win $_nTrace1
+srcActiveTrace "tb_top_sv.dut.u_ingress.reserve_batch" -win $_nTrace1
+srcTraceLoad "tb_top_sv.dut.u_ingress.reserve_batch" -win $_nTrace1
+srcActiveTrace "tb_top_sv.dut.u_ingress.reserve_batch" -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "alloc_reserve_valid_o" -line 18 -pos 1 -win $_nTrace1
+srcActiveTrace "tb_top_sv.dut.u_ingress.alloc_reserve_valid_o\[3:0\]" -win \
+           $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "slot_lane_valid_q\[slot_rd_ptr_q\]" -line 89 -pos 1 -win \
+          $_nTrace1
+srcTraceLoad "tb_top_sv.dut.u_ingress.slot_lane_valid_q\[0:1\]" -win $_nTrace1
+srcActiveTrace "tb_top_sv.dut.u_ingress.slot_lane_valid_q\[0:1\]" -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "alloc_reserve_ready_i" -line 19 -pos 1 -win $_nTrace1
+srcActiveTrace "tb_top_sv.dut.u_ingress.alloc_reserve_ready_i" -win $_nTrace1
+wvSelectSignal -win $_nWave2 {( "G1" 5 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G2" 0)}
+wvSetPosition -win $_nWave2 {("G1" 6)}
+wvSelectSignal -win $_nWave2 {( "G1" 4 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G2" 0)}
+wvSetPosition -win $_nWave2 {("G1" 5)}
+wvSelectSignal -win $_nWave2 {( "G1" 2 )} 
+wvCut -win $_nWave2
+wvSetPosition -win $_nWave2 {("G2" 0)}
+wvSetPosition -win $_nWave2 {("G1" 4)}
+wvSelectSignal -win $_nWave2 {( "G1" 3 )} 
+wvSelectSignal -win $_nWave2 {( "G1" 4 )} 
+wvSetPosition -win $_nWave2 {("G1" 3)}
+wvSetPosition -win $_nWave2 {("G1" 2)}
+wvMoveSelected -win $_nWave2
+wvSetPosition -win $_nWave2 {("G1" 2)}
+wvSetPosition -win $_nWave2 {("G1" 3)}
+wvSelectSignal -win $_nWave2 {( "G1" 4 )} 
+wvSelectSignal -win $_nWave2 {( "G1" 4 )} 
+srcTraceLoad "tb_top_sv.dut.u_rob.alloc_reserve_ready_o" -win $_nTrace1
+wvSelectSignal -win $_nWave2 {( "G1" 3 )} 
+wvSelectSignal -win $_nWave2 {( "G1" 4 )} 
+srcTraceLoad "tb_top_sv.dut.u_ingress.alloc_reserve_ready_i" -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "alloc_reserve_valid_o" -line 102 -pos 1 -win $_nTrace1
+srcTraceLoad "tb_top_sv.dut.u_ingress.alloc_reserve_valid_o\[3:0\]" -win \
+           $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "alloc_reserve_valid_o" -line 102 -pos 1 -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "alloc_commit_valid_o" -line 20 -pos 1 -win $_nTrace1
+srcActiveTrace "tb_top_sv.dut.u_ingress.alloc_commit_valid_o\[3:0\]" -win \
+           $_nTrace1
+srcTraceLoad "tb_top_sv.dut.u_ingress.alloc_commit_valid_o\[3:0\]" -win $_nTrace1
+srcDeselectAll -win $_nTrace1
+srcSelect -signal "alloc_commit" -line 179 -pos 1 -win $_nTrace1
+srcActiveTrace "tb_top_sv.dut.u_rob.alloc_commit\[3:0\]" -win $_nTrace1
+srcTraceLoad "tb_top_sv.dut.u_rob.alloc_commit\[3:0\]" -win $_nTrace1
+srcTraceLoad "tb_top_sv.dut.u_rob.alloc_commit\[3:0\]" -win $_nTrace1
+srcActiveTrace "tb_top_sv.dut.u_rob.alloc_commit\[3:0\]" -win $_nTrace1
+srcTraceLoad "tb_top_sv.dut.u_rob.alloc_commit\[3:0\]" -win $_nTrace1
+srcHBSelect "tb_top_sv.dut.u_rob" -win $_nTrace1
+srcSetScope -win $_nTrace1 "tb_top_sv.dut.u_rob" -delim "."
+srcHBSelect "tb_top_sv.dut.u_rob" -win $_nTrace1
