@@ -10,8 +10,11 @@ module PPE_ROB #(
 ) (
     input  wire                                      clk_i,
     input  wire                                      rst_ni,
-    input  wire [`PPE_N-1:0]                         alloc_reserve_valid_i,
-    output reg                                       alloc_reserve_ready_o,
+    // Count is derived from the captured ingress FIFO head.
+    input  wire [`PPE_LANE_COUNT_W-1:0]              alloc_reserve_count_i,
+    // Both capacity terms are registered; ingress adds them for acceptance.
+    output reg  [`PPE_ROB_OCCUPANCY_W-1:0]           alloc_reserve_credit_o,
+    output reg  [`PPE_LANE_COUNT_W-1:0]              alloc_pending_retire_count_o,
     input  wire [`PPE_N-1:0]                         alloc_commit_valid_i,
     input  wire [`PPE_SEQ_W-1:0]                     alloc_seq_tag_i [0:`PPE_N-1],
     input  wire [PACKET_W-1:0]                       alloc_packet_i [0:`PPE_N-1],
@@ -42,8 +45,11 @@ module PPE_ROB #(
     localparam integer SEQ_W            = `PPE_SEQ_W;
     localparam integer ROB_ID_W         = `PPE_ROB_ID_W;
     localparam integer HISTORY_ID_W     = `PPE_HISTORY_ID_W;
-    localparam integer LANE_COUNT_W     = 3;
-    localparam integer OCCUPANCY_W      = 6;
+    localparam integer LANE_COUNT_W     = `PPE_LANE_COUNT_W;
+    localparam integer OCCUPANCY_W      = `PPE_ROB_OCCUPANCY_W;
+    localparam integer CAPACITY_EXT_W  = OCCUPANCY_W + 1;
+    localparam [OCCUPANCY_W-1:0] ROB_DEPTH_VALUE =
+        ROB_DEPTH[OCCUPANCY_W-1:0];
     localparam integer DATA_BANK_NUM    = N;
     localparam integer DATA_BANK_W      = 2;
     localparam integer DATA_ROW_NUM     = ROB_DEPTH / DATA_BANK_NUM;
@@ -83,8 +89,13 @@ module PPE_ROB #(
     wire [ROB_ID_W-1:0] head_ptr_q;
     reg [OCCUPANCY_W-1:0] occupancy_q;
     reg [LANE_COUNT_W-1:0] retire_count;
-    reg [OCCUPANCY_W-1:0] occupancy_after_retire;
     reg [OCCUPANCY_W-1:0] occupancy_next;
+    reg [OCCUPANCY_W-1:0] alloc_reserve_credit_next;
+    reg [LANE_COUNT_W-1:0] accepted_reserve_count;
+    reg [CAPACITY_EXT_W-1:0] occupancy_after_retire_ext;
+    reg [CAPACITY_EXT_W-1:0] occupancy_next_ext;
+    reg [CAPACITY_EXT_W-1:0] credit_next_ext;
+    reg [CAPACITY_EXT_W-1:0] reserve_capacity_ext;
 
     reg [FE_NUM-1:0] wb_commit;
     reg [ROB_ID_W-1:0] wb_rob_id [0:FE_NUM-1];
@@ -105,7 +116,6 @@ module PPE_ROB #(
     reg [ROB_ID_W-1:0] retire_pending_rob_id_q [0:N-1];
     reg [SEQ_W-1:0] retire_pending_seq_tag_q [0:N-1];
     reg [PACKET_W-1:0] retire_pending_data_q [0:N-1];
-    reg [LANE_COUNT_W-1:0] retire_count_q;
 
     reg [ROB_DEPTH-1:0] wb_lane_entry_commit [0:FE_NUM-1];
     reg [ROB_DEPTH-1:0] wb_lane_entry_predict [0:FE_NUM-1];
@@ -134,7 +144,6 @@ module PPE_ROB #(
     reg [N-1:0] retire_raw_done;
     reg retire_done01;
     reg retire_done23;
-    reg [DATA_BANK_W-1:0] retire_advance_mod4;
     reg [ROB_ID_W-1:0] retire_bank_rob_id [0:DATA_BANK_NUM-1];
     reg [ROB_ID_W-1:0] retire_rotate_one_rob_id [0:DATA_BANK_NUM-1];
     reg [ROB_TAG_HI_W-1:0] retire_bank_tag_hi [0:DATA_BANK_NUM-1];
@@ -155,6 +164,12 @@ module PPE_ROB #(
     reg [ISSUE_WIDTH-1:0] issue_dep_wb_any;
     reg [PACKET_W-1:0] issue_dep_wb_data [0:ISSUE_WIDTH-1];
     reg [PACKET_W-1:0] issue_dep_data_d [0:ISSUE_WIDTH-1];
+
+    // The gather query is the narrow intermediate register.  The wide
+    // authoritative data selection runs after this boundary and is sampled
+    // by the internal FE input register on the following edge.
+    reg [ISSUE_WIDTH-1:0] gather_dep_required_q;
+    reg [SEQ_W-1:0] gather_target_seq_tag_q [0:ISSUE_WIDTH-1];
 
     integer done_bank;
     integer done_row;
@@ -308,7 +323,6 @@ module PPE_ROB #(
         retire_raw_done = {N{1'b0}};
         retire_done01 = 1'b0;
         retire_done23 = 1'b0;
-        retire_advance_mod4 = {DATA_BANK_W{1'b0}};
         retire_head_bank_next = retire_head_bank_q;
         retire_valid_o = {N{1'b0}};
         retire_count = {LANE_COUNT_W{1'b0}};
@@ -371,15 +385,29 @@ module PPE_ROB #(
         retire_valid_o[1] = retire_done01;
         retire_valid_o[2] = retire_done01 && retire_raw_done[2];
         retire_valid_o[3] = retire_done01 && retire_done23;
-        retire_advance_mod4[0] = ^retire_valid_o;
-        retire_advance_mod4[1] =
-            retire_valid_o[1] ^ retire_valid_o[3];
-        retire_head_bank_next[0] =
-            retire_head_bank_q[0] ^ retire_advance_mod4[0];
-        retire_head_bank_next[1] =
-            retire_head_bank_q[1]
-            ^ retire_advance_mod4[1]
-            ^ (retire_head_bank_q[0] & retire_advance_mod4[0]);
+        // Dense-prefix retire_valid has five legal encodings.  Decode the
+        // modulo-four cursor update directly instead of building parity and
+        // an adder on the retirement critical path.
+        case (retire_valid_o)
+            4'b0001: begin
+                retire_head_bank_next[0] = ~retire_head_bank_q[0];
+                retire_head_bank_next[1] =
+                    retire_head_bank_q[1] ^ retire_head_bank_q[0];
+            end
+            4'b0011: begin
+                retire_head_bank_next[0] = retire_head_bank_q[0];
+                retire_head_bank_next[1] = ~retire_head_bank_q[1];
+            end
+            4'b0111: begin
+                retire_head_bank_next[0] = ~retire_head_bank_q[0];
+                retire_head_bank_next[1] =
+                    ~(retire_head_bank_q[1] ^ retire_head_bank_q[0]);
+            end
+            default: begin
+                // 0000 and 1111 both advance by zero modulo four.
+                retire_head_bank_next = retire_head_bank_q;
+            end
+        endcase
         case (retire_valid_o)
             4'b0000: retire_count = 3'd0;
             4'b0001: retire_count = 3'd1;
@@ -470,35 +498,38 @@ module PPE_ROB #(
     end
 
     always @* begin : allocation_capacity
-        occupancy_after_retire =
-            occupancy_q
-            - {{(OCCUPANCY_W-LANE_COUNT_W){1'b0}}, retire_count_q};
-        occupancy_next = occupancy_after_retire;
-        alloc_reserve_ready_o = 1'b0;
-        case (alloc_reserve_valid_i)
-            4'b0000: begin end
-            4'b0001, 4'b0010, 4'b0100, 4'b1000:
-                if (occupancy_after_retire <= 6'd31) begin
-                    alloc_reserve_ready_o = 1'b1;
-                    occupancy_next = occupancy_after_retire + 6'd1;
-                end
-            4'b0011, 4'b0101, 4'b0110, 4'b1001, 4'b1010, 4'b1100:
-                if (occupancy_after_retire <= 6'd30) begin
-                    alloc_reserve_ready_o = 1'b1;
-                    occupancy_next = occupancy_after_retire + 6'd2;
-                end
-            4'b0111, 4'b1011, 4'b1101, 4'b1110:
-                if (occupancy_after_retire <= 6'd29) begin
-                    alloc_reserve_ready_o = 1'b1;
-                    occupancy_next = occupancy_after_retire + 6'd3;
-                end
-            4'b1111:
-                if (occupancy_after_retire <= 6'd28) begin
-                    alloc_reserve_ready_o = 1'b1;
-                    occupancy_next = occupancy_after_retire + 6'd4;
-                end
-            default: alloc_reserve_ready_o = 1'b0;
-        endcase
+        reserve_capacity_ext =
+            {1'b0, alloc_reserve_credit_o}
+            + {{(CAPACITY_EXT_W-LANE_COUNT_W){1'b0}},
+               alloc_pending_retire_count_o};
+
+        occupancy_after_retire_ext =
+            {1'b0, occupancy_q}
+            - {{(CAPACITY_EXT_W-LANE_COUNT_W){1'b0}},
+               alloc_pending_retire_count_o};
+        accepted_reserve_count = {LANE_COUNT_W{1'b0}};
+        if ((alloc_reserve_count_i != {LANE_COUNT_W{1'b0}})
+            && ({{(CAPACITY_EXT_W-LANE_COUNT_W){1'b0}},
+                 alloc_reserve_count_i} <= reserve_capacity_ext)) begin
+            accepted_reserve_count = alloc_reserve_count_i;
+        end
+
+        occupancy_next_ext =
+            occupancy_after_retire_ext
+            + {{(CAPACITY_EXT_W-LANE_COUNT_W){1'b0}},
+               accepted_reserve_count};
+        occupancy_next = occupancy_next_ext[OCCUPANCY_W-1:0];
+
+        // Capacity is split into registered free space and a registered
+        // retirement lookahead.  The current head scan is not on this path.
+        credit_next_ext =
+            {1'b0, alloc_reserve_credit_o}
+            - {{(CAPACITY_EXT_W-LANE_COUNT_W){1'b0}},
+               accepted_reserve_count}
+            + {{(CAPACITY_EXT_W-LANE_COUNT_W){1'b0}},
+               alloc_pending_retire_count_o};
+        alloc_reserve_credit_next =
+            credit_next_ext[OCCUPANCY_W-1:0];
     end
 
     always @* begin : issue_source_read
@@ -564,12 +595,12 @@ module PPE_ROB #(
              query_idx = query_idx + 1) begin
             issue_dep_active_data[query_idx] = {PACKET_W{1'b0}};
             issue_dep_history_data[query_idx] = {PACKET_W{1'b0}};
-            target_rob_id = gather_target_seq_tag_i[query_idx][ROB_ID_W-1:0];
-            history_id = gather_target_seq_tag_i[query_idx][HISTORY_ID_W-1:0];
-            if (gather_dep_required_i[query_idx]) begin
+            target_rob_id = gather_target_seq_tag_q[query_idx][ROB_ID_W-1:0];
+            history_id = gather_target_seq_tag_q[query_idx][HISTORY_ID_W-1:0];
+            if (gather_dep_required_q[query_idx]) begin
                 if (rob_valid_q[target_rob_id]
                     && (rob_tag_hi_q[target_rob_id]
-                        == gather_target_seq_tag_i[query_idx][
+                        == gather_target_seq_tag_q[query_idx][
                             ROB_ID_W +: ROB_TAG_HI_W])) begin
                     issue_dep_active_match[query_idx] = 1'b1;
                     issue_dep_active_available[query_idx] =
@@ -584,7 +615,7 @@ module PPE_ROB #(
                 end
                 if (history_valid_q[history_id]
                     && (history_tag_hi_q[history_id]
-                        == gather_target_seq_tag_i[query_idx][
+                        == gather_target_seq_tag_q[query_idx][
                             HISTORY_ID_W +: HISTORY_TAG_HI_W])) begin
                     issue_dep_history_match[query_idx] = 1'b1;
                     issue_dep_history_data[query_idx] =
@@ -646,13 +677,13 @@ module PPE_ROB #(
              query_idx = query_idx + 1) begin
             issue_dep_wb_match[query_idx] = {FE_NUM{1'b0}};
             issue_dep_wb_data[query_idx] = {PACKET_W{1'b0}};
-            if (!gather_target_seq_tag_i[query_idx][0]) begin
+            if (!gather_target_seq_tag_q[query_idx][0]) begin
                 for (wb_idx = 0; wb_idx < 2; wb_idx = wb_idx + 1) begin
                     issue_dep_wb_match[query_idx][wb_idx] =
-                        gather_dep_required_i[query_idx]
+                        gather_dep_required_q[query_idx]
                         && wb_commit[wb_idx]
                         && (wb_seq_tag_i[wb_idx]
-                            == gather_target_seq_tag_i[query_idx]);
+                            == gather_target_seq_tag_q[query_idx]);
                 end
                 issue_dep_wb_any[query_idx] =
                     issue_dep_wb_match[query_idx][0]
@@ -667,10 +698,10 @@ module PPE_ROB #(
             end else begin
                 for (wb_idx = 2; wb_idx < 4; wb_idx = wb_idx + 1) begin
                     issue_dep_wb_match[query_idx][wb_idx] =
-                        gather_dep_required_i[query_idx]
+                        gather_dep_required_q[query_idx]
                         && wb_commit[wb_idx]
                         && (wb_seq_tag_i[wb_idx]
-                            == gather_target_seq_tag_i[query_idx]);
+                            == gather_target_seq_tag_q[query_idx]);
                 end
                 issue_dep_wb_any[query_idx] =
                     issue_dep_wb_match[query_idx][2]
@@ -692,7 +723,7 @@ module PPE_ROB #(
         for (query_idx = 0; query_idx < ISSUE_WIDTH;
              query_idx = query_idx + 1) begin
             issue_dep_data_d[query_idx] = {PACKET_W{1'b0}};
-            if (gather_dep_required_i[query_idx]) begin
+            if (gather_dep_required_q[query_idx]) begin
                 if (issue_dep_wb_any[query_idx]) begin
                     issue_dep_data_d[query_idx] = issue_dep_wb_data[query_idx];
                 end else if (issue_dep_active_match[query_idx]) begin
@@ -715,6 +746,27 @@ module PPE_ROB #(
             assign gather_dep_data_o[gather_lane] = issue_dep_data_d[gather_lane];
         end
     endgenerate
+
+    always @(posedge clk_i or negedge rst_ni) begin : gather_query_state
+        integer query_idx;
+
+        if (!rst_ni) begin
+            gather_dep_required_q <= {ISSUE_WIDTH{1'b0}};
+            for (query_idx = 0; query_idx < ISSUE_WIDTH;
+                 query_idx = query_idx + 1) begin
+                gather_target_seq_tag_q[query_idx] <= {SEQ_W{1'b0}};
+            end
+        end else begin
+            gather_dep_required_q <= gather_dep_required_i;
+            for (query_idx = 0; query_idx < ISSUE_WIDTH;
+                 query_idx = query_idx + 1) begin
+                if (gather_dep_required_i[query_idx]) begin
+                    gather_target_seq_tag_q[query_idx] <=
+                        gather_target_seq_tag_i[query_idx];
+                end
+            end
+        end
+    end
 
     always @(posedge clk_i or negedge rst_ni) begin : rob_metadata_update
         integer entry_idx;
@@ -752,10 +804,10 @@ module PPE_ROB #(
 
         if (!rst_ni) begin
             retire_pending_valid_q <= {N{1'b0}};
-            retire_count_q <= {LANE_COUNT_W{1'b0}};
+            alloc_pending_retire_count_o <= {LANE_COUNT_W{1'b0}};
         end else begin
             retire_pending_valid_q <= retire_valid_o;
-            retire_count_q <= retire_count;
+            alloc_pending_retire_count_o <= retire_count;
             for (retire_idx = 0; retire_idx < N;
                  retire_idx = retire_idx + 1)
                 if (retire_valid_o[retire_idx]) begin
@@ -848,6 +900,7 @@ module PPE_ROB #(
         if (!rst_ni) begin
             retire_head_bank_q <= {DATA_BANK_W{1'b0}};
             occupancy_q <= {OCCUPANCY_W{1'b0}};
+            alloc_reserve_credit_o <= ROB_DEPTH_VALUE;
             for (bank_idx = 0; bank_idx < DATA_BANK_NUM;
                  bank_idx = bank_idx + 1)
                 retire_bank_row_q[bank_idx] <= {DATA_ROW_W{1'b0}};
@@ -859,6 +912,7 @@ module PPE_ROB #(
                     retire_bank_row_q[bank_idx] <=
                         retire_bank_row_q[bank_idx] + 3'd1;
             occupancy_q <= occupancy_next;
+            alloc_reserve_credit_o <= alloc_reserve_credit_next;
         end
     end
 

@@ -27,6 +27,7 @@ module PPE_SCHEDULER #(
     input  wire [PACKET_W-1:0]                       source_bank_packet_i [0:`PPE_N-1],
     output reg  [`PPE_FE_NUM-1:0]                    gather_dep_required_o,
     output reg  [`PPE_SEQ_W-1:0]                     gather_target_seq_tag_o [0:`PPE_FE_NUM-1],
+    // ROB resolves the authoritative dependency on the internal FE path.
     input  wire [PACKET_W-1:0]                       gather_dep_data_i [0:`PPE_FE_NUM-1],
     output reg  [`PPE_FE_NUM-1:0]                    issue_valid_o,
     output reg  [PACKET_W-1:0]                       issue_packet_o [0:`PPE_FE_NUM-1],
@@ -63,7 +64,30 @@ module PPE_SCHEDULER #(
     localparam integer ADMIT_BANK_W = 2;
     localparam integer ADMIT_ROWS   = ISSUE_DEPTH / ADMIT_BANKS;
     localparam integer ADMIT_ROW_W  = 3;
+    // Waiter storage follows the same 4-bank x 8-row physical partition.
+    localparam integer WAIT_BANKS   = ADMIT_BANKS;
+    localparam integer WAIT_BANK_W  = ADMIT_BANK_W;
+    localparam integer WAIT_ROWS    = ADMIT_ROWS;
+    localparam integer WAIT_ROW_W   = ADMIT_ROW_W;
     localparam integer RETURN_FUTURE_DEPTH = `PPE_RETURN_FUTURE_DEPTH;
+
+    function [MAX_DEP-1:0] decode_dep_offset;
+        input [SEQ_W-1:0] consumer_seq_tag;
+        input [SEQ_W-1:0] target_seq_tag;
+        begin
+            decode_dep_offset = {MAX_DEP{1'b0}};
+            case (consumer_seq_tag - target_seq_tag)
+                6'd1: decode_dep_offset[0] = 1'b1;
+                6'd2: decode_dep_offset[1] = 1'b1;
+                6'd3: decode_dep_offset[2] = 1'b1;
+                6'd4: decode_dep_offset[3] = 1'b1;
+                6'd5: decode_dep_offset[4] = 1'b1;
+                6'd6: decode_dep_offset[5] = 1'b1;
+                6'd7: decode_dep_offset[6] = 1'b1;
+                default: begin end
+            endcase
+        end
+    endfunction
 
     reg [1:0]         issue_state_q          [0:ISSUE_DEPTH-1];
     reg [SEQ_W-1:0]   issue_seq_tag_q        [0:ISSUE_DEPTH-1];
@@ -91,7 +115,6 @@ module PPE_SCHEDULER #(
     reg [DELAY_W-1:0] selected_delay_q [0:FE_NUM-1];
     reg [FE_NUM-1:0] selected_dep_required_q;
     reg [PACKET_W-1:0] selected_packet_q [0:FE_NUM-1];
-    reg [PACKET_W-1:0] selected_dep_data_q [0:FE_NUM-1];
 
     reg [ISSUE_DEPTH-1:0] wake_hit;
     reg [ADMIT_BANKS-1:0] alloc_bank_write_en;
@@ -106,7 +129,7 @@ module PPE_SCHEDULER #(
 
     reg [N-1:0] dep_status_valid_q;
     reg [SEQ_W-1:0] dep_status_target_seq_tag_q [0:N-1];
-    reg [SEQ_W-1:0] dep_status_consumer_seq_tag_q [0:N-1];
+    reg [MAX_DEP-1:0] dep_status_offset_q [0:N-1];
     reg [ROB_ID_W-1:0] dep_status_consumer_id_q [0:N-1];
     reg [ISSUE_DEPTH-1:0] dep_status_pending_entry;
     reg [ISSUE_DEPTH-1:0] dep_status_available_entry;
@@ -116,7 +139,12 @@ module PPE_SCHEDULER #(
     reg [MAX_DEP-1:0] waiter_set [0:ISSUE_DEPTH-1];
     reg [N-1:0] waiter_set_valid;
     reg [ROB_ID_W-1:0] waiter_set_producer_id [0:N-1];
+    reg [WAIT_ROW_W-1:0] waiter_set_row [0:N-1];
     reg [MAX_DEP-1:0] waiter_set_offset [0:N-1];
+    reg [WAIT_ROWS-1:0] waiter_target_row_onehot
+        [0:N-1][0:WAIT_BANKS-1];
+    reg [MAX_DEP-1:0] waiter_set_bank
+        [0:WAIT_BANKS-1][0:WAIT_ROWS-1];
     reg [MAX_DEP-1:0] waiter_take [0:ISSUE_DEPTH-1];
     reg [ISSUE_DEPTH-1:0] waiter_clear;
     reg [ISSUE_DEPTH-1:0] early_wake_hit_d;
@@ -404,6 +432,8 @@ module PPE_SCHEDULER #(
 
         if (!rst_ni) begin
             dep_status_valid_q <= {N{1'b0}};
+            for (lane = 0; lane < N; lane = lane + 1)
+                dep_status_offset_q[lane] <= {MAX_DEP{1'b0}};
         end else begin
             for (lane = 0; lane < N; lane = lane + 1) begin
                 dep_status_valid_q[lane] <=
@@ -413,8 +443,9 @@ module PPE_SCHEDULER #(
                     && alloc_dep_required_i[lane]) begin
                     dep_status_target_seq_tag_q[lane] <=
                         alloc_target_seq_tag_i[lane];
-                    dep_status_consumer_seq_tag_q[lane] <=
-                        alloc_seq_tag_i[lane];
+                    dep_status_offset_q[lane] <=
+                        decode_dep_offset(alloc_seq_tag_i[lane],
+                                          alloc_target_seq_tag_i[lane]);
                     dep_status_consumer_id_q[lane] <=
                         alloc_seq_tag_i[lane][ROB_ID_W-1:0];
                 end
@@ -422,42 +453,121 @@ module PPE_SCHEDULER #(
         end
     end
 
-    always @* begin : reverse_waiter_registration
+    always @* begin : reverse_waiter_request_decode
         integer lane;
-        integer producer;
 
         waiter_set_valid = {N{1'b0}};
         for (lane = 0; lane < N; lane = lane + 1) begin
             waiter_set_producer_id[lane] =
                 dep_status_target_seq_tag_q[lane][ROB_ID_W-1:0];
-            waiter_set_offset[lane] = {MAX_DEP{1'b0}};
+            waiter_set_row[lane] =
+                dep_status_target_seq_tag_q[lane][ROB_ID_W-1:WAIT_BANK_W];
+            waiter_set_offset[lane] = dep_status_offset_q[lane];
             if (dep_status_valid_q[lane]
-                && !dep_status_available_i[lane]) begin
+                && !dep_status_available_i[lane]
+                && (|dep_status_offset_q[lane])) begin
                 waiter_set_valid[lane] = 1'b1;
-                case (dep_status_consumer_seq_tag_q[lane]
-                      - dep_status_target_seq_tag_q[lane])
-                    6'd1: waiter_set_offset[lane][0] = 1'b1;
-                    6'd2: waiter_set_offset[lane][1] = 1'b1;
-                    6'd3: waiter_set_offset[lane][2] = 1'b1;
-                    6'd4: waiter_set_offset[lane][3] = 1'b1;
-                    6'd5: waiter_set_offset[lane][4] = 1'b1;
-                    6'd6: waiter_set_offset[lane][5] = 1'b1;
-                    6'd7: waiter_set_offset[lane][6] = 1'b1;
-                    default: waiter_set_valid[lane] = 1'b0;
+            end
+        end
+    end
+
+    // Decode each target into one local row of its selected waiter bank.
+    // The explicit case structure avoids a repeated producer-wide comparator.
+    always @* begin : reverse_waiter_target_decode
+        integer lane;
+        integer bank;
+
+        for (lane = 0; lane < N; lane = lane + 1)
+            for (bank = 0; bank < WAIT_BANKS; bank = bank + 1)
+                waiter_target_row_onehot[lane][bank] =
+                    {WAIT_ROWS{1'b0}};
+
+        for (lane = 0; lane < N; lane = lane + 1) begin
+            if (waiter_set_valid[lane]) begin
+                case (waiter_set_producer_id[lane][WAIT_BANK_W-1:0])
+                    2'd0: begin
+                        case (waiter_set_row[lane])
+                            3'd0: waiter_target_row_onehot[lane][0][0] = 1'b1;
+                            3'd1: waiter_target_row_onehot[lane][0][1] = 1'b1;
+                            3'd2: waiter_target_row_onehot[lane][0][2] = 1'b1;
+                            3'd3: waiter_target_row_onehot[lane][0][3] = 1'b1;
+                            3'd4: waiter_target_row_onehot[lane][0][4] = 1'b1;
+                            3'd5: waiter_target_row_onehot[lane][0][5] = 1'b1;
+                            3'd6: waiter_target_row_onehot[lane][0][6] = 1'b1;
+                            3'd7: waiter_target_row_onehot[lane][0][7] = 1'b1;
+                            default: begin end
+                        endcase
+                    end
+                    2'd1: begin
+                        case (waiter_set_row[lane])
+                            3'd0: waiter_target_row_onehot[lane][1][0] = 1'b1;
+                            3'd1: waiter_target_row_onehot[lane][1][1] = 1'b1;
+                            3'd2: waiter_target_row_onehot[lane][1][2] = 1'b1;
+                            3'd3: waiter_target_row_onehot[lane][1][3] = 1'b1;
+                            3'd4: waiter_target_row_onehot[lane][1][4] = 1'b1;
+                            3'd5: waiter_target_row_onehot[lane][1][5] = 1'b1;
+                            3'd6: waiter_target_row_onehot[lane][1][6] = 1'b1;
+                            3'd7: waiter_target_row_onehot[lane][1][7] = 1'b1;
+                            default: begin end
+                        endcase
+                    end
+                    2'd2: begin
+                        case (waiter_set_row[lane])
+                            3'd0: waiter_target_row_onehot[lane][2][0] = 1'b1;
+                            3'd1: waiter_target_row_onehot[lane][2][1] = 1'b1;
+                            3'd2: waiter_target_row_onehot[lane][2][2] = 1'b1;
+                            3'd3: waiter_target_row_onehot[lane][2][3] = 1'b1;
+                            3'd4: waiter_target_row_onehot[lane][2][4] = 1'b1;
+                            3'd5: waiter_target_row_onehot[lane][2][5] = 1'b1;
+                            3'd6: waiter_target_row_onehot[lane][2][6] = 1'b1;
+                            3'd7: waiter_target_row_onehot[lane][2][7] = 1'b1;
+                            default: begin end
+                        endcase
+                    end
+                    default: begin
+                        case (waiter_set_row[lane])
+                            3'd0: waiter_target_row_onehot[lane][3][0] = 1'b1;
+                            3'd1: waiter_target_row_onehot[lane][3][1] = 1'b1;
+                            3'd2: waiter_target_row_onehot[lane][3][2] = 1'b1;
+                            3'd3: waiter_target_row_onehot[lane][3][3] = 1'b1;
+                            3'd4: waiter_target_row_onehot[lane][3][4] = 1'b1;
+                            3'd5: waiter_target_row_onehot[lane][3][5] = 1'b1;
+                            3'd6: waiter_target_row_onehot[lane][3][6] = 1'b1;
+                            3'd7: waiter_target_row_onehot[lane][3][7] = 1'b1;
+                            default: begin end
+                        endcase
+                    end
                 endcase
             end
         end
+    end
 
-        for (producer = 0; producer < ISSUE_DEPTH;
-             producer = producer + 1) begin
-            waiter_set[producer] = {MAX_DEP{1'b0}};
-            for (lane = 0; lane < N; lane = lane + 1) begin
-                if (waiter_set_valid[lane]
-                    && (waiter_set_producer_id[lane]
-                        == producer[ROB_ID_W-1:0])) begin
-                    waiter_set[producer] = waiter_set[producer]
-                                                 | waiter_set_offset[lane];
+    always @* begin : reverse_waiter_registration
+        integer lane;
+        integer bank;
+        integer row;
+
+        for (bank = 0; bank < WAIT_BANKS; bank = bank + 1)
+            for (row = 0; row < WAIT_ROWS; row = row + 1)
+                waiter_set_bank[bank][row] = {MAX_DEP{1'b0}};
+
+        for (bank = 0; bank < WAIT_BANKS; bank = bank + 1) begin
+            for (row = 0; row < WAIT_ROWS; row = row + 1) begin
+                for (lane = 0; lane < N; lane = lane + 1) begin
+                    if (waiter_set_valid[lane]
+                        && waiter_target_row_onehot[lane][bank][row]) begin
+                        waiter_set_bank[bank][row] =
+                            waiter_set_bank[bank][row]
+                            | waiter_set_offset[lane];
+                    end
                 end
+            end
+        end
+
+        for (bank = 0; bank < WAIT_BANKS; bank = bank + 1) begin
+            for (row = 0; row < WAIT_ROWS; row = row + 1) begin
+                waiter_set[row * WAIT_BANKS + bank] =
+                    waiter_set_bank[bank][row];
             end
         end
     end
@@ -968,7 +1078,9 @@ module PPE_SCHEDULER #(
                 issue_delay_o[fe] = selected_delay_q[fe];
                 issue_dep_required_o[fe] =
                     selected_dep_required_q[fe];
-                issue_dep_data_o[fe] = selected_dep_data_q[fe];
+                if (selected_dep_required_q[fe]) begin
+                    issue_dep_data_o[fe] = gather_dep_data_i[fe];
+                end
             end
             completion_valid_o[fe] =
                 fe_out_valid_i[fe] && future_valid_q[fe][0];
@@ -1049,7 +1161,6 @@ module PPE_SCHEDULER #(
                     default:
                         selected_packet_q[fe] <= source_bank_packet_i[3];
                 endcase
-                selected_dep_data_q[fe] <= gather_dep_data_i[fe];
             end
         end
     end

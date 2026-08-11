@@ -15,8 +15,10 @@ module PPE_INGRESS #(
     input  wire [PACKET_W-1:0]               in_packet_i [0:`PPE_N-1],
     input  wire [DESC_W-1:0]                 in_desc_i [0:`PPE_N-1],
     output wire                              bkps_o,
-    output reg  [`PPE_N-1:0]                 alloc_reserve_valid_o,
-    input  wire                              alloc_reserve_ready_i,
+    // Registered ROB credit is compared with the captured head count.
+    output wire [`PPE_LANE_COUNT_W-1:0]       alloc_reserve_count_o,
+    input  wire [`PPE_ROB_OCCUPANCY_W-1:0]   alloc_reserve_credit_i,
+    input  wire [`PPE_LANE_COUNT_W-1:0]       alloc_pending_retire_count_i,
     output wire [`PPE_N-1:0]                 alloc_commit_valid_o,
     output wire [`PPE_SEQ_W-1:0]             alloc_seq_tag_o [0:`PPE_N-1],
     output wire [`PPE_SEQ_W-1:0]             alloc_target_seq_tag_o [0:`PPE_N-1],
@@ -30,10 +32,12 @@ module PPE_INGRESS #(
     localparam integer DELAY_W      = `PPE_DELAY_W;
     localparam integer SLOT_DEPTH   = 2;
     localparam integer SLOT_COUNT_W = 2;
-    localparam integer LANE_COUNT_W = 3;
+    localparam integer LANE_COUNT_W = `PPE_LANE_COUNT_W;
     localparam integer DEP_OFFSET_W = DESC_W - DELAY_W;
     localparam integer DELTA_W      = DEP_OFFSET_W + 1;
     localparam integer DEP_LSB      = DELAY_W;
+
+    wire [LANE_COUNT_W-1:0] input_packet_count;
 
     reg [N-1:0]                          slot_lane_valid_q [0:SLOT_DEPTH-1];
     reg [PACKET_W-1:0]                   slot_packet_q [0:SLOT_DEPTH-1][0:N-1];
@@ -52,8 +56,10 @@ module PPE_INGRESS #(
     wire                                 head_nonempty;
     wire                                 head_release;
     wire                                 reserve_batch;
+    wire                                 reserve_capacity_ok;
+    wire [`PPE_ROB_OCCUPANCY_W:0]        reserve_capacity_ext;
 
-    reg [LANE_COUNT_W-1:0]               slot_packet_count [0:SLOT_DEPTH-1];
+    reg [LANE_COUNT_W-1:0]               slot_packet_count_q [0:SLOT_DEPTH-1];
     reg [SEQ_W-1:0]                      slot_seq_tag [0:SLOT_DEPTH-1][0:N-1];
     reg [SEQ_W-1:0]                      slot_target_seq_tag [0:SLOT_DEPTH-1][0:N-1];
     reg [DELAY_W-1:0]                    slot_delay [0:SLOT_DEPTH-1][0:N-1];
@@ -87,7 +93,7 @@ module PPE_INGRESS #(
 
         if (slot_count_q != {SLOT_COUNT_W{1'b0}}) begin
             head_lane_valid   = slot_lane_valid_q[slot_rd_ptr_q];
-            head_packet_count = slot_packet_count[slot_rd_ptr_q];
+            head_packet_count = slot_packet_count_q[slot_rd_ptr_q];
             head_dep_required = slot_dep_required[slot_rd_ptr_q];
             for (lane_idx = 0; lane_idx < N; lane_idx = lane_idx + 1) begin
                 head_seq_tag[lane_idx] =
@@ -99,19 +105,32 @@ module PPE_INGRESS #(
             end
         end
 
-        alloc_reserve_valid_o = head_lane_valid;
     end
 
-    assign head_nonempty = |alloc_reserve_valid_o;
+    assign alloc_reserve_count_o = head_packet_count;
+    assign head_nonempty = (head_packet_count != {LANE_COUNT_W{1'b0}});
+    assign reserve_capacity_ext =
+        {1'b0, alloc_reserve_credit_i}
+        + {{(`PPE_ROB_OCCUPANCY_W+1-LANE_COUNT_W){1'b0}},
+           alloc_pending_retire_count_i};
+    assign reserve_capacity_ok =
+        ({{(`PPE_ROB_OCCUPANCY_W+1-LANE_COUNT_W){1'b0}},
+          head_packet_count} <= reserve_capacity_ext);
     assign reserve_batch = (slot_count_q != {SLOT_COUNT_W{1'b0}})
                            && head_nonempty
-                           && alloc_reserve_ready_i;
+                           && reserve_capacity_ok;
     assign head_release  = (slot_count_q != {SLOT_COUNT_W{1'b0}})
                            && (!head_nonempty
-                               || alloc_reserve_ready_i);
+                               || reserve_capacity_ok);
     assign capture_batch   = !bkps_q;
     assign slot_bank0_write = capture_batch && !slot_wr_ptr_q;
     assign slot_bank1_write = capture_batch &&  slot_wr_ptr_q;
+
+    assign input_packet_count =
+        {{(LANE_COUNT_W-1){1'b0}}, in_valid_i[0]}
+        + {{(LANE_COUNT_W-1){1'b0}}, in_valid_i[1]}
+        + {{(LANE_COUNT_W-1){1'b0}}, in_valid_i[2]}
+        + {{(LANE_COUNT_W-1){1'b0}}, in_valid_i[3]};
 
     always @* begin : occupancy_and_backpressure
         slot_count_d = slot_count_q;
@@ -131,13 +150,11 @@ module PPE_INGRESS #(
         integer slot_idx;
         integer lane_idx;
         reg [LANE_COUNT_W-1:0] lower_count;
-        reg [LANE_COUNT_W-1:0] upper_count;
         reg [LANE_COUNT_W-1:0] lane_rank;
         reg [DELTA_W-1:0]      target_delta;
         reg [DEP_OFFSET_W-1:0] dep_offset;
 
         lower_count           = {LANE_COUNT_W{1'b0}};
-        upper_count           = {LANE_COUNT_W{1'b0}};
         lane_rank             = {LANE_COUNT_W{1'b0}};
         target_delta          = {DELTA_W{1'b0}};
         dep_offset            = {DEP_OFFSET_W{1'b0}};
@@ -145,7 +162,6 @@ module PPE_INGRESS #(
         for (slot_idx = 0;
              slot_idx < SLOT_DEPTH;
              slot_idx = slot_idx + 1) begin
-            slot_packet_count[slot_idx] = {LANE_COUNT_W{1'b0}};
             slot_dep_required[slot_idx] = {N{1'b0}};
             for (lane_idx = 0; lane_idx < N; lane_idx = lane_idx + 1) begin
                 slot_seq_tag[slot_idx][lane_idx] = {SEQ_W{1'b0}};
@@ -157,13 +173,6 @@ module PPE_INGRESS #(
                   slot_lane_valid_q[slot_idx][0]}
                 + {{(LANE_COUNT_W-1){1'b0}},
                     slot_lane_valid_q[slot_idx][1]};
-            upper_count =
-                {{(LANE_COUNT_W-1){1'b0}},
-                  slot_lane_valid_q[slot_idx][2]}
-                + {{(LANE_COUNT_W-1){1'b0}},
-                    slot_lane_valid_q[slot_idx][3]};
-            slot_packet_count[slot_idx] = lower_count + upper_count;
-
             for (lane_idx = 0; lane_idx < N; lane_idx = lane_idx + 1) begin
                 case (lane_idx)
                     0: lane_rank = {LANE_COUNT_W{1'b0}};
@@ -239,9 +248,12 @@ module PPE_INGRESS #(
             slot_rd_ptr_q     <= 1'b0;
             slot_wr_ptr_q     <= 1'b0;
             slot_count_q      <= {SLOT_COUNT_W{1'b0}};
+            slot_packet_count_q[0] <= {LANE_COUNT_W{1'b0}};
+            slot_packet_count_q[1] <= {LANE_COUNT_W{1'b0}};
         end else begin
             if (slot_bank0_write) begin
                 slot_lane_valid_q[0] <= in_valid_i;
+                slot_packet_count_q[0] <= input_packet_count;
                 for (lane_idx = 0; lane_idx < N; lane_idx = lane_idx + 1) begin
                     slot_packet_q[0][lane_idx] <= in_packet_i[lane_idx];
                     slot_desc_q[0][lane_idx] <= in_desc_i[lane_idx];
@@ -249,6 +261,7 @@ module PPE_INGRESS #(
             end
             if (slot_bank1_write) begin
                 slot_lane_valid_q[1] <= in_valid_i;
+                slot_packet_count_q[1] <= input_packet_count;
                 for (lane_idx = 0; lane_idx < N; lane_idx = lane_idx + 1) begin
                     slot_packet_q[1][lane_idx] <= in_packet_i[lane_idx];
                     slot_desc_q[1][lane_idx] <= in_desc_i[lane_idx];
@@ -281,7 +294,7 @@ module PPE_INGRESS #(
             alloc_commit_valid_q <= {N{1'b0}};
         end else begin
             alloc_commit_valid_q <=
-                alloc_reserve_valid_o & {N{reserve_batch}};
+                head_lane_valid & {N{reserve_batch}};
             if (slot_count_q != {SLOT_COUNT_W{1'b0}}) begin
                 for (lane_idx = 0; lane_idx < N; lane_idx = lane_idx + 1) begin
                     alloc_commit_seq_tag_q[lane_idx] <= head_seq_tag[lane_idx];

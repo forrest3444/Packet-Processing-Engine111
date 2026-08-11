@@ -10,6 +10,9 @@
 `define PPE_CAND_WINDOW_DEPTH    8
 `define PPE_READY_ENQUEUE_WIDTH  4
 `define PPE_ROB_ID_W             5
+// Shared widths used by the allocation-capacity interface.
+`define PPE_LANE_COUNT_W         3
+`define PPE_ROB_OCCUPANCY_W      6
 
 `define PPE_MAX_DEP              7
 `define PPE_RESULT_BANKS         8

@@ -12,7 +12,9 @@
 +incdir+tb/agent/master
 +incdir+tb/agent/slave
 +incdir+tb/seq_lib
++incdir+tb/seq_lib/base
 +incdir+tb/tests
++incdir+tb/tests/base
 +incdir+tb/probe
 
 tb/tb/ppe_if.sv
