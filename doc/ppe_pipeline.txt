@@ -1,0 +1,124 @@
+PPE 流水线说明
+版本：Draft 1.0
+状态：与当前 RTL 流水边界一致
+
+================================================================================
+1. 文档目的
+================================================================================
+
+本文只描述当前维护版 PPE 的流水级、寄存边界和并行数据通路。功能语义以
+doc/ppe_feature_description.txt 为准，模块职责以 doc/hld.txt 为准，逐周期行为以
+doc/lld.txt 为准；本文不重新定义这些文档中的协议。
+
+================================================================================
+2. 主流水线
+================================================================================
+
+外部输入只在顶层输入寄存边界之后进入 PPE。主路径从输入捕获到 FE 发射如下：
+
+  外部 in_valid / in_packet / in_desc
+                 │
+                 ▼
+  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+  I0  External Input Capture
+      捕获完整输入批次到 ingress 的两项 elastic FIFO；不做分配或解析。
+                 │
+                 ▼
+  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+  D0A Input Admission / Capacity Reservation
+      扫描寄存 FIFO head，计算有效报文数、连续 seq、target、delay 和
+      dep_required，并取得 ROB reservation；末端寄存 commit bundle。
+                 │
+                 ▼
+  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+  D0B Allocation Commit
+      将已取得容量保证的 commit bundle 同时提交到 ROB 和 Scheduler。
+      ROB 捕获原始 packet，Scheduler 初始化 READY 或 WAIT_DEP。
+                 │
+                 ▼
+  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+  D0C Dependency Status Resolve
+      查询依赖目标的 available 状态；命中时按 consumer 物理索引更新
+      WAIT_DEP entry。未命中时登记窄 waiter 信息。
+                 │
+                 ▼
+  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+  D1 Bank-local READY Nomination
+      四个交错 bank 各提名至多一个最老 READY entry，写入两个窄候选槽之一。
+      候选槽只保存 seq、target、delay 和 dep_required。
+                 │
+                 ▼
+  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+  D2A Candidate Shortlist / Local Pair Match
+      每个 bank 从两个 way 中选出至多一个合法候选；偶数 bank 和奇数 bank
+      分别经过固定 2x2 匹配网络，末端锁存不可撤销 grant。
+                 │
+                 ▼
+  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+  D2B Return-slot Commit / Operand Gather
+      消费 grant、删除候选、将 issue entry 置为 SELECTED，并预约 FE 返回槽。
+      同时向 ROB 发出 source/dependency gather 请求。
+                 │
+                 ▼
+  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+  D3 Registered Operand Issue
+      捕获 selected metadata 和原始 packet；依赖数据由 ROB 在窄 query
+      寄存器之后组合解析，并由内部 FE 输入寄存器采样。
+                 │
+                 ▼
+             FE0 / FE1 / FE2 / FE3
+
+典型连续流中，D2A 在周期 n 锁存 grant，D2B 在 n+1 消费，D3 在 n+2 向 FE
+发射。FE 的 delay=d 请求在发射沿之后固定 d+1 个周期返回。
+
+================================================================================
+3. Backend 并行通路
+================================================================================
+
+Backend 不与主调度路径串成单一线性流水，而是与其并行运行：
+
+  D0A/D0B  ───────►  A0/A1  ROB allocation
+                         │
+  D0C/D2B  ───────►  G0    dependency status / data gather
+                         │
+  FE return  ─────►  W0    completion qualification and writeback
+                         │
+  ROB head   ─────►  R0    in-order retire / history / output register
+
+  A0/A1：A0 更新 reservation 和 metadata，A1 提交 bank-local 原始 packet。
+  G0：按 completion bypass、active ROB、retired history 的优先级解析依赖。
+  W0：接收 FE 乱序返回，按完整 seq tag 资格检查后写回 ROB。
+  R0：从 ROB head 形成连续 DONE prefix，更新 history，并装载输出寄存器。
+
+A0、G0、W0 和 R0 可以在同一周期处理不同 entry。R0 的输出寄存器装载、ROB
+释放、history 更新和输出 lane 指针推进属于同一个退休事件。
+
+================================================================================
+4. Dependency event path
+================================================================================
+
+  D0B 状态探针寄存
+       │
+       ▼
+  D0C available 查询 ── 命中 ──► 下一周期进入 READY
+       │
+       └─ 未命中 ──► waiter 登记
+                         │
+                 D2B grant 后窄 token 提前唤醒
+                         │
+                 completion tag 兜底唤醒
+
+唤醒事件只更新 issue 状态边界，不组合直通候选选择或 FE 输入。被唤醒 entry 最早
+在后续周期参加 D1 提名。
+
+================================================================================
+5. 关键边界和不变量
+================================================================================
+
+  - 顶层输入和输出（包括 bkps）由寄存器驱动；内部 FE 接口允许组合通路。
+  - D2A grant 一旦锁存不可撤销；D2B 必须消费该 grant。
+  - D3 释放对应 ISSUE_SELECTED entry；候选窗不保存 packet 或 dependency data。
+  - ROB 是原始 packet、FE 结果、顺序退休和依赖权威数据的唯一所有者。
+  - FE 返回可乱序，R0 只退休从 ROB head 开始的连续 DONE prefix。
+  - 同一 FE 的未来返回日历不能出现目标周期冲突。
+

@@ -8,8 +8,11 @@
 module PPE_SCHEDULER #(
     parameter integer PACKET_W = `PPE_DEFAULT_PACKET_W
 ) (
+    // Clock and reset.
     input  wire                                      clk_i,
     input  wire                                      rst_ni,
+
+    // D1: ROB retirement-bank age hints and D0B allocation metadata.
     input  wire [`PPE_ROB_BANK_ROW_W-1:0]            ready_bank_head_row_i
                                                      [0:`PPE_READY_ENQUEUE_WIDTH-1],
     input  wire [`PPE_N-1:0]                         issue_alloc_valid_i,
@@ -17,23 +20,34 @@ module PPE_SCHEDULER #(
     input  wire [`PPE_SEQ_W-1:0]                     alloc_target_seq_tag_i [0:`PPE_N-1],
     input  wire [`PPE_DELAY_W-1:0]                   alloc_delay_i [0:`PPE_N-1],
     input  wire [`PPE_N-1:0]                         alloc_dep_required_i,
+
+    // D0C: dependency-status query to and availability response from ROB.
     output reg  [`PPE_N-1:0]                         dep_status_valid_o,
     output reg  [`PPE_SEQ_W-1:0]                     dep_status_target_seq_tag_o [0:`PPE_N-1],
     input  wire [`PPE_N-1:0]                         dep_status_available_i,
+
+    // W0: FE completion events used for writeback and dependency wakeup.
     input  wire [`PPE_FE_NUM-1:0]                    completion_valid_i,
     input  wire [`PPE_SEQ_W-1:0]                     completion_seq_tag_i [0:`PPE_FE_NUM-1],
+
+    // D2B/G0: bank-local source packet request and response.
     output reg  [`PPE_ROB_BANK_ROW_W-1:0]            source_bank_row_o [0:`PPE_N-1],
     output reg  [`PPE_ROB_TAG_HI_W-1:0]              source_bank_tag_hi_o [0:`PPE_N-1],
     input  wire [PACKET_W-1:0]                       source_bank_packet_i [0:`PPE_N-1],
+
+    // D2B/G0: authoritative dependency-data gather.
     output reg  [`PPE_FE_NUM-1:0]                    gather_dep_required_o,
     output reg  [`PPE_SEQ_W-1:0]                     gather_target_seq_tag_o [0:`PPE_FE_NUM-1],
-    // ROB resolves the authoritative dependency on the internal FE path.
     input  wire [PACKET_W-1:0]                       gather_dep_data_i [0:`PPE_FE_NUM-1],
+
+    // D3: selected operand and control sent to the internal FE array.
     output reg  [`PPE_FE_NUM-1:0]                    issue_valid_o,
     output reg  [PACKET_W-1:0]                       issue_packet_o [0:`PPE_FE_NUM-1],
     output reg  [`PPE_DELAY_W-1:0]                   issue_delay_o [0:`PPE_FE_NUM-1],
     output reg  [`PPE_FE_NUM-1:0]                    issue_dep_required_o,
     output reg  [PACKET_W-1:0]                       issue_dep_data_o [0:`PPE_FE_NUM-1],
+
+    // W0: FE return observation and predecoded ROB writeback information.
     input  wire [`PPE_FE_NUM-1:0]                    fe_out_valid_i,
     output reg  [`PPE_FE_NUM-1:0]                    completion_valid_o,
     output reg  [`PPE_SEQ_W-1:0]                     completion_seq_tag_o [0:`PPE_FE_NUM-1],
@@ -345,6 +359,8 @@ module PPE_SCHEDULER #(
         end
     endfunction
 
+    // D0B: decode the committed allocation bundle into local issue banks.
+    // The following combinational blocks feed the D0B state updates below.
     always @* begin : allocation_bank_route
         integer bank;
         integer lane;
@@ -385,6 +401,7 @@ module PPE_SCHEDULER #(
         end
     end
 
+    // D0B: expand one bank-local allocation into an entry-local write enable.
     always @* begin : allocation_row_decode
         integer bank;
         integer row;
@@ -412,6 +429,7 @@ module PPE_SCHEDULER #(
         end
     end
 
+    // D0C: present the registered dependency-status probe to the ROB.
     always @* begin : dependency_status_request
         integer lane;
 
@@ -426,6 +444,7 @@ module PPE_SCHEDULER #(
         end
     end
 
+    // D0B -> D0C: capture dependency probes for the next status lookup.
     always @(posedge clk_i or negedge rst_ni)
         begin : dependency_status_pipeline
         integer lane;
@@ -453,6 +472,7 @@ module PPE_SCHEDULER #(
         end
     end
 
+    // D0C: prepare the narrow reverse-waiter registration request.
     always @* begin : reverse_waiter_request_decode
         integer lane;
 
@@ -471,7 +491,7 @@ module PPE_SCHEDULER #(
         end
     end
 
-    // Decode each target into one local row of its selected waiter bank.
+    // D0C: decode each target into one local waiter-bank row.
     // The explicit case structure avoids a repeated producer-wide comparator.
     always @* begin : reverse_waiter_target_decode
         integer lane;
@@ -542,6 +562,7 @@ module PPE_SCHEDULER #(
         end
     end
 
+    // D0C: merge same-bank waiter registrations by dependency offset.
     always @* begin : reverse_waiter_registration
         integer lane;
         integer bank;
@@ -572,6 +593,7 @@ module PPE_SCHEDULER #(
         end
     end
 
+    // D2B: derive early-wakeup tokens from the grant producer's waiter row.
     always @* begin : reverse_waiter_early_wakeup
         integer fe;
         integer offset;
@@ -607,6 +629,7 @@ module PPE_SCHEDULER #(
         end
     end
 
+    // W0: clear waiter rows when a producer is allocated or completes.
     always @* begin : reverse_waiter_clear_decode
         integer fe;
         integer producer;
@@ -626,6 +649,7 @@ module PPE_SCHEDULER #(
         end
     end
 
+    // D2B/W0: commit waiter rows and pipeline early-wakeup tokens.
     always @(posedge clk_i or negedge rst_ni) begin : reverse_waiter_state
         integer producer;
 
@@ -652,6 +676,7 @@ module PPE_SCHEDULER #(
         end
     end
 
+    // D0C: expand status responses into entry-local update vectors.
     always @* begin : dependency_status_pending_decode
         integer entry;
         integer lane;
@@ -675,6 +700,7 @@ module PPE_SCHEDULER #(
         end
     end
 
+    // D3: identify selected entries released after FE input capture.
     always @* begin : selected_release_decode
         integer entry;
         integer fe;
@@ -691,6 +717,7 @@ module PPE_SCHEDULER #(
         end
     end
 
+    // W0: completion tags provide the dependency-wakeup safety net.
     always @* begin : completion_wakeup_scan
         integer entry;
         integer fe;
@@ -709,6 +736,7 @@ module PPE_SCHEDULER #(
         end
     end
 
+    // D2A: calculate FE-calendar legality for each candidate way.
     always @* begin : candidate_way_legality
         integer bank;
         integer slot;
@@ -773,6 +801,7 @@ module PPE_SCHEDULER #(
         end
     end
 
+    // D2A: choose one legal way per candidate bank for the shortlist.
     always @* begin : candidate_shortlist
         integer bank;
         integer slot;
@@ -826,6 +855,7 @@ module PPE_SCHEDULER #(
         end
     end
 
+    // D2A: perform the fixed local 2x2 candidate-to-FE matches.
     always @* begin : fixed_local_pair_match
         integer candidate;
         integer fe;
@@ -881,6 +911,7 @@ module PPE_SCHEDULER #(
                 end
     end
 
+    // D2B: form bank-local source-packet gather requests from the grant.
     always @* begin : source_bank_request_decode
         integer bank;
         integer fe;
@@ -904,6 +935,7 @@ module PPE_SCHEDULER #(
         end
     end
 
+    // D2B: decode the registered grant into candidate and issue-entry removals.
     always @* begin : candidate_removal_decode
         integer fe;
         integer entry;
@@ -929,6 +961,7 @@ module PPE_SCHEDULER #(
         end
     end
 
+    // D1: identify READY entries that are not already present in a candidate slot.
     always @* begin : ready_eligibility
         integer entry;
         integer bank;
@@ -952,6 +985,7 @@ module PPE_SCHEDULER #(
         end
     end
 
+    // D1: nominate at most one oldest READY entry per bank.
     always @* begin : ready_bank_nomination
         integer bank;
         reg vacancy;
@@ -1009,6 +1043,7 @@ module PPE_SCHEDULER #(
         end
     end
 
+    // D1/D2B: update candidate slots for nomination and grant consumption.
     always @* begin : candidate_bank_next
         integer slot;
         integer bank;
@@ -1059,6 +1094,7 @@ module PPE_SCHEDULER #(
         end
     end
 
+    // D3/W0: adapt registered scheduler state to the internal FE and ROB paths.
     always @* begin : interface_outputs
         integer fe;
 
@@ -1090,6 +1126,7 @@ module PPE_SCHEDULER #(
         end
     end
 
+    // D0B/D0C/D2B/D3: own the issue-entry lifecycle state.
     always @(posedge clk_i or negedge rst_ni) begin : issue_entry_state
         integer entry;
 
@@ -1126,6 +1163,7 @@ module PPE_SCHEDULER #(
         end
     end
 
+    // D0B/D0C: store issue metadata and the resolved dependency target.
     always @(posedge clk_i) begin : issue_entry_metadata
         integer entry;
 
@@ -1143,6 +1181,7 @@ module PPE_SCHEDULER #(
         end
     end
 
+    // D3: capture the selected metadata and source packet for FE input.
     always @(posedge clk_i or negedge rst_ni) begin : selected_metadata
         integer fe;
 
@@ -1165,6 +1204,7 @@ module PPE_SCHEDULER #(
         end
     end
 
+    // D2A/D2B: lock the grant, fairness state, and source-gather addresses.
     always @(posedge clk_i or negedge rst_ni) begin : grant_state
         integer bank;
         integer fe;
@@ -1204,6 +1244,7 @@ module PPE_SCHEDULER #(
         end
     end
 
+    // W0: predecode the next predicted completion entry for the ROB.
     always @(posedge clk_i or negedge rst_ni) begin : writeback_predecode
         integer fe;
 
@@ -1231,6 +1272,7 @@ module PPE_SCHEDULER #(
              future_fe = future_fe + 1) begin : g_future_table
             integer slot;
 
+            // W0: shift one FE's fixed-latency return calendar.
             always @(posedge clk_i or negedge rst_ni) begin : state
                 if (!rst_ni) begin
                     future_valid_q[future_fe] <=
@@ -1276,6 +1318,7 @@ module PPE_SCHEDULER #(
         end
     endgenerate
 
+    // D1/D2B: commit candidate-window state and candidate metadata.
     always @(posedge clk_i or negedge rst_ni) begin : candidate_state
         integer slot;
 

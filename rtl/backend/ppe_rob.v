@@ -8,30 +8,45 @@
 module PPE_ROB #(
     parameter integer PACKET_W = `PPE_DEFAULT_PACKET_W
 ) (
+    // Clock and reset.
     input  wire                                      clk_i,
     input  wire                                      rst_ni,
-    // Count is derived from the captured ingress FIFO head.
+
+    // A0: capacity reservation request from the registered ingress head.
     input  wire [`PPE_LANE_COUNT_W-1:0]              alloc_reserve_count_i,
-    // Both capacity terms are registered; ingress adds them for acceptance.
+
+    // A0: registered free-space and pending-retirement credit to ingress.
     output reg  [`PPE_ROB_OCCUPANCY_W-1:0]           alloc_reserve_credit_o,
     output reg  [`PPE_LANE_COUNT_W-1:0]              alloc_pending_retire_count_o,
+
+    // A1: committed allocation metadata and original packet from ingress.
     input  wire [`PPE_N-1:0]                         alloc_commit_valid_i,
     input  wire [`PPE_SEQ_W-1:0]                     alloc_seq_tag_i [0:`PPE_N-1],
     input  wire [PACKET_W-1:0]                       alloc_packet_i [0:`PPE_N-1],
+
+    // D0C/G0: dependency-status query and availability response.
     input  wire [`PPE_N-1:0]                         dep_status_valid_i,
     input  wire [`PPE_SEQ_W-1:0]                     dep_status_target_seq_tag_i [0:`PPE_N-1],
     output reg  [`PPE_N-1:0]                         dep_status_available_o,
+
+    // D2B/G0: bank-local original-packet gather request and response.
     input  wire [`PPE_ROB_BANK_ROW_W-1:0]            source_bank_row_i [0:`PPE_N-1],
     input  wire [`PPE_ROB_TAG_HI_W-1:0]              source_bank_tag_hi_i [0:`PPE_N-1],
     output reg  [PACKET_W-1:0]                       source_bank_packet_o [0:`PPE_N-1],
+
+    // D2B/G0: dependency-data gather query and authoritative response.
     input  wire [`PPE_ISSUE_WIDTH-1:0]               gather_dep_required_i,
     input  wire [`PPE_SEQ_W-1:0]                     gather_target_seq_tag_i [0:`PPE_ISSUE_WIDTH-1],
     output wire [PACKET_W-1:0]                       gather_dep_data_o [0:`PPE_ISSUE_WIDTH-1],
+
+    // W0: FE completion/writeback inputs, including one-cycle predecode hints.
     input  wire [`PPE_FE_NUM-1:0]                    wb_valid_i,
     input  wire [`PPE_SEQ_W-1:0]                     wb_seq_tag_i [0:`PPE_FE_NUM-1],
     input  wire [`PPE_SEQ_W-1:0]                     wb_pre_seq_tag_i [0:`PPE_FE_NUM-1],
     input  wire [`PPE_ROB_DEPTH-1:0]                 wb_pre_entry_onehot_i [0:`PPE_FE_NUM-1],
     input  wire [PACKET_W-1:0]                       wb_data_i [0:`PPE_FE_NUM-1],
+
+    // D1/R0: bank age hints to Scheduler and dense in-order retire bundle.
     output wire [`PPE_ROB_BANK_ROW_W-1:0]            ready_bank_head_row_o [0:`PPE_N-1],
     output reg  [`PPE_N-1:0]                         retire_valid_o,
     output reg  [PACKET_W-1:0]                       retire_data_o [0:`PPE_N-1]
@@ -171,8 +186,12 @@ module PPE_ROB #(
     reg [ISSUE_WIDTH-1:0] gather_dep_required_q;
     reg [SEQ_W-1:0] gather_target_seq_tag_q [0:ISSUE_WIDTH-1];
 
+    //-------------------------------------------------------------------------
+    // A0/A1 and W0: allocation, completion qualification, and done visibility.
+    //-------------------------------------------------------------------------
     integer done_bank;
     integer done_row;
+    // W0/R0: combine stored completion state with the next-return prediction.
     always @* begin : done_bank_decode
         for (done_bank = 0; done_bank < DATA_BANK_NUM;
              done_bank = done_bank + 1) begin
@@ -193,6 +212,7 @@ module PPE_ROB #(
         {retire_bank_row_q[retire_head_bank_q], retire_head_bank_q};
     assign alloc_commit = alloc_commit_valid_i;
 
+    // A0: derive local ROB indices from the committed sequence tags.
     always @* begin : allocation_request_decode
         integer lane_idx;
         for (lane_idx = 0; lane_idx < N; lane_idx = lane_idx + 1) begin
@@ -201,6 +221,7 @@ module PPE_ROB #(
         end
     end
 
+    // A0: capture one allocation packet per physical data bank.
     always @* begin : allocation_data_capture
         integer alloc_idx;
         integer bank_idx;
@@ -230,6 +251,7 @@ module PPE_ROB #(
         end
     end
 
+    // W0: qualify writeback lanes and form entry-local write enables/data.
     always @* begin : writeback_qualification
         integer wb_idx;
         integer entry_idx;
@@ -314,6 +336,10 @@ module PPE_ROB #(
         end
     end
 
+    //-------------------------------------------------------------------------
+    // R0: in-order head scan, data rotation, and retirement bookkeeping.
+    //-------------------------------------------------------------------------
+    // R0: scan the dense DONE prefix from the current physical head.
     always @* begin : retirement_scan
         integer bank_idx;
         integer retire_idx;
@@ -436,6 +462,7 @@ module PPE_ROB #(
         end
     end
 
+    // R0: read the retiring bank data and restore logical output order.
     always @* begin : retirement_data_read
         integer bank_idx;
         reg [ROB_ID_W-1:0] retire_data_rob_id;
@@ -472,6 +499,7 @@ module PPE_ROB #(
         end
     end
 
+    // R0: decode retired entries into history-bank writes.
     always @* begin : history_write_decode
         integer history_idx;
         integer retire_idx;
@@ -497,6 +525,7 @@ module PPE_ROB #(
         end
     end
 
+    // A0: calculate registered reservation capacity and next occupancy.
     always @* begin : allocation_capacity
         reserve_capacity_ext =
             {1'b0, alloc_reserve_credit_o}
@@ -532,6 +561,10 @@ module PPE_ROB #(
             credit_next_ext[OCCUPANCY_W-1:0];
     end
 
+    //-------------------------------------------------------------------------
+    // G0: source-packet read and dependency status/data resolution.
+    //-------------------------------------------------------------------------
+    // D2B/G0: read the original source packet addressed by the registered grant.
     always @* begin : issue_source_read
         integer bank_idx;
         reg [ROB_ID_W-1:0] source_rob_id;
@@ -560,6 +593,7 @@ module PPE_ROB #(
         end
     end
 
+    // G0: decode active-ROB and retired-history lookup metadata.
     always @* begin : dependency_lookup_decode
         integer query_idx;
         reg [ROB_ID_W-1:0] target_rob_id;
@@ -625,6 +659,7 @@ module PPE_ROB #(
         end
     end
 
+    // D0C/G0: resolve dependency availability for the status probe.
     always @* begin : dependency_status_resolve
         integer query_idx;
         integer wb_idx;
@@ -668,6 +703,7 @@ module PPE_ROB #(
         end
     end
 
+    // G0/W0: resolve same-cycle completion bypass for gather data.
     always @* begin : dependency_completion_bypass
         integer query_idx;
         integer wb_idx;
@@ -717,6 +753,7 @@ module PPE_ROB #(
         end
     end
 
+    // G0: apply the fixed completion/active/history data priority.
     always @* begin : dependency_data_resolve
         integer query_idx;
 
@@ -747,6 +784,7 @@ module PPE_ROB #(
         end
     endgenerate
 
+    // D2B/G0: register the narrow dependency gather query.
     always @(posedge clk_i or negedge rst_ni) begin : gather_query_state
         integer query_idx;
 
@@ -768,6 +806,11 @@ module PPE_ROB #(
         end
     end
 
+    //-------------------------------------------------------------------------
+    // Registered backend state updates.  The combinational groups above feed
+    // these stage-owned registers without changing the architectural boundary.
+    //-------------------------------------------------------------------------
+    // A0/W0/R0: update ROB validity, generation, and result-valid metadata.
     always @(posedge clk_i or negedge rst_ni) begin : rob_metadata_update
         integer entry_idx;
         integer retire_idx;
@@ -799,6 +842,7 @@ module PPE_ROB #(
         end
     end
 
+    // R0/A0: register the retirement prefix and pending capacity credit.
     always @(posedge clk_i or negedge rst_ni) begin : retire_pending_control
         integer retire_idx;
 
@@ -819,6 +863,7 @@ module PPE_ROB #(
         end
     end
 
+    // R0: register the retiring payload for the history write in the next edge.
     always @(posedge clk_i) begin : retire_pending_data
         integer retire_idx;
         for (retire_idx = 0; retire_idx < N;
@@ -828,6 +873,7 @@ module PPE_ROB #(
                     retire_data_o[retire_idx];
     end
 
+    // A0/A1: register bank-local allocation row/control state.
     always @(posedge clk_i or negedge rst_ni) begin : alloc_data_control
         integer bank_idx;
         if (!rst_ni) begin
@@ -842,6 +888,7 @@ module PPE_ROB #(
         end
     end
 
+    // A1: register bank-local allocation payloads.
     always @(posedge clk_i) begin : alloc_data_payload
         integer bank_idx;
         for (bank_idx = 0; bank_idx < DATA_BANK_NUM;
@@ -850,6 +897,7 @@ module PPE_ROB #(
                 alloc_data_q[bank_idx] <= alloc_data_capture[bank_idx];
     end
 
+    // A1/W0: commit allocation payloads and FE results into the data banks.
     always @(posedge clk_i) begin : rob_data_update
         integer bank_idx;
         integer row_idx;
@@ -870,6 +918,7 @@ module PPE_ROB #(
             end
     end
 
+    // R0: update retired-history metadata.
     always @(posedge clk_i or negedge rst_ni)
         begin : history_metadata_update
         integer history_idx;
@@ -887,6 +936,7 @@ module PPE_ROB #(
         end
     end
 
+    // R0: update history payloads.
     always @(posedge clk_i) begin : history_data_update
         integer history_idx;
         for (history_idx = 0; history_idx < RESULT_BANKS;
@@ -895,6 +945,7 @@ module PPE_ROB #(
                 history_data_q[history_idx] <= history_write_data[history_idx];
     end
 
+    // A0/R0: advance the ROB head, bank rows, occupancy, and reserve credit.
     always @(posedge clk_i or negedge rst_ni) begin : rob_control_update
         integer bank_idx;
         if (!rst_ni) begin

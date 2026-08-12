@@ -643,3 +643,15 @@ srcTraceLoad "tb_top_sv.dut.u_rob.alloc_commit\[3:0\]" -win $_nTrace1
 srcHBSelect "tb_top_sv.dut.u_rob" -win $_nTrace1
 srcSetScope -win $_nTrace1 "tb_top_sv.dut.u_rob" -delim "."
 srcHBSelect "tb_top_sv.dut.u_rob" -win $_nTrace1
+wvSelectSignal -win $_nWave2 {( "G1" 2 )} 
+wvSetCursor -win $_nWave2 73718.307165 -snap {("G1" 1)}
+wvSetCursor -win $_nWave2 84627.294323 -snap {("G1" 1)}
+wvSetCursor -win $_nWave2 94544.555377 -snap {("G1" 3)}
+wvSetCursor -win $_nWave2 72726.581059 -snap {("G1" 2)}
+wvSetCursor -win $_nWave2 84627.294323 -snap {("G1" 2)}
+wvSetCursor -win $_nWave2 84957.869692 -snap {("G1" 2)}
+wvSetCursor -win $_nWave2 84296.718955 -snap {("G1" 1)}
+wvSetCursor -win $_nWave2 95205.706114 -snap {("G1" 1)}
+wvSetCursor -win $_nWave2 75371.184007 -snap {("G1" 2)}
+wvSetCursor -win $_nWave2 84627.294323 -snap {("G1" 3)}
+wvSetCursor -win $_nWave2 94544.555377 -snap {("G1" 3)}
