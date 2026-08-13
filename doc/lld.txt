@@ -187,7 +187,7 @@ valid、enable和mask在需要按位运算时仍使用packed vector。其余RTL�
     A0：预留容量并在下一周期提交ROB entry；
     W0：接收最多4路FE乱序完成结果；
     G0：为D0C提供available状态并为grant后gather提供最多4路权威依赖数据；
-    R0：从ROB head保序退休、更新retired history并产生寄存器输出。
+    R0a：从ROB head保序退休、更新retired history并产生retirement bundle；R0b随后完成输出映射。
 
 2.3 典型无依赖报文数据流
 
@@ -200,7 +200,7 @@ valid、enable和mask在需要按位运算时仍使用packed vector。其余RTL�
   5) D2A形成4项shortlist，用两个固定2x2网络选择报文和FE并捕获grant；
   6) D2B以grant tag从ROB gather operand并写返回表，D3以寄存operand向FE发出请求；
   7) FE返回，W0按完整seq tag低位写ROB并设置result_valid；
-  8) 报文到达ROB head且DONE后，R0将数据装入输出寄存器；
+  8) 报文到达ROB head且DONE后，R0a产生bundle，R0b在下一沿将其装入输出寄存器；
   9) 同一退休沿更新对应retired history bank并释放ROB entry。
 
 2.4 典型依赖等待数据流
@@ -322,7 +322,8 @@ PPE_SCHEDULER维护4组两项本地窄候选缓冲；匹配时每bank组合形�
   candidate_delay[0..7][1:0]
   candidate_dep_required[0..7]
   candidate_present[ROB_DEPTH]
-  ready_bank_head_row[0..3][2:0]
+  ready_bank_head_row_i[0..3][2:0]
+  ready_bank_head_row_q[0..3][2:0]
   candidate_way_rr_ptr[0..3]
   shortlist_valid[0..3]
   shortlist_candidate_onehot[0..3][7:0]
@@ -332,9 +333,10 @@ PPE_SCHEDULER维护4组两项本地窄候选缓冲；匹配时每bank组合形�
   candidate_pending_block[0..7][2:0]
 
 entry按ROB ID低2位分为4个交错bank，每bank包含8个row和两个固定候选槽。
-候选槽bank对应way0，槽4+bank对应way1。每个bank仅在至少一个本地槽沿前无效或
-本周期被D2B寄存grant删除时，从ROB提供的本bank最老未退休row开始环形扫描并提名
-至多1项，直接写入优先空闲way。8项row以3 bit自然回卷，不保存独立READY扫描指针。
+候选槽bank对应way0，槽4+bank对应way1。ready_bank_head_row_q在D1边界捕获ROB提供的
+ready_bank_head_row_i；每个bank仅在至少一个本地槽沿前无效或本周期被D2B寄存grant删除时，
+从该已寄存起点开始环形扫描并提名至多1项，直接写入优先空闲way。8项row以3 bit自然
+回卷，不保存独立READY扫描指针。
 不同bank之间不存在候选compact、重排或共享
 写入仲裁；每bank每周期最多写一个候选槽。未进入候选缓冲的READY entry继续保存在
 issue状态表中。candidate_present只覆盖8个本地候选槽；提名时置位，D2B消费grant时清位。
@@ -574,10 +576,11 @@ seq tag密集分配，因此无需backend向issue table返回allocation ID或acc
 
 ROB同时向Scheduler输出每个4-way interleaved bank的最老未退休row：
 
-  ready_bank_head_row[4][2:0]
+  ready_bank_head_row_i[4][2:0]
 
-该信号直接来自ROB的bank-local退休游标。Scheduler只用它作为本bank READY环形扫描
-起点，不据此改变依赖状态、候选合法性或FE匹配规则。
+该信号直接来自ROB的bank-local退休游标，并在Scheduler内部捕获为
+ready_bank_head_row_q。Scheduler只用q值作为本bank READY环形扫描起点，不据此改变依赖
+状态、候选合法性或FE匹配规则；提示滞后一拍只增加候选可见延迟。
 
 D0C为上一周期D0B提交的最多N个有依赖allocation发出小位宽状态请求：
 
@@ -614,7 +617,7 @@ dependency模块或额外流水边界。
 
 PPE_SCHEDULER接收D0B guaranteed commit bundle、D0C dependency status响应以及FE返回有效：
 
-  ready_bank_head_row[4][2:0]
+  ready_bank_head_row_i[4][2:0]
   issue_alloc_valid[N]
   alloc_seq_tag[N][SEQ_W-1:0]
   alloc_target_seq_tag[N][SEQ_W-1:0]
@@ -901,8 +904,9 @@ READY更新。Allocation仍具有最终优先权，selected更新优先于各类
 
 ISSUE_READY且candidate_present=0的entry可被发现。发现只使用沿前状态；allocation、
 D0C状态更新和completion wakeup最早下一周期参与发现。entry按ROB ID低2位进入4个
-交错bank，每bank从ready_bank_head_row开始环形扫描8个row并提名至多1项。该起点是
-本bank最老未退休entry，因此优先级按全局退休年龄投影到各bank。每bank候选槽固定为
+交错bank，每bank从ready_bank_head_row_q开始环形扫描8个row并提名至多1项。该起点是
+ROB提示在D1边界捕获后的值，最多滞后一拍；它仍表示本bank最老未退休entry的年龄投影，
+因此不改变候选合法性或FE匹配规则。每bank候选槽固定为
 bank和4+bank。
 
 若本bank有无效槽或本周期D2B消费grant删除槽，则允许一次提名。优先写入被删除或无效的way0，
@@ -1145,7 +1149,8 @@ ppe_rob输出按报文序排列的逻辑退休bundle：
   retire_data[N][127:0]
 
 retire_valid从slot 0开始连续有效，不得留洞；slot j对应head+j的沿前ROB结果。
-该bundle为组合退休事件，供ppe_retire_output在同一上升沿捕获，不使用ready或反压。
+该bundle为组合退休事件，供ppe_retire_output在退休沿捕获到内部
+retire_valid_q/retire_data_q；输出模块在下一沿使用该捕获bundle，不使用ready或反压。
 若slot的DONE来自predicted_done，retire_data必须从命中该entry的唯一FE
 wb_data旁路；否则读取ROB data bank。同一entry不存在多路合法预测命中。
 
@@ -1175,15 +1180,15 @@ Pending期间旧active entry保持有效；提交沿前由active提供依赖，�
 因此内部所有权延后但available语义无空窗。head_bank和bank_row_cursor的组合状态
 与原5 bit自然回绕head_ptr严格等价，不生成ROB_DEPTH比较/减法路径。
 
-同一退休沿在ppe_retire_output内同时执行：
+在退休沿，ppe_retire_output先捕获全4路retire_valid和有效retire_data。下一沿再执行：
 
-  - 先将全4路out_valid的next value默认为0，再按start_lane映射K个退休slot；
-  - 仅更新本周期out_valid=1的out_packet寄存器，其余out_packet保持；
-  - start_lane按同一advance_mod4计算两位模4 next-state，保持固定的窄逻辑路径。
+  - 将捕获bundle按沿前start_lane映射到物理lane；
+  - 仅更新mapped_valid=1的out_packet寄存器，其余out_packet保持；
+  - 按捕获bundle的dense-prefix valid更新start_lane。
 
-第j个逻辑退休slot映射到lane=(start_lane+j) mod 4，使用沿前start_lane。ROB状态
-释放、history更新、输出寄存器装载和start_lane更新属于同一架构退休沿，不新增
-流水级或跨模块握手。
+第j个逻辑退休slot映射到lane=(start_lane+j) mod 4。ROB状态释放和history更新仍属于
+原架构退休沿；输出模块的capture与映射寄存器只增加一拍输出延迟，不引入ready或跨模块
+握手。
 
 固定N=4实现使用两级barrel rotate：第一级由start_lane[0]选择旋转0或1，第二级由
 start_lane[1]选择继续旋转0或2。valid和128 bit data经过相同的固定连线置换，不使用
@@ -1351,7 +1356,7 @@ HLD和LLD，不属于首版RTL编码时的自由选择。
   6) FE返回只设置active ROB result并形成completion事件，不直接写retired history。
   7) Active ROB tag命中但result_valid=0时必须等待，禁止继续查询history。
   8) 退休只从ROB head开始并且只退休连续DONE entry。
-  9) 输出寄存器装载、ROB释放和history更新属于同一退休事件。
+  9) ROB释放和history更新属于同一退休事件；输出寄存器使用随后一拍捕获的退休bundle。
   10) ROB occupancy必须等于有效ROB entry数量。
   11) 无效宽数据内容不影响任何功能判断。
   12) 同一FE的有效future槽唯一对应一个目标返回周期，D2A不得生成冲突预约，

@@ -174,6 +174,7 @@ module PPE_SCHEDULER #(
     reg [ROB_ID_W-1:0] select_entry_id [0:FE_NUM-1];
 
     reg [ADMIT_ROWS-1:0] bank_ready [0:ADMIT_BANKS-1];
+    reg [ADMIT_ROW_W-1:0] ready_bank_head_row_q [0:ADMIT_BANKS-1];
     reg [ADMIT_BANKS-1:0] bank_winner_valid;
     reg [ADMIT_ROW_W-1:0] bank_winner_row [0:ADMIT_BANKS-1];
     reg [SEQ_W-1:0] bank_winner_seq_tag [0:ADMIT_BANKS-1];
@@ -1010,7 +1011,7 @@ module PPE_SCHEDULER #(
             bank_winner_row[bank] = {ADMIT_ROW_W{1'b0}};
             row_select = select_ready_row(
                 bank_ready[bank],
-                ready_bank_head_row_i[bank]);
+                ready_bank_head_row_q[bank]);
             winner_id  = {ROB_ID_W{1'b0}};
 
             if (vacancy) begin
@@ -1163,6 +1164,21 @@ module PPE_SCHEDULER #(
         end
     end
 
+    // D1: capture the ROB age hints before the bank-local READY scan.
+    always @(posedge clk_i or negedge rst_ni) begin : ready_head_hint_state
+        integer bank;
+
+        if (!rst_ni) begin
+            for (bank = 0; bank < ADMIT_BANKS; bank = bank + 1) begin
+                ready_bank_head_row_q[bank] <= {ADMIT_ROW_W{1'b0}};
+            end
+        end else begin
+            for (bank = 0; bank < ADMIT_BANKS; bank = bank + 1) begin
+                ready_bank_head_row_q[bank] <= ready_bank_head_row_i[bank];
+            end
+        end
+    end
+
     // D0B/D0C: store issue metadata and the resolved dependency target.
     always @(posedge clk_i) begin : issue_entry_metadata
         integer entry;
@@ -1193,12 +1209,27 @@ module PPE_SCHEDULER #(
                 selected_seq_tag_q[fe] <= grant_seq_tag_q[fe];
                 selected_delay_q[fe] <= grant_delay_q[fe];
                 selected_dep_required_q[fe] <= grant_dep_required_q[fe];
-                case (grant_seq_tag_q[fe][DATA_BANK_W-1:0])
-                    2'd0: selected_packet_q[fe] <= source_bank_packet_i[0];
-                    2'd1: selected_packet_q[fe] <= source_bank_packet_i[1];
-                    2'd2: selected_packet_q[fe] <= source_bank_packet_i[2];
-                    default:
-                        selected_packet_q[fe] <= source_bank_packet_i[3];
+                /*
+                 * Matcher legality fixes the source-bank group: FE0/FE1
+                 * use banks 0/2 and FE2/FE3 use banks 1/3.  Tag bit [1]
+                 * therefore selects a local 2:1 response instead of a
+                 * four-way packet mux.
+                 */
+                case (fe)
+                    0, 1: begin
+                        if (grant_seq_tag_q[fe][1]) begin
+                            selected_packet_q[fe] <= source_bank_packet_i[2];
+                        end else begin
+                            selected_packet_q[fe] <= source_bank_packet_i[0];
+                        end
+                    end
+                    default: begin
+                        if (grant_seq_tag_q[fe][1]) begin
+                            selected_packet_q[fe] <= source_bank_packet_i[3];
+                        end else begin
+                            selected_packet_q[fe] <= source_bank_packet_i[1];
+                        end
+                    end
                 endcase
             end
         end

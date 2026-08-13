@@ -43,7 +43,13 @@ doc/lld.txt 为准；本文不重新定义这些文档中的协议。
                  │
                  ▼
   - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-  D1 Bank-local READY Nomination
+  D1a ROB Age-hint Capture
+      Scheduler 捕获四个 bank-local 的 ROB age hint，隔离 ROB 游标到 READY 扫描的
+      组合路径；该提示仅允许滞后一拍，不改变年龄顺序和合法性。
+                 │
+                 ▼
+  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+  D1b Bank-local READY Nomination
       四个交错 bank 各提名至多一个最老 READY entry，写入两个窄候选槽之一。
       候选槽只保存 seq、target、delay 和 dep_required。
                  │
@@ -83,15 +89,19 @@ Backend 不与主调度路径串成单一线性流水，而是与其并行运行
                          │
   FE return  ─────►  W0    completion qualification and writeback
                          │
-  ROB head   ─────►  R0    in-order retire / history / output register
+  ROB head   ─────►  R0a   in-order retire / history / retirement bundle
+                              │
+                              ▼
+                         R0b   retire-bundle capture / output mapping
 
   A0/A1：A0 更新 reservation 和 metadata，A1 提交 bank-local 原始 packet。
   G0：按 completion bypass、active ROB、retired history 的优先级解析依赖。
   W0：接收 FE 乱序返回，按完整 seq tag 资格检查后写回 ROB。
-  R0：从 ROB head 形成连续 DONE prefix，更新 history，并装载输出寄存器。
+  R0a：从 ROB head 形成连续 DONE prefix，更新 history，并产生 retirement bundle。
+  R0b：捕获 bundle，下一拍完成固定 lane 旋转并装载顶层输出寄存器。
 
-A0、G0、W0 和 R0 可以在同一周期处理不同 entry。R0 的输出寄存器装载、ROB
-释放、history 更新和输出 lane 指针推进属于同一个退休事件。
+A0、G0、W0 和 R0a 可以在同一周期处理不同 entry。R0a 的 ROB 释放和 history 更新
+不变；R0b 只增加一拍输出延迟，独立推进输出 lane 指针，不引入 ready/反压。
 
 ================================================================================
 4. Dependency event path
@@ -118,7 +128,7 @@ A0、G0、W0 和 R0 可以在同一周期处理不同 entry。R0 的输出寄存
   - 顶层输入和输出（包括 bkps）由寄存器驱动；内部 FE 接口允许组合通路。
   - D2A grant 一旦锁存不可撤销；D2B 必须消费该 grant。
   - D3 释放对应 ISSUE_SELECTED entry；候选窗不保存 packet 或 dependency data。
+  - R0b 的输出寄存器只使用已经捕获的 retirement bundle，输出端口仍保持寄存驱动。
   - ROB 是原始 packet、FE 结果、顺序退休和依赖权威数据的唯一所有者。
-  - FE 返回可乱序，R0 只退休从 ROB head 开始的连续 DONE prefix。
+  - FE 返回可乱序，R0a 只退休从 ROB head 开始的连续 DONE prefix。
   - 同一 FE 的未来返回日历不能出现目标周期冲突。
-

@@ -178,9 +178,9 @@ FE0/1组成的偶数组内匹配，Bank1/3只在FE2/3组成的
 奇数组内匹配；每组使用固定最大基数2x2网络，允许两个本地bank在组内借用FE，但不
 允许跨组匹配。匹配结果不可撤销。
 
-READY提名以ROB输出的4个bank-local退休row为扫描起点，在每个bank中优先发现最老的
-可派发entry。该row直接来自ROB退休游标，不增加全局年龄比较；候选way和组内匹配仍
-保持原有轮询公平机制。
+READY提名使用ROB输出的4个bank-local退休row年龄提示，在每个bank中优先发现最老的
+可派发entry。Scheduler先在D1边界捕获该提示，后续bank扫描使用上一拍的已寄存起点；
+该一拍提示只改变候选可见时延，不改变年龄投影、依赖合法性或候选way/组内轮询公平。
 
 Scheduler在D2A使用当周期calendar并行计算两个本地way的legal，选出至多一个合法way
 后执行固定2x2匹配。delay 3直接形成全合法向量，不读取future table。D2A捕获不可撤销grant；
@@ -297,8 +297,9 @@ ppe_retire_output是backend功能域内独立的最终输出子模块，负责�
   - 驱动同一级顶层out_valid/out_packet寄存器。
 
 ppe_retire_output不封装ppe_rob，也不转发allocation、依赖查询或writeback接口。
-ppe_top分别例化并连接两者。该拆分不增加ready或额外流水级；ROB状态释放、history
-写入、输出寄存器装载和start_lane更新仍发生在同一个退休上升沿。
+ppe_top分别例化并连接两者。retirement bundle先在ppe_retire_output内部捕获，下一拍
+再执行固定旋转并装载顶层输出寄存器；该边界不增加ready或反压接口，仅增加一拍输出延迟。
+ROB状态释放和history写入仍由ROB在原退休沿完成，start_lane与输出寄存器由输出模块独立维护。
 
 ================================================================================
 4. 高层数据流
@@ -353,12 +354,12 @@ history，也不得绕过ROB直接输出。
 4.5 保序退休
 
 ppe_rob从ROB head开始退休最多4个连续DONE报文，并向ppe_retire_output提供无空洞的逻辑
-退休前缀。退休事件同时完成：
+退休前缀。ROB退休事件完成顺序状态更新；ppe_retire_output在其后捕获并延迟一拍呈现输出：
 
-  - ppe_retire_output将结果映射并装入顶层输出寄存器；
   - 更新8-bank retired history；
   - 释放 ROB entry；
-  - 推进ROB head，并由ppe_retire_output推进输出lane指针。
+  - 推进ROB head；
+  - ppe_retire_output按捕获bundle映射并装入顶层输出寄存器，推进输出lane指针。
 
 严格保序可能产生 head-of-line blocking，这是功能要求。调度策略应避免无必要地延迟
 接近 ROB head 的可派发报文。
@@ -444,9 +445,10 @@ Backend不采用单一线性流水，而是包含四条并行通路：
   A0/A1：ROB Metadata Allocation / Bank-local Packet Commit
   G0：Dependency Status / Data Gather
   W0：FE Writeback
-  R0：In-order Retire / Registered Output
+  R0a：In-order Retire / Retirement Bundle
+  R0b：Retire Bundle Capture / Registered Output
 
-A0、G0、W0和R0可以在同周期处理不同ROB entry。它们共享的ROB状态必须由统一
+A0、G0、W0和R0a可以在同周期处理不同ROB entry；R0b只消费上一沿的退休bundle。它们共享的ROB状态必须由统一
 状态所有权和 next-state 逻辑协调。
 
 5.3 高层流水关系
@@ -457,7 +459,7 @@ A0、G0、W0和R0可以在同周期处理不同ROB entry。它们共享的ROB状
            ROB Reservation A0/A1               FE(fixed delay + 1 cycles)
                                                     |
                                                     v
-                                         Backend W0 -> R0 -> Output
+                                         Backend W0 -> R0a -> R0b -> Output
 
   D0A只预留ROB容量并形成寄存bundle；Backend A0与D0B commit并行，A1只提交上一沿
   已经捕获的bank-local packet。D0B中无依赖entry直接初始化为READY；只有依赖状态
@@ -510,11 +512,12 @@ commit有效时更新128 bit数据。RTL仅描述clock-enable语义，不手动�
 
 6.6 R0 多路退休
 
-R0需要完成连续DONE检查、最多4路数据选择、输出旋转和history更新。第一版保持
-逐周期4-wide退休。Head和逻辑retirement bundle在R0生成；entry清除和history写入由
-一项逐周期pending-retire寄存器在下一沿提交。提交前旧active entry继续提供依赖数据，
-提交后history接替，禁止产生不可用空窗。Occupancy使用寄存的上一周期retire_count释放
-credit；allocation容量可安全借用该已寄存且本沿必提交的credit，不依赖当前head扫描。
+R0需要完成连续DONE检查、最多4路数据选择和history更新。第一版保持逐周期4-wide
+退休。Head和逻辑retirement bundle在R0生成；entry清除和history写入由一项逐周期
+pending-retire寄存器在下一沿提交。提交前旧active entry继续提供依赖数据，提交后history
+接替，禁止产生不可用空窗。ppe_retire_output在ROB bundle之后增加一项内部capture寄存器，
+把输出旋转与ROB退休扫描解耦；Occupancy使用寄存的上一周期retire_count释放credit，
+allocation容量可安全借用该已寄存且本沿必提交的credit，不依赖当前head扫描。
 Active result的4-bank组织保证连续4个ROB ID分别落入不同bank。R0对每个bank只执行
 一次8:1行选择。物理head拆分为2 bit head bank和每bank一个3 bit row cursor，
 各bank直接以寄存cursor读取DONE和data；退休沿只推进被消费bank的cursor。
@@ -552,7 +555,7 @@ clock-gating推断机会并抑制无效lane宽数据翻转。
      一组grant寄存器和每FE 6项相对未来返回表；
   4) FE completion只写active ROB，只有retirement写8-bank history；
   5) grant后dependency gather按固定优先级支持最多4路读取，不在issue entry或候选窗复制宽依赖；
-  6) R0使用单级退休并直接更新顶层输出寄存器；
+  6) R0保持单级保序退休，ppe_retire_output在bundle后增加一拍capture再更新顶层输出寄存器；
   7) 不定义可综合的异常上报、恢复或全局锁死状态，内部一致性由验证侧检查。
   8) scheduler把32项issue状态静态划分为4个8项交错bank，每bank每周期提名至多1项
      并维护两个固定本地候选槽。D2A从每bank两个槽中选出至多1项，按bank奇偶参与
