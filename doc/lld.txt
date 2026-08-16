@@ -599,10 +599,12 @@ D0C为上一周期D0B提交的最多N个有依赖allocation发出小位宽状态
 
 Scheduler在D2A锁存grant时按source seq tag低2位直接更新对应bank的row和tag-high，
 无新请求的bank保持旧地址。Backend对4个bank分别读取原始packet；Scheduler按
-grant seq tag低2位把bank响应送入对应FE operand寄存器。gather_dep_required时，ROB先
-在窄query寄存器中保存target tag，再在其后的组合周期按completion bypass、active ROB
-和history顺序形成最终gather_dep_data；该数据经内部FE接口由FE输入寄存器采样。
-正常状态下读取必须命中，该路径不设ready、fallback或replay端口。
+grant seq tag低2位把bank响应送入对应FE operand寄存器。需要依赖时，Scheduler在同一
+D2A沿使用当前grant组合结果发出窄query，ROB锁存target tag和dep_required。D2A到D2B
+之间分别形成completion、active ROB和history候选数据/命中信息，D2B沿寄存这些候选；
+D3/FE周期只按completion、retirement/active、history顺序执行最终浅层选择，响应与
+selected packet/control保持同一FE槽位。正常状态下读取必须命中，该路径不设ready、
+fallback或replay端口。
 
 请求无效时响应定义为：
 
@@ -610,8 +612,8 @@ grant seq tag低2位把bank响应送入对应FE operand寄存器。gather_dep_re
   - 无对应grant时，source_bank_packet不被有效selected operand采样；
   - gather_dep_required=0时，gather_dep_data不具有语义。
 
-PPE_SCHEDULER直接管理请求资格、completion wakeup比较和gather响应语义适配，不设置中间
-dependency模块或额外流水边界。
+PPE_SCHEDULER直接管理请求资格、completion wakeup比较和gather响应语义适配；ROB内部
+增加D2B单拍候选响应寄存器，但不设置独立dependency模块或额外FE发射流水边界。
 
 5.4 Unified Scheduler Interfaces
 
@@ -654,11 +656,13 @@ FE0/1，Bank1/3只连接FE2/3。
 合法候选和一个合法FE。两个组不存在跨组请求、接受或retry逻辑。该网络保证一个候选
 和一个FE每周期至多获得一次grant，并在各自2x2合法矩阵内取得最大基数。
 
-Grant不可撤销。D2A沿锁存完整窄metadata和candidate one-hot。下一周期D2B使用one-hot
-删除对应候选、清candidate_present、将entry置为ISSUE_SELECTED，同时允许同bank空槽
-补入一个沿前READY entry；grant metadata并行驱动ROB gather并写future预约。D2B沿
-gather响应进入per-FE operand
-寄存器并送入FE，同时旧SELECTED entry转为FREE。接口没有ready、rollback或replay。
+Grant不可撤销。D2A沿锁存完整窄metadata和candidate one-hot，同时以当前grant的
+target_seq_tag/dep_required发起ROB依赖query。下一周期D2B使用one-hot删除对应候选、
+清candidate_present、将entry置为ISSUE_SELECTED，同时允许同bank空槽补入一个沿前READY
+entry；grant metadata写future预约。ROB在该D2B沿锁存与query对应的completion、active和
+history候选。D2B沿source packet、selected metadata和依赖候选进入per-FE operand路径，
+D3/FE周期只做浅层优先级选择并送入FE，同时旧SELECTED entry转为FREE。接口没有ready、
+rollback或replay。
 
 issue_valid=0时其余issue bundle字段输出0；下游使用
 
@@ -952,22 +956,24 @@ source row/tag-high请求。下一周期D2B以寄存target metadata请求ROB dep
 9. Scheduler D3：Operand Gather与FE Issue
 ================================================================================
 
-每路有效grant使用其seq tag低2位选择bank-local source packet；需要依赖时，ROB先锁存
-窄gather query，再在selected到FE的周期按completion bypass、active ROB、history优先级
-形成最终gather_dep_data。请求不设置ready或重放，合法调度下读取必须命中。
+每路有效grant使用其seq tag低2位选择bank-local source packet；需要依赖时，D2A沿发起
+窄gather query，ROB在D2A到D2B之间分别形成completion bypass、active ROB和history候选，
+并在D2B沿寄存候选命中和数据。D3/FE周期按completion bypass、retirement/active ROB、
+history优先级形成最终gather_dep_data。请求不设置ready或重放，合法调度下读取必须命中。
 
-source packet、issue metadata和selected valid在下一上升沿写入对应per-FE selected寄存器。
-沿后dependency data从ROB query对应的内部组合结果进入FE，由FE输入寄存器采样。该内部
-组合通路不改变顶层对外输出的寄存要求，也不增加FE发射周期。同沿将上一份selected entry
-释放为ISSUE_FREE。Selected释放和D2B候选删除使用完整有效FE集合检查对应物理entry。
-当前operand被消费时允许捕获下一份gather响应，因此不产生隔周期气泡。
+source packet、issue metadata和selected valid在下一上升沿写入对应per-FE selected寄存器；
+ROB同时在该D2B沿捕获D2A query对应的依赖候选。沿后D3/FE路径只对已寄存候选执行最终
+优先级选择，由FE输入寄存器采样。该内部组合通路不改变顶层对外输出的寄存要求，也不
+增加FE发射周期。同沿将上一份selected entry释放为ISSUE_FREE。Selected释放和D2B候选
+删除使用完整有效FE集合检查对应物理entry。当前operand被消费时允许捕获下一份query
+响应，因此不产生隔周期气泡。
 候选窗不保存packet或dependency，宽数据只存在于ROB和4份operand寄存器。
 
 grant metadata寄存器在grant_valid=0时保持旧值，跨模块gather tag不因valid=0而清零。
-ROB在gather请求侧只锁存窄target tag和dep_required；selected_valid每周期捕获
-grant_valid，selected metadata和source packet在selected_valid=0时内容不具有语义。
-ROB的最终dependency data在query寄存器之后组合产生，并通过内部FE接口送入FE输入
-寄存器；不额外复制scheduler宽候选寄存器，也不把grant_valid扇出到宽数据路径。
+ROB在D2A query侧锁存窄target tag和dep_required，并在D2B锁存每个来源的候选命中与
+数据；selected_valid每周期捕获grant_valid，selected metadata和source packet在
+selected_valid=0时内容不具有语义。D3/FE仅对D2B候选执行固定优先级选择，不把下一拍
+query的宽数据组合直通当前FE，也不把grant_valid扇出到宽候选寄存器的有效控制路径。
 
 future slot1表示下一completion采样沿。Scheduler每沿以slot1为每个FE寄存
 完整wb_pre_seq_tag和32 bit entry one-hot；slot1无效时one-hot清零并保持seq tag。
@@ -1041,21 +1047,24 @@ Source gather使用D2A寄存的bank-local row和tag-high索引。ROB valid、完
 11.2 Query Width
 
 D0C每周期最多提交N路status query，只返回dep_status_available，不要求切换128 bit数据。
-D3每周期最多提交ISSUE_WIDTH路dependency data query，每路返回128 bit data。同一target被多路
+D2A每周期最多提交ISSUE_WIDTH路dependency data query，每路在D2B形成候选响应；D3/FE每路
+返回最终128 bit data。同一target被多路
 请求命中时允许共享一次读取并广播；实现也可描述为等价的独立组合读取。
 每个query的target ROB ID、history ID、active完整tag命中和history完整tag命中只生成
 一次中间结果，并由available/data选择共同使用。RTL不增加运行时跨query合并器；综合
 工具可对相同target请求共享组合读取，独立读取仍是周期语义等价的合法实现。
-每路D3 query对四个completion lane并行形成one-hot完整tag命中，128 bit bypass data
-使用两级平衡OR归并；最终在ROB窄query寄存器之后按completion、active、history固定
-优先级选择。不得用source_resolved跨completion lane形成串行选择链。
+每路D2A query对四个completion lane并行形成one-hot完整tag命中，128 bit bypass data
+使用两级平衡OR归并；active和history分别形成局部候选并在D2B寄存。D3/FE在候选寄存器
+之后按completion、retirement/active、history固定优先级选择。不得用source_resolved跨
+completion lane形成串行选择链。
 
 11.3 Cycle Boundary Rules
 
 Completion bypass可以使D0C查询的entry或ISSUE_WAIT_DEP entry在W0写ROB的同一沿得到available状态，
-但该entry最早下一周期参加D2A，不允许同沿completion-to-FE直通。Retirement bypass
-读取沿前旧ROB数据，并优先于沿后可能复用同一ROB ID的新allocation。上升沿后，目标
-改由已更新history命中。该规则不依赖存储体未定义的read-during-write行为。
+但该entry最早下一周期参加D2A，不允许同沿completion-to-FE直通。D2A发起的依赖query
+在D2B沿采样当前completion/retirement事件；retirement bypass读取沿前旧ROB数据，并
+优先于沿后可能复用同一ROB ID的新allocation。D2B之后即使query寄存器接收下一条请求，
+当前grant仍使用已锁存候选。该规则不依赖存储体未定义的read-during-write行为。
 
 ================================================================================
 12. Backend W0：FE Writeback
@@ -1349,10 +1358,10 @@ HLD和LLD，不属于首版RTL编码时的自由选择。
 ================================================================================
 
   1) 同一issue entry不得被重复选择或重复派发。
-  2) selected entry、FE launch和future预约必须成对建立。
+  2) selected entry、依赖响应、FE launch和future预约必须成对建立。
   3) 有效future槽的seq_tag在返回前不得被覆盖。
   4) 依赖未满足时不得被select；ISSUE_SELECTED entry的source和所需依赖读取必须命中。
-  5) 依赖查询必须完整匹配seq_tag。
+  5) 依赖查询和D2B响应必须完整匹配seq_tag；D2A query不能被下一条query覆盖当前FE响应。
   6) FE返回只设置active ROB result并形成completion事件，不直接写retired history。
   7) Active ROB tag命中但result_valid=0时必须等待，禁止继续查询history。
   8) 退休只从ROB head开始并且只退休连续DONE entry。

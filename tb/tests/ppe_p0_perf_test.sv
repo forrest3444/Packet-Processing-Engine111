@@ -8,7 +8,7 @@
 class ppe_p0_perf_test extends uvm_test;
     `uvm_component_utils(ppe_p0_perf_test)
 
-    localparam int unsigned PACKET_COUNT = 1024;
+    localparam int unsigned PACKET_COUNT = 20480;
     localparam int unsigned TIMEOUT_CYCLES = 20000;
 
     ppe_env   env;

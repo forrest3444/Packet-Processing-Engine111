@@ -8,7 +8,7 @@
 class ppe_uniform_random_delay_seq extends uvm_sequence #(ppe_item);
     `uvm_object_utils(ppe_uniform_random_delay_seq)
 
-    localparam int unsigned PACKET_COUNT = 8192;
+    localparam int unsigned PACKET_COUNT = 163840;
 
     function new(string name = "ppe_uniform_random_delay_seq");
         super.new(name);

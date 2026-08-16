@@ -144,6 +144,54 @@ module PPE_INGRESS #(
         bkps_d = (slot_count_d == 2'd2);
     end
 
+    // I0: capture the external batch into the selected elastic-FIFO slot.
+    always @(posedge clk_i or negedge rst_ni) begin : slot_state_update
+        integer lane_idx;
+
+        if (!rst_ni) begin
+            slot_lane_valid_q[0] <= {N{1'b0}};
+            slot_lane_valid_q[1] <= {N{1'b0}};
+            slot_rd_ptr_q     <= 1'b0;
+            slot_wr_ptr_q     <= 1'b0;
+            slot_count_q      <= {SLOT_COUNT_W{1'b0}};
+            slot_packet_count_q[0] <= {LANE_COUNT_W{1'b0}};
+            slot_packet_count_q[1] <= {LANE_COUNT_W{1'b0}};
+        end else begin
+            if (slot_bank0_write) begin
+                slot_lane_valid_q[0] <= in_valid_i;
+                slot_packet_count_q[0] <= input_packet_count;
+                for (lane_idx = 0; lane_idx < N; lane_idx = lane_idx + 1) begin
+                    slot_packet_q[0][lane_idx] <= in_packet_i[lane_idx];
+                    slot_desc_q[0][lane_idx] <= in_desc_i[lane_idx];
+                end
+            end
+            if (slot_bank1_write) begin
+                slot_lane_valid_q[1] <= in_valid_i;
+                slot_packet_count_q[1] <= input_packet_count;
+                for (lane_idx = 0; lane_idx < N; lane_idx = lane_idx + 1) begin
+                    slot_packet_q[1][lane_idx] <= in_packet_i[lane_idx];
+                    slot_desc_q[1][lane_idx] <= in_desc_i[lane_idx];
+                end
+            end
+            if (capture_batch) begin
+                slot_wr_ptr_q <= ~slot_wr_ptr_q;
+            end
+            if (head_release) begin
+                slot_rd_ptr_q <= ~slot_rd_ptr_q;
+            end
+            slot_count_q <= slot_count_d;
+        end
+    end
+
+    // I0: register the backpressure result for the next external cycle.
+    always @(posedge clk_i or negedge rst_ni) begin : bkps_state_update
+        if (!rst_ni) begin
+            bkps_q <= 1'b1;
+        end else begin
+            bkps_q <= bkps_d;
+        end
+    end
+
     assign bkps_o = bkps_q;
 
     always @* begin : per_slot_metadata_decode
@@ -211,6 +259,39 @@ module PPE_INGRESS #(
         end
     end
 
+    // D0A: advance the dense sequence base when the FIFO head is reserved.
+    always @(posedge clk_i or negedge rst_ni) begin : sequence_state_update
+        if (!rst_ni) begin
+            next_seq_tag_q <= {SEQ_W{1'b0}};
+        end else if (reserve_batch) begin
+            next_seq_tag_q <= next_seq_tag_q
+                              + {{(SEQ_W-LANE_COUNT_W){1'b0}},
+                                  head_packet_count};
+        end
+    end
+
+    // D0A: register the reserved head metadata for the D0B commit bundle.
+    always @(posedge clk_i or negedge rst_ni) begin : allocation_commit_state
+        integer lane_idx;
+
+        if (!rst_ni) begin
+            alloc_commit_valid_q <= {N{1'b0}};
+        end else begin
+            alloc_commit_valid_q <=
+                head_lane_valid & {N{reserve_batch}};
+            if (slot_count_q != {SLOT_COUNT_W{1'b0}}) begin
+                for (lane_idx = 0; lane_idx < N; lane_idx = lane_idx + 1) begin
+                    alloc_commit_seq_tag_q[lane_idx] <= head_seq_tag[lane_idx];
+                    alloc_commit_target_seq_tag_q[lane_idx] <=
+                        head_target_seq_tag[lane_idx];
+                    alloc_commit_delay_q[lane_idx] <= head_delay[lane_idx];
+                end
+                alloc_commit_dep_required_q   <= head_dep_required;
+                alloc_commit_slot_q           <= slot_rd_ptr_q;
+            end
+        end
+    end
+
     always @* begin : allocation_commit_outputs
         integer lane_idx;
 
@@ -238,83 +319,6 @@ module PPE_INGRESS #(
                 alloc_commit_delay_q[output_lane];
         end
     endgenerate
-
-    always @(posedge clk_i or negedge rst_ni) begin : slot_state_update
-        integer lane_idx;
-
-        if (!rst_ni) begin
-            slot_lane_valid_q[0] <= {N{1'b0}};
-            slot_lane_valid_q[1] <= {N{1'b0}};
-            slot_rd_ptr_q     <= 1'b0;
-            slot_wr_ptr_q     <= 1'b0;
-            slot_count_q      <= {SLOT_COUNT_W{1'b0}};
-            slot_packet_count_q[0] <= {LANE_COUNT_W{1'b0}};
-            slot_packet_count_q[1] <= {LANE_COUNT_W{1'b0}};
-        end else begin
-            if (slot_bank0_write) begin
-                slot_lane_valid_q[0] <= in_valid_i;
-                slot_packet_count_q[0] <= input_packet_count;
-                for (lane_idx = 0; lane_idx < N; lane_idx = lane_idx + 1) begin
-                    slot_packet_q[0][lane_idx] <= in_packet_i[lane_idx];
-                    slot_desc_q[0][lane_idx] <= in_desc_i[lane_idx];
-                end
-            end
-            if (slot_bank1_write) begin
-                slot_lane_valid_q[1] <= in_valid_i;
-                slot_packet_count_q[1] <= input_packet_count;
-                for (lane_idx = 0; lane_idx < N; lane_idx = lane_idx + 1) begin
-                    slot_packet_q[1][lane_idx] <= in_packet_i[lane_idx];
-                    slot_desc_q[1][lane_idx] <= in_desc_i[lane_idx];
-                end
-            end
-            if (capture_batch) begin
-                slot_wr_ptr_q <= ~slot_wr_ptr_q;
-            end
-            if (head_release) begin
-                slot_rd_ptr_q <= ~slot_rd_ptr_q;
-            end
-            slot_count_q <= slot_count_d;
-        end
-    end
-
-    always @(posedge clk_i or negedge rst_ni) begin : sequence_state_update
-        if (!rst_ni) begin
-            next_seq_tag_q <= {SEQ_W{1'b0}};
-        end else if (reserve_batch) begin
-            next_seq_tag_q <= next_seq_tag_q
-                              + {{(SEQ_W-LANE_COUNT_W){1'b0}},
-                                  head_packet_count};
-        end
-    end
-
-    always @(posedge clk_i or negedge rst_ni) begin : allocation_commit_state
-        integer lane_idx;
-
-        if (!rst_ni) begin
-            alloc_commit_valid_q <= {N{1'b0}};
-        end else begin
-            alloc_commit_valid_q <=
-                head_lane_valid & {N{reserve_batch}};
-            if (slot_count_q != {SLOT_COUNT_W{1'b0}}) begin
-                for (lane_idx = 0; lane_idx < N; lane_idx = lane_idx + 1) begin
-                    alloc_commit_seq_tag_q[lane_idx] <= head_seq_tag[lane_idx];
-                    alloc_commit_target_seq_tag_q[lane_idx] <=
-                        head_target_seq_tag[lane_idx];
-                    alloc_commit_delay_q[lane_idx] <= head_delay[lane_idx];
-                end
-                alloc_commit_dep_required_q   <= head_dep_required;
-                alloc_commit_slot_q           <= slot_rd_ptr_q;
-            end
-        end
-    end
-
-    always @(posedge clk_i or negedge rst_ni) begin : bkps_state_update
-        if (!rst_ni) begin
-            bkps_q <= 1'b1;
-        end else begin
-            bkps_q <= bkps_d;
-        end
-    end
 
 endmodule
 

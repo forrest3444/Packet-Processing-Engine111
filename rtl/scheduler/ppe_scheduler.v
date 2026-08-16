@@ -35,7 +35,7 @@ module PPE_SCHEDULER #(
     output reg  [`PPE_ROB_TAG_HI_W-1:0]              source_bank_tag_hi_o [0:`PPE_N-1],
     input  wire [PACKET_W-1:0]                       source_bank_packet_i [0:`PPE_N-1],
 
-    // D2B/G0: authoritative dependency-data gather.
+    // D2A/G0: launch the dependency-data prefetch for the locked grant.
     output reg  [`PPE_FE_NUM-1:0]                    gather_dep_required_o,
     output reg  [`PPE_SEQ_W-1:0]                     gather_target_seq_tag_o [0:`PPE_FE_NUM-1],
     input  wire [PACKET_W-1:0]                       gather_dep_data_i [0:`PPE_FE_NUM-1],
@@ -191,7 +191,6 @@ module PPE_SCHEDULER #(
     reg [1:0] shortlist_legal [0:FE_NUM-1];
     reg [2:0] shortlist_pending_block [0:FE_NUM-1];
     reg [1:0] candidate_legal [0:CAND_WINDOW_DEPTH-1];
-    reg [2:0] candidate_pending_block [0:CAND_WINDOW_DEPTH-1];
     reg [FE_NUM-1:0] grant_valid_d;
     reg [CAND_WINDOW_DEPTH-1:0] grant_onehot_d;
     reg [SEQ_W-1:0] grant_seq_tag_d [0:FE_NUM-1];
@@ -225,36 +224,54 @@ module PPE_SCHEDULER #(
         input       rr;
         reg         straight;
         reg         cross_map;
+        reg         valid0_legal;
+        reg         valid1_legal;
         begin
             local_pair_match = 4'b0000;
             straight = valid0 && valid1 && legal0[0] && legal1[1];
             cross_map = valid0 && valid1 && legal0[1] && legal1[0];
+            valid0_legal = valid0 && (|legal0);
+            valid1_legal = valid1 && (|legal1);
 
             if (straight || cross_map) begin
                 if (straight && (!cross_map || !rr)) begin
-                    local_pair_match[0] = 1'b1;
-                    local_pair_match[3] = 1'b1;
+                    local_pair_match = 4'b1001;
                 end else begin
-                    local_pair_match[1] = 1'b1;
-                    local_pair_match[2] = 1'b1;
+                    local_pair_match = 4'b0110;
                 end
             end else if (!rr) begin
-                if (valid0 && (|legal0)) begin
-                    if (legal0[0]) local_pair_match[0] = 1'b1;
-                    else           local_pair_match[1] = 1'b1;
-                end else if (valid1 && (|legal1)) begin
-                    if (legal1[1]) local_pair_match[3] = 1'b1;
-                    else           local_pair_match[2] = 1'b1;
+                if (valid0_legal) begin
+                    if (legal0[0]) local_pair_match = 4'b0001;
+                    else           local_pair_match = 4'b0010;
+                end else if (valid1_legal) begin
+                    if (legal1[1]) local_pair_match = 4'b1000;
+                    else           local_pair_match = 4'b0100;
                 end
             end else begin
-                if (valid1 && (|legal1)) begin
-                    if (legal1[0]) local_pair_match[2] = 1'b1;
-                    else           local_pair_match[3] = 1'b1;
-                end else if (valid0 && (|legal0)) begin
-                    if (legal0[1]) local_pair_match[1] = 1'b1;
-                    else           local_pair_match[0] = 1'b1;
+                if (valid1_legal) begin
+                    if (legal1[0]) local_pair_match = 4'b0100;
+                    else           local_pair_match = 4'b1000;
+                end else if (valid0_legal) begin
+                    if (legal0[1]) local_pair_match = 4'b0010;
+                    else           local_pair_match = 4'b0001;
                 end
             end
+        end
+    endfunction
+
+    // Only the selected shortlist entry needs its pending-block decode.  The
+    // legality calculation above still evaluates every candidate, but keeping
+    // this decode after shortlist selection avoids broadcasting a 3-bit value
+    // from every candidate way through the matcher.
+    function [2:0] decode_pending_block;
+        input [DELAY_W-1:0] delay;
+        begin
+            case (delay)
+                2'd0:    decode_pending_block = 3'b000;
+                2'd1:    decode_pending_block = 3'b001;
+                2'd2:    decode_pending_block = 3'b010;
+                default: decode_pending_block = 3'b100;
+            endcase
         end
     endfunction
 
@@ -360,6 +377,9 @@ module PPE_SCHEDULER #(
         end
     endfunction
 
+    //==========================================================================
+    // Pipeline-ordered combinational/control logic: D0B and D0C.
+    //==========================================================================
     // D0B: decode the committed allocation bundle into local issue banks.
     // The following combinational blocks feed the D0B state updates below.
     always @* begin : allocation_bank_route
@@ -445,30 +465,26 @@ module PPE_SCHEDULER #(
         end
     end
 
-    // D0B -> D0C: capture dependency probes for the next status lookup.
-    always @(posedge clk_i or negedge rst_ni)
-        begin : dependency_status_pipeline
+    // D0C: expand status responses into entry-local update vectors.
+    always @* begin : dependency_status_pending_decode
+        integer entry;
         integer lane;
 
-        if (!rst_ni) begin
-            dep_status_valid_q <= {N{1'b0}};
-            for (lane = 0; lane < N; lane = lane + 1)
-                dep_status_offset_q[lane] <= {MAX_DEP{1'b0}};
-        end else begin
-            for (lane = 0; lane < N; lane = lane + 1) begin
-                dep_status_valid_q[lane] <=
-                    issue_alloc_valid_i[lane]
-                    && alloc_dep_required_i[lane];
-                if (issue_alloc_valid_i[lane]
-                    && alloc_dep_required_i[lane]) begin
-                    dep_status_target_seq_tag_q[lane] <=
-                        alloc_target_seq_tag_i[lane];
-                    dep_status_offset_q[lane] <=
-                        decode_dep_offset(alloc_seq_tag_i[lane],
-                                          alloc_target_seq_tag_i[lane]);
-                    dep_status_consumer_id_q[lane] <=
-                        alloc_seq_tag_i[lane][ROB_ID_W-1:0];
-                end
+        dep_status_pending_entry   = {ISSUE_DEPTH{1'b0}};
+        dep_status_available_entry = {ISSUE_DEPTH{1'b0}};
+        for (entry = 0; entry < ISSUE_DEPTH; entry = entry + 1) begin
+            dep_status_target_entry[entry] = {SEQ_W{1'b0}};
+        end
+        for (lane = 0; lane < N; lane = lane + 1) begin
+            if (dep_status_valid_q[lane]) begin
+                dep_status_pending_entry[
+                    dep_status_consumer_id_q[lane]] = 1'b1;
+                dep_status_available_entry[
+                    dep_status_consumer_id_q[lane]] =
+                    dep_status_available_i[lane];
+                dep_status_target_entry[
+                    dep_status_consumer_id_q[lane]] =
+                    dep_status_target_seq_tag_q[lane];
             end
         end
     end
@@ -594,349 +610,56 @@ module PPE_SCHEDULER #(
         end
     end
 
-    // D2B: derive early-wakeup tokens from the grant producer's waiter row.
-    always @* begin : reverse_waiter_early_wakeup
-        integer fe;
-        integer offset;
-        integer producer;
-
-        early_wake_hit_d   = {ISSUE_DEPTH{1'b0}};
-        early_wake_delay_d = {ISSUE_DEPTH{1'b0}};
-        for (producer = 0; producer < ISSUE_DEPTH;
-             producer = producer + 1) begin
-            waiter_take[producer] = {MAX_DEP{1'b0}};
-            for (fe = 0; fe < FE_NUM; fe = fe + 1) begin
-                if (grant_valid_q[fe]
-                    && (grant_seq_tag_q[fe][ROB_ID_W-1:0]
-                        == producer[ROB_ID_W-1:0])
-                    && (issue_seq_tag_q[producer]
-                        == grant_seq_tag_q[fe])) begin
-                    waiter_take[producer] = waiter_take[producer]
-                                                   | waiter_q[producer];
-                    for (offset = 1; offset <= MAX_DEP;
-                         offset = offset + 1) begin
-                        if (waiter_q[producer][offset-1]) begin
-                            if (grant_delay_q[fe] == 2'd3) begin
-                                early_wake_delay_d[
-                                    (producer + offset) % ISSUE_DEPTH] = 1'b1;
-                            end else begin
-                                early_wake_hit_d[
-                                    (producer + offset) % ISSUE_DEPTH] = 1'b1;
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    // W0: clear waiter rows when a producer is allocated or completes.
-    always @* begin : reverse_waiter_clear_decode
-        integer fe;
-        integer producer;
-
-        waiter_clear = alloc_entry_write_en;
-        for (producer = 0; producer < ISSUE_DEPTH;
-             producer = producer + 1) begin
-            for (fe = 0; fe < FE_NUM; fe = fe + 1) begin
-                if (completion_valid_i[fe]
-                    && (completion_seq_tag_i[fe][ROB_ID_W-1:0]
-                        == producer[ROB_ID_W-1:0])
-                    && (issue_seq_tag_q[producer]
-                        == completion_seq_tag_i[fe])) begin
-                    waiter_clear[producer] = 1'b1;
-                end
-            end
-        end
-    end
-
-    // D2B/W0: commit waiter rows and pipeline early-wakeup tokens.
-    always @(posedge clk_i or negedge rst_ni) begin : reverse_waiter_state
-        integer producer;
-
-        if (!rst_ni) begin
-            early_wake_hit_q   <= {ISSUE_DEPTH{1'b0}};
-            early_wake_delay_q <= {ISSUE_DEPTH{1'b0}};
-            for (producer = 0; producer < ISSUE_DEPTH;
-                 producer = producer + 1) begin
-                waiter_q[producer] <= {MAX_DEP{1'b0}};
-            end
-        end else begin
-            early_wake_hit_q   <= early_wake_hit_d | early_wake_delay_q;
-            early_wake_delay_q <= early_wake_delay_d;
-            for (producer = 0; producer < ISSUE_DEPTH;
-                 producer = producer + 1) begin
-                if (waiter_clear[producer]) begin
-                    waiter_q[producer] <= {MAX_DEP{1'b0}};
-                end else begin
-                    waiter_q[producer] <=
-                        (waiter_q[producer] & ~waiter_take[producer])
-                        | waiter_set[producer];
-                end
-            end
-        end
-    end
-
-    // D0C: expand status responses into entry-local update vectors.
-    always @* begin : dependency_status_pending_decode
-        integer entry;
+    // D0B -> D0C: capture dependency probes for the next status lookup.
+    always @(posedge clk_i or negedge rst_ni)
+        begin : dependency_status_pipeline
         integer lane;
 
-        dep_status_pending_entry   = {ISSUE_DEPTH{1'b0}};
-        dep_status_available_entry = {ISSUE_DEPTH{1'b0}};
-        for (entry = 0; entry < ISSUE_DEPTH; entry = entry + 1) begin
-            dep_status_target_entry[entry] = {SEQ_W{1'b0}};
-        end
-        for (lane = 0; lane < N; lane = lane + 1) begin
-            if (dep_status_valid_q[lane]) begin
-                dep_status_pending_entry[
-                    dep_status_consumer_id_q[lane]] = 1'b1;
-                dep_status_available_entry[
-                    dep_status_consumer_id_q[lane]] =
-                    dep_status_available_i[lane];
-                dep_status_target_entry[
-                    dep_status_consumer_id_q[lane]] =
-                    dep_status_target_seq_tag_q[lane];
+        if (!rst_ni) begin
+            dep_status_valid_q <= {N{1'b0}};
+            for (lane = 0; lane < N; lane = lane + 1)
+                dep_status_offset_q[lane] <= {MAX_DEP{1'b0}};
+        end else begin
+            for (lane = 0; lane < N; lane = lane + 1) begin
+                dep_status_valid_q[lane] <=
+                    issue_alloc_valid_i[lane]
+                    && alloc_dep_required_i[lane];
+                if (issue_alloc_valid_i[lane]
+                    && alloc_dep_required_i[lane]) begin
+                    dep_status_target_seq_tag_q[lane] <=
+                        alloc_target_seq_tag_i[lane];
+                    dep_status_offset_q[lane] <=
+                        decode_dep_offset(alloc_seq_tag_i[lane],
+                                          alloc_target_seq_tag_i[lane]);
+                    dep_status_consumer_id_q[lane] <=
+                        alloc_seq_tag_i[lane][ROB_ID_W-1:0];
+                end
             end
         end
     end
 
-    // D3: identify selected entries released after FE input capture.
-    always @* begin : selected_release_decode
+    // D0B/D0C: store issue metadata and the resolved dependency target.
+    always @(posedge clk_i) begin : issue_entry_metadata
         integer entry;
-        integer fe;
 
-        selected_release_hit = {ISSUE_DEPTH{1'b0}};
         for (entry = 0; entry < ISSUE_DEPTH; entry = entry + 1) begin
-            for (fe = 0; fe < FE_NUM; fe = fe + 1) begin
-                if (selected_valid_q[fe]
-                    && (selected_seq_tag_q[fe][ROB_ID_W-1:0]
-                        == entry[ROB_ID_W-1:0])) begin
-                    selected_release_hit[entry] = 1'b1;
-                end
+            if (alloc_entry_write_en[entry]) begin
+                issue_seq_tag_q[entry] <= alloc_entry_seq_tag[entry];
+                issue_delay_q[entry] <= alloc_entry_delay[entry];
+                issue_dep_required_q[entry] <=
+                    alloc_entry_dep_required[entry];
+            end
+            if (dep_status_pending_entry[entry]) begin
+                issue_target_seq_tag_q[entry] <=
+                    dep_status_target_entry[entry];
             end
         end
     end
 
-    // W0: completion tags provide the dependency-wakeup safety net.
-    always @* begin : completion_wakeup_scan
-        integer entry;
-        integer fe;
-
-        wake_hit = {ISSUE_DEPTH{1'b0}};
-        for (entry = 0; entry < ISSUE_DEPTH; entry = entry + 1) begin
-            for (fe = 0; fe < FE_NUM; fe = fe + 1) begin
-                if (completion_valid_i[fe]
-                    && (issue_state_q[entry] == ISSUE_WAIT_DEP)
-                    && !dep_status_pending_entry[entry]
-                    && (issue_target_seq_tag_q[entry]
-                        == completion_seq_tag_i[fe])) begin
-                    wake_hit[entry] = 1'b1;
-                end
-            end
-        end
-    end
-
-    // D2A: calculate FE-calendar legality for each candidate way.
-    always @* begin : candidate_way_legality
-        integer bank;
-        integer slot;
-        integer way;
-        integer fe;
-        reg [1:0] legal;
-
-        legal                   = 2'b00;
-
-        for (slot = 0; slot < CAND_WINDOW_DEPTH; slot = slot + 1) begin
-            candidate_legal[slot] = 2'b00;
-            candidate_pending_block[slot] = 3'b000;
-        end
-
-        for (bank = 0; bank < FE_NUM; bank = bank + 1) begin
-            for (way = 0; way < 2; way = way + 1) begin
-                slot  = (way * FE_NUM) + bank;
-                legal = 2'b00;
-                case (candidate_delay_q[slot])
-                    2'd0: begin
-                        for (fe = 0; fe < 2; fe = fe + 1) begin
-                            if ((bank == 0) || (bank == 2)) begin
-                                legal[fe] = !future_valid_q[fe][3]
-                                    && !grant_pending_block_q[fe][0];
-                            end else begin
-                                legal[fe] = !future_valid_q[fe+2][3]
-                                    && !grant_pending_block_q[fe+2][0];
-                            end
-                        end
-                    end
-                    2'd1: begin
-                        candidate_pending_block[slot][0] = 1'b1;
-                        for (fe = 0; fe < 2; fe = fe + 1) begin
-                            if ((bank == 0) || (bank == 2)) begin
-                                legal[fe] = !future_valid_q[fe][4]
-                                    && !grant_pending_block_q[fe][1];
-                            end else begin
-                                legal[fe] = !future_valid_q[fe+2][4]
-                                    && !grant_pending_block_q[fe+2][1];
-                            end
-                        end
-                    end
-                    2'd2: begin
-                        candidate_pending_block[slot][1] = 1'b1;
-                        for (fe = 0; fe < 2; fe = fe + 1) begin
-                            if ((bank == 0) || (bank == 2)) begin
-                                legal[fe] = !future_valid_q[fe][5]
-                                    && !grant_pending_block_q[fe][2];
-                            end else begin
-                                legal[fe] = !future_valid_q[fe+2][5]
-                                    && !grant_pending_block_q[fe+2][2];
-                            end
-                        end
-                    end
-                    default: begin
-                        legal = 2'b11;
-                        candidate_pending_block[slot][2] = 1'b1;
-                    end
-                endcase
-                candidate_legal[slot] = legal;
-            end
-        end
-    end
-
-    // D2A: choose one legal way per candidate bank for the shortlist.
-    always @* begin : candidate_shortlist
-        integer bank;
-        integer slot;
-        reg way0_available;
-        reg way1_available;
-        reg way0_legal;
-        reg way1_legal;
-
-        shortlist_valid_d        = {FE_NUM{1'b0}};
-        shortlist_dep_required_d = {FE_NUM{1'b0}};
-        candidate_pending        = grant_onehot_q;
-        way0_available           = 1'b0;
-        way1_available           = 1'b0;
-        way0_legal               = 1'b0;
-        way1_legal               = 1'b0;
-
-        for (bank = 0; bank < FE_NUM; bank = bank + 1) begin
-            shortlist_seq_tag_d[bank]        = {SEQ_W{1'b0}};
-            shortlist_target_seq_tag_d[bank] = {SEQ_W{1'b0}};
-            shortlist_delay_d[bank]          = {DELAY_W{1'b0}};
-            shortlist_onehot_d[bank]         = {CAND_WINDOW_DEPTH{1'b0}};
-            shortlist_legal[bank]            = 2'b00;
-            shortlist_pending_block[bank]    = 3'b000;
-            way0_available = candidate_valid_q[bank]
-                && !candidate_pending[bank];
-            way1_available = candidate_valid_q[FE_NUM+bank]
-                && !candidate_pending[FE_NUM+bank];
-            way0_legal = way0_available
-                && (|candidate_legal[bank]);
-            way1_legal = way1_available
-                && (|candidate_legal[FE_NUM+bank]);
-            slot = bank;
-            if (way1_legal
-                && (!way0_legal || candidate_way_rr_q[bank])) begin
-                slot = FE_NUM + bank;
-            end
-
-            if (way0_legal || way1_legal) begin
-                shortlist_valid_d[bank] = 1'b1;
-                shortlist_onehot_d[bank][slot] = 1'b1;
-                shortlist_seq_tag_d[bank] = candidate_seq_tag_q[slot];
-                shortlist_target_seq_tag_d[bank] =
-                    candidate_target_seq_tag_q[slot];
-                shortlist_delay_d[bank] = candidate_delay_q[slot];
-                shortlist_dep_required_d[bank] =
-                    candidate_dep_required_q[slot];
-                shortlist_legal[bank] = candidate_legal[slot];
-                shortlist_pending_block[bank] =
-                    candidate_pending_block[slot];
-            end
-        end
-    end
-
-    // D2A: perform the fixed local 2x2 candidate-to-FE matches.
-    always @* begin : fixed_local_pair_match
-        integer candidate;
-        integer fe;
-        reg [FE_NUM-1:0] accept [0:FE_NUM-1];
-        reg [3:0] even_match;
-        reg [3:0] odd_match;
-
-        for (candidate = 0; candidate < FE_NUM;
-             candidate = candidate + 1) begin
-            accept[candidate] = {FE_NUM{1'b0}};
-        end
-        even_match        = local_pair_match(
-            shortlist_valid_d[0], shortlist_valid_d[2],
-            shortlist_legal[0], shortlist_legal[2], group_rr_q[0]);
-        odd_match         = local_pair_match(
-            shortlist_valid_d[1], shortlist_valid_d[3],
-            shortlist_legal[1], shortlist_legal[3], group_rr_q[1]);
-
-        accept[0][0] = even_match[0];
-        accept[0][1] = even_match[1];
-        accept[2][0] = even_match[2];
-        accept[2][1] = even_match[3];
-        accept[1][2] = odd_match[0];
-        accept[1][3] = odd_match[1];
-        accept[3][2] = odd_match[2];
-        accept[3][3] = odd_match[3];
-
-        grant_valid_d     = {FE_NUM{1'b0}};
-        grant_onehot_d    = {CAND_WINDOW_DEPTH{1'b0}};
-        grant_dep_required_d = {FE_NUM{1'b0}};
-        for (fe = 0; fe < FE_NUM; fe = fe + 1) begin
-            grant_seq_tag_d[fe]        = {SEQ_W{1'b0}};
-            grant_target_seq_tag_d[fe] = {SEQ_W{1'b0}};
-            grant_delay_d[fe]          = {DELAY_W{1'b0}};
-            grant_pending_block_d[fe]  = 3'b000;
-        end
-
-        for (fe = 0; fe < FE_NUM; fe = fe + 1)
-            for (candidate = 0; candidate < FE_NUM;
-                 candidate = candidate + 1)
-                if (accept[candidate][fe]) begin
-                    grant_valid_d[fe] = 1'b1;
-                    grant_onehot_d = grant_onehot_d
-                        | shortlist_onehot_d[candidate];
-                    grant_pending_block_d[fe] =
-                        shortlist_pending_block[candidate];
-                    grant_seq_tag_d[fe] = shortlist_seq_tag_d[candidate];
-                    grant_target_seq_tag_d[fe] =
-                        shortlist_target_seq_tag_d[candidate];
-                    grant_delay_d[fe] = shortlist_delay_d[candidate];
-                    grant_dep_required_d[fe] =
-                        shortlist_dep_required_d[candidate];
-                end
-    end
-
-    // D2B: form bank-local source-packet gather requests from the grant.
-    always @* begin : source_bank_request_decode
-        integer bank;
-        integer fe;
-        reg [DATA_BANK_W-1:0] source_bank;
-
-        source_bank_update_en = {ADMIT_BANKS{1'b0}};
-        source_bank = {DATA_BANK_W{1'b0}};
-        for (bank = 0; bank < ADMIT_BANKS; bank = bank + 1) begin
-            source_bank_row_d[bank] = {ADMIT_ROW_W{1'b0}};
-            source_bank_tag_hi_d[bank] = {ROB_TAG_HI_W{1'b0}};
-        end
-        for (fe = 0; fe < FE_NUM; fe = fe + 1) begin
-            source_bank = grant_seq_tag_d[fe][DATA_BANK_W-1:0];
-            if (grant_valid_d[fe]) begin
-                source_bank_update_en[source_bank] = 1'b1;
-                source_bank_row_d[source_bank] =
-                    grant_seq_tag_d[fe][DATA_BANK_W +: ADMIT_ROW_W];
-                source_bank_tag_hi_d[source_bank] =
-                    grant_seq_tag_d[fe][ROB_ID_W +: ROB_TAG_HI_W];
-            end
-        end
-    end
-
-    // D2B: decode the registered grant into candidate and issue-entry removals.
+    //==========================================================================
+    // Pipeline-ordered combinational/control logic: D1.
+    //==========================================================================
+    // D2B feedback used by the D1 candidate discovery and refill logic.
     always @* begin : candidate_removal_decode
         integer fe;
         integer entry;
@@ -1044,6 +767,306 @@ module PPE_SCHEDULER #(
         end
     end
 
+    // D1: capture the ROB age hints before the bank-local READY scan.
+    always @(posedge clk_i or negedge rst_ni) begin : ready_head_hint_state
+        integer bank;
+
+        if (!rst_ni) begin
+            for (bank = 0; bank < ADMIT_BANKS; bank = bank + 1) begin
+                ready_bank_head_row_q[bank] <= {ADMIT_ROW_W{1'b0}};
+            end
+        end else begin
+            for (bank = 0; bank < ADMIT_BANKS; bank = bank + 1) begin
+                ready_bank_head_row_q[bank] <= ready_bank_head_row_i[bank];
+            end
+        end
+    end
+
+    //==========================================================================
+    // Pipeline-ordered combinational/control logic: D2A.
+    //==========================================================================
+    // D2A: calculate FE-calendar legality for each candidate way.
+    always @* begin : candidate_way_legality
+        integer bank;
+        integer slot;
+        integer way;
+        integer fe;
+        reg [1:0] legal;
+
+        legal                   = 2'b00;
+
+        for (slot = 0; slot < CAND_WINDOW_DEPTH; slot = slot + 1) begin
+            candidate_legal[slot] = 2'b00;
+        end
+
+        for (bank = 0; bank < FE_NUM; bank = bank + 1) begin
+            for (way = 0; way < 2; way = way + 1) begin
+                slot  = (way * FE_NUM) + bank;
+                legal = 2'b00;
+                case (candidate_delay_q[slot])
+                    2'd0: begin
+                        for (fe = 0; fe < 2; fe = fe + 1) begin
+                            if ((bank == 0) || (bank == 2)) begin
+                                legal[fe] = !future_valid_q[fe][3]
+                                    && !grant_pending_block_q[fe][0];
+                            end else begin
+                                legal[fe] = !future_valid_q[fe+2][3]
+                                    && !grant_pending_block_q[fe+2][0];
+                            end
+                        end
+                    end
+                    2'd1: begin
+                        for (fe = 0; fe < 2; fe = fe + 1) begin
+                            if ((bank == 0) || (bank == 2)) begin
+                                legal[fe] = !future_valid_q[fe][4]
+                                    && !grant_pending_block_q[fe][1];
+                            end else begin
+                                legal[fe] = !future_valid_q[fe+2][4]
+                                    && !grant_pending_block_q[fe+2][1];
+                            end
+                        end
+                    end
+                    2'd2: begin
+                        for (fe = 0; fe < 2; fe = fe + 1) begin
+                            if ((bank == 0) || (bank == 2)) begin
+                                legal[fe] = !future_valid_q[fe][5]
+                                    && !grant_pending_block_q[fe][2];
+                            end else begin
+                                legal[fe] = !future_valid_q[fe+2][5]
+                                    && !grant_pending_block_q[fe+2][2];
+                            end
+                        end
+                    end
+                    default: begin
+                        legal = 2'b11;
+                    end
+                endcase
+                candidate_legal[slot] = legal;
+            end
+        end
+    end
+
+    // D2A: choose one legal way per candidate bank for the shortlist.
+    always @* begin : candidate_shortlist
+        integer bank;
+        integer slot;
+        reg way0_available;
+        reg way1_available;
+        reg way0_legal;
+        reg way1_legal;
+
+        shortlist_valid_d        = {FE_NUM{1'b0}};
+        shortlist_dep_required_d = {FE_NUM{1'b0}};
+        candidate_pending        = grant_onehot_q;
+        way0_available           = 1'b0;
+        way1_available           = 1'b0;
+        way0_legal               = 1'b0;
+        way1_legal               = 1'b0;
+
+        for (bank = 0; bank < FE_NUM; bank = bank + 1) begin
+            shortlist_seq_tag_d[bank]        = {SEQ_W{1'b0}};
+            shortlist_target_seq_tag_d[bank] = {SEQ_W{1'b0}};
+            shortlist_delay_d[bank]          = {DELAY_W{1'b0}};
+            shortlist_onehot_d[bank]         = {CAND_WINDOW_DEPTH{1'b0}};
+            shortlist_legal[bank]            = 2'b00;
+            shortlist_pending_block[bank]    = 3'b000;
+            way0_available = candidate_valid_q[bank]
+                && !candidate_pending[bank];
+            way1_available = candidate_valid_q[FE_NUM+bank]
+                && !candidate_pending[FE_NUM+bank];
+            way0_legal = way0_available
+                && (|candidate_legal[bank]);
+            way1_legal = way1_available
+                && (|candidate_legal[FE_NUM+bank]);
+            slot = bank;
+            if (way1_legal
+                && (!way0_legal || candidate_way_rr_q[bank])) begin
+                slot = FE_NUM + bank;
+            end
+
+            if (way0_legal || way1_legal) begin
+                shortlist_valid_d[bank] = 1'b1;
+                shortlist_onehot_d[bank][slot] = 1'b1;
+                shortlist_seq_tag_d[bank] = candidate_seq_tag_q[slot];
+                shortlist_target_seq_tag_d[bank] =
+                    candidate_target_seq_tag_q[slot];
+                shortlist_delay_d[bank] = candidate_delay_q[slot];
+                shortlist_dep_required_d[bank] =
+                    candidate_dep_required_q[slot];
+                shortlist_legal[bank] = candidate_legal[slot];
+                shortlist_pending_block[bank] =
+                    decode_pending_block(candidate_delay_q[slot]);
+            end
+        end
+    end
+
+    // D2A: perform the fixed local 2x2 candidate-to-FE matches.
+    always @* begin : fixed_local_pair_match
+        integer fe;
+        reg [3:0] even_match;
+        reg [3:0] odd_match;
+
+        even_match        = local_pair_match(
+            shortlist_valid_d[0], shortlist_valid_d[2],
+            shortlist_legal[0], shortlist_legal[2], group_rr_q[0]);
+        odd_match         = local_pair_match(
+            shortlist_valid_d[1], shortlist_valid_d[3],
+            shortlist_legal[1], shortlist_legal[3], group_rr_q[1]);
+
+        grant_valid_d     = {FE_NUM{1'b0}};
+        grant_onehot_d    = {CAND_WINDOW_DEPTH{1'b0}};
+        grant_dep_required_d = {FE_NUM{1'b0}};
+        for (fe = 0; fe < FE_NUM; fe = fe + 1) begin
+            grant_seq_tag_d[fe]        = {SEQ_W{1'b0}};
+            grant_target_seq_tag_d[fe] = {SEQ_W{1'b0}};
+            grant_delay_d[fe]          = {DELAY_W{1'b0}};
+            grant_pending_block_d[fe]  = 3'b000;
+        end
+
+        // The matcher is fixed to two independent 2x2 groups.  Spell out the
+        // eight possible edges so the synthesis cone does not contain an
+        // intermediate candidate-by-FE accept matrix and nested variable
+        // selection loops.
+        if (even_match[0]) begin
+            grant_valid_d[0] = 1'b1;
+            grant_onehot_d = grant_onehot_d | shortlist_onehot_d[0];
+            grant_pending_block_d[0] = shortlist_pending_block[0];
+            grant_seq_tag_d[0] = shortlist_seq_tag_d[0];
+            grant_target_seq_tag_d[0] = shortlist_target_seq_tag_d[0];
+            grant_delay_d[0] = shortlist_delay_d[0];
+            grant_dep_required_d[0] = shortlist_dep_required_d[0];
+        end else if (even_match[2]) begin
+            grant_valid_d[0] = 1'b1;
+            grant_onehot_d = grant_onehot_d | shortlist_onehot_d[2];
+            grant_pending_block_d[0] = shortlist_pending_block[2];
+            grant_seq_tag_d[0] = shortlist_seq_tag_d[2];
+            grant_target_seq_tag_d[0] = shortlist_target_seq_tag_d[2];
+            grant_delay_d[0] = shortlist_delay_d[2];
+            grant_dep_required_d[0] = shortlist_dep_required_d[2];
+        end
+
+        if (even_match[1]) begin
+            grant_valid_d[1] = 1'b1;
+            grant_onehot_d = grant_onehot_d | shortlist_onehot_d[0];
+            grant_pending_block_d[1] = shortlist_pending_block[0];
+            grant_seq_tag_d[1] = shortlist_seq_tag_d[0];
+            grant_target_seq_tag_d[1] = shortlist_target_seq_tag_d[0];
+            grant_delay_d[1] = shortlist_delay_d[0];
+            grant_dep_required_d[1] = shortlist_dep_required_d[0];
+        end else if (even_match[3]) begin
+            grant_valid_d[1] = 1'b1;
+            grant_onehot_d = grant_onehot_d | shortlist_onehot_d[2];
+            grant_pending_block_d[1] = shortlist_pending_block[2];
+            grant_seq_tag_d[1] = shortlist_seq_tag_d[2];
+            grant_target_seq_tag_d[1] = shortlist_target_seq_tag_d[2];
+            grant_delay_d[1] = shortlist_delay_d[2];
+            grant_dep_required_d[1] = shortlist_dep_required_d[2];
+        end
+
+        if (odd_match[0]) begin
+            grant_valid_d[2] = 1'b1;
+            grant_onehot_d = grant_onehot_d | shortlist_onehot_d[1];
+            grant_pending_block_d[2] = shortlist_pending_block[1];
+            grant_seq_tag_d[2] = shortlist_seq_tag_d[1];
+            grant_target_seq_tag_d[2] = shortlist_target_seq_tag_d[1];
+            grant_delay_d[2] = shortlist_delay_d[1];
+            grant_dep_required_d[2] = shortlist_dep_required_d[1];
+        end else if (odd_match[2]) begin
+            grant_valid_d[2] = 1'b1;
+            grant_onehot_d = grant_onehot_d | shortlist_onehot_d[3];
+            grant_pending_block_d[2] = shortlist_pending_block[3];
+            grant_seq_tag_d[2] = shortlist_seq_tag_d[3];
+            grant_target_seq_tag_d[2] = shortlist_target_seq_tag_d[3];
+            grant_delay_d[2] = shortlist_delay_d[3];
+            grant_dep_required_d[2] = shortlist_dep_required_d[3];
+        end
+
+        if (odd_match[1]) begin
+            grant_valid_d[3] = 1'b1;
+            grant_onehot_d = grant_onehot_d | shortlist_onehot_d[1];
+            grant_pending_block_d[3] = shortlist_pending_block[1];
+            grant_seq_tag_d[3] = shortlist_seq_tag_d[1];
+            grant_target_seq_tag_d[3] = shortlist_target_seq_tag_d[1];
+            grant_delay_d[3] = shortlist_delay_d[1];
+            grant_dep_required_d[3] = shortlist_dep_required_d[1];
+        end else if (odd_match[3]) begin
+            grant_valid_d[3] = 1'b1;
+            grant_onehot_d = grant_onehot_d | shortlist_onehot_d[3];
+            grant_pending_block_d[3] = shortlist_pending_block[3];
+            grant_seq_tag_d[3] = shortlist_seq_tag_d[3];
+            grant_target_seq_tag_d[3] = shortlist_target_seq_tag_d[3];
+            grant_delay_d[3] = shortlist_delay_d[3];
+            grant_dep_required_d[3] = shortlist_dep_required_d[3];
+        end
+    end
+
+    // D2A/D2B: lock the grant, fairness state, and source-gather addresses.
+    always @(posedge clk_i or negedge rst_ni) begin : grant_state
+        integer bank;
+        integer fe;
+
+        if (!rst_ni) begin
+            grant_valid_q         <= {FE_NUM{1'b0}};
+            grant_onehot_q        <= {CAND_WINDOW_DEPTH{1'b0}};
+            grant_dep_required_q  <= {FE_NUM{1'b0}};
+            candidate_way_rr_q    <= {FE_NUM{1'b0}};
+            group_rr_q            <= 2'b00;
+            for (fe = 0; fe < FE_NUM; fe = fe + 1) begin
+                grant_pending_block_q[fe] <= 3'b000;
+            end
+        end else begin
+            grant_valid_q         <= grant_valid_d;
+            grant_onehot_q        <= grant_onehot_d;
+            candidate_way_rr_q    <= ~candidate_way_rr_q;
+            group_rr_q            <= ~group_rr_q;
+            for (fe = 0; fe < FE_NUM; fe = fe + 1) begin
+                grant_pending_block_q[fe] <= grant_pending_block_d[fe];
+                if (grant_valid_d[fe]) begin
+                    grant_seq_tag_q[fe] <= grant_seq_tag_d[fe];
+                    grant_target_seq_tag_q[fe] <=
+                        grant_target_seq_tag_d[fe];
+                    grant_delay_q[fe] <= grant_delay_d[fe];
+                    grant_dep_required_q[fe] <=
+                        grant_dep_required_d[fe];
+                end
+            end
+            for (bank = 0; bank < ADMIT_BANKS; bank = bank + 1) begin
+                if (source_bank_update_en[bank]) begin
+                    source_bank_row_o[bank] <= source_bank_row_d[bank];
+                    source_bank_tag_hi_o[bank] <=
+                        source_bank_tag_hi_d[bank];
+                end
+            end
+        end
+    end
+
+    //==========================================================================
+    // Pipeline-ordered combinational/control logic: D2B.
+    //==========================================================================
+    // D2B: form bank-local source-packet gather requests from the grant.
+    always @* begin : source_bank_request_decode
+        integer bank;
+        integer fe;
+        reg [DATA_BANK_W-1:0] source_bank;
+
+        source_bank_update_en = {ADMIT_BANKS{1'b0}};
+        source_bank = {DATA_BANK_W{1'b0}};
+        for (bank = 0; bank < ADMIT_BANKS; bank = bank + 1) begin
+            source_bank_row_d[bank] = {ADMIT_ROW_W{1'b0}};
+            source_bank_tag_hi_d[bank] = {ROB_TAG_HI_W{1'b0}};
+        end
+        for (fe = 0; fe < FE_NUM; fe = fe + 1) begin
+            source_bank = grant_seq_tag_d[fe][DATA_BANK_W-1:0];
+            if (grant_valid_d[fe]) begin
+                source_bank_update_en[source_bank] = 1'b1;
+                source_bank_row_d[source_bank] =
+                    grant_seq_tag_d[fe][DATA_BANK_W +: ADMIT_ROW_W];
+                source_bank_tag_hi_d[source_bank] =
+                    grant_seq_tag_d[fe][ROB_ID_W +: ROB_TAG_HI_W];
+            end
+        end
+    end
+
     // D1/D2B: update candidate slots for nomination and grant consumption.
     always @* begin : candidate_bank_next
         integer slot;
@@ -1095,17 +1118,117 @@ module PPE_SCHEDULER #(
         end
     end
 
-    // D3/W0: adapt registered scheduler state to the internal FE and ROB paths.
+    // D2B: derive early-wakeup tokens from the grant producer's waiter row.
+    always @* begin : reverse_waiter_early_wakeup
+        integer fe;
+        integer offset;
+        integer producer;
+
+        early_wake_hit_d   = {ISSUE_DEPTH{1'b0}};
+        early_wake_delay_d = {ISSUE_DEPTH{1'b0}};
+        for (producer = 0; producer < ISSUE_DEPTH;
+             producer = producer + 1) begin
+            waiter_take[producer] = {MAX_DEP{1'b0}};
+            for (fe = 0; fe < FE_NUM; fe = fe + 1) begin
+                if (grant_valid_q[fe]
+                    && (grant_seq_tag_q[fe][ROB_ID_W-1:0]
+                        == producer[ROB_ID_W-1:0])
+                    && (issue_seq_tag_q[producer]
+                        == grant_seq_tag_q[fe])) begin
+                    waiter_take[producer] = waiter_take[producer]
+                                                   | waiter_q[producer];
+                    for (offset = 1; offset <= MAX_DEP;
+                         offset = offset + 1) begin
+                        if (waiter_q[producer][offset-1]) begin
+                            if (grant_delay_q[fe] == 2'd3) begin
+                                early_wake_delay_d[
+                                    (producer + offset) % ISSUE_DEPTH] = 1'b1;
+                            end else begin
+                                early_wake_hit_d[
+                                    (producer + offset) % ISSUE_DEPTH] = 1'b1;
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    // D1/D2B: commit candidate-window state and candidate metadata.
+    always @(posedge clk_i or negedge rst_ni) begin : candidate_state
+        integer slot;
+
+        if (!rst_ni) begin
+            candidate_valid_q <= {CAND_WINDOW_DEPTH{1'b0}};
+            candidate_present_q <= {ISSUE_DEPTH{1'b0}};
+            candidate_dep_required_q <= {CAND_WINDOW_DEPTH{1'b0}};
+        end else begin
+            candidate_valid_q <= candidate_valid_d;
+            candidate_present_q <= candidate_present_d;
+            candidate_dep_required_q <= candidate_dep_required_d;
+            for (slot = 0; slot < CAND_WINDOW_DEPTH; slot = slot + 1) begin
+                if (candidate_valid_d[slot]
+                    && (!candidate_valid_q[slot]
+                        || candidate_remove[slot]
+                        || (candidate_seq_tag_d[slot]
+                            != candidate_seq_tag_q[slot]))) begin
+                    candidate_seq_tag_q[slot] <= candidate_seq_tag_d[slot];
+                    candidate_target_seq_tag_q[slot] <=
+                        candidate_target_seq_tag_d[slot];
+                    candidate_delay_q[slot] <= candidate_delay_d[slot];
+                end
+            end
+        end
+    end
+
+    // D2B/W0: commit waiter rows and pipeline early-wakeup tokens.
+    always @(posedge clk_i or negedge rst_ni) begin : reverse_waiter_state
+        integer producer;
+
+        if (!rst_ni) begin
+            early_wake_hit_q   <= {ISSUE_DEPTH{1'b0}};
+            early_wake_delay_q <= {ISSUE_DEPTH{1'b0}};
+            for (producer = 0; producer < ISSUE_DEPTH;
+                 producer = producer + 1) begin
+                waiter_q[producer] <= {MAX_DEP{1'b0}};
+            end
+        end else begin
+            early_wake_hit_q   <= early_wake_hit_d | early_wake_delay_q;
+            early_wake_delay_q <= early_wake_delay_d;
+            for (producer = 0; producer < ISSUE_DEPTH;
+                 producer = producer + 1) begin
+                if (waiter_clear[producer]) begin
+                    waiter_q[producer] <= {MAX_DEP{1'b0}};
+                end else begin
+                    waiter_q[producer] <=
+                        (waiter_q[producer] & ~waiter_take[producer])
+                        | waiter_set[producer];
+                end
+            end
+        end
+    end
+
+    //==========================================================================
+    // Pipeline-ordered combinational/control logic: D3 and W0.
+    //==========================================================================
+    // D2A/D3/W0: launch dependency prefetch and adapt registered scheduler
+    // state to the internal FE and ROB paths.
     always @* begin : interface_outputs
         integer fe;
 
-        gather_dep_required_o   = grant_dep_required_q;
+        /*
+         * The dependency query is launched from the same D2A combinational
+         * grant that is captured into grant_*_q at this edge.  Using the
+         * registered grant here would leave the query one cycle behind the
+         * selected packet/control bundle.
+         */
+        gather_dep_required_o   = grant_valid_d & grant_dep_required_d;
         issue_valid_o           = selected_valid_q;
         issue_dep_required_o    = {FE_NUM{1'b0}};
         completion_valid_o      = {FE_NUM{1'b0}};
 
         for (fe = 0; fe < FE_NUM; fe = fe + 1) begin
-            gather_target_seq_tag_o[fe] = grant_target_seq_tag_q[fe];
+            gather_target_seq_tag_o[fe] = grant_target_seq_tag_d[fe];
             issue_packet_o[fe]          = {PACKET_W{1'b0}};
             issue_delay_o[fe]           = {DELAY_W{1'b0}};
             issue_dep_data_o[fe]        = {PACKET_W{1'b0}};
@@ -1127,72 +1250,19 @@ module PPE_SCHEDULER #(
         end
     end
 
-    // D0B/D0C/D2B/D3: own the issue-entry lifecycle state.
-    always @(posedge clk_i or negedge rst_ni) begin : issue_entry_state
+    // D3: identify selected entries released after FE input capture.
+    always @* begin : selected_release_decode
         integer entry;
+        integer fe;
 
-        if (!rst_ni) begin
-            for (entry = 0; entry < ISSUE_DEPTH; entry = entry + 1) begin
-                issue_state_q[entry] <= ISSUE_FREE;
-            end
-        end else begin
-            for (entry = 0; entry < ISSUE_DEPTH; entry = entry + 1) begin
-                if (selected_release_hit[entry]) begin
-                    issue_state_q[entry] <= ISSUE_FREE;
-                end
-                if (wake_hit[entry]) begin
-                    issue_state_q[entry] <= ISSUE_READY;
-                end
-                if (early_wake_hit_q[entry]
-                    && (issue_state_q[entry] == ISSUE_WAIT_DEP)
-                    && !dep_status_pending_entry[entry]) begin
-                    issue_state_q[entry] <= ISSUE_READY;
-                end
-                if (dep_status_available_entry[entry]
-                    && (issue_state_q[entry] == ISSUE_WAIT_DEP)) begin
-                    issue_state_q[entry] <= ISSUE_READY;
-                end
-                if (select_entry_hit[entry]) begin
-                    issue_state_q[entry] <= ISSUE_SELECTED;
-                end
-                if (alloc_entry_write_en[entry]) begin
-                    issue_state_q[entry] <=
-                        alloc_entry_dep_required[entry]
-                        ? ISSUE_WAIT_DEP : ISSUE_READY;
-                end
-            end
-        end
-    end
-
-    // D1: capture the ROB age hints before the bank-local READY scan.
-    always @(posedge clk_i or negedge rst_ni) begin : ready_head_hint_state
-        integer bank;
-
-        if (!rst_ni) begin
-            for (bank = 0; bank < ADMIT_BANKS; bank = bank + 1) begin
-                ready_bank_head_row_q[bank] <= {ADMIT_ROW_W{1'b0}};
-            end
-        end else begin
-            for (bank = 0; bank < ADMIT_BANKS; bank = bank + 1) begin
-                ready_bank_head_row_q[bank] <= ready_bank_head_row_i[bank];
-            end
-        end
-    end
-
-    // D0B/D0C: store issue metadata and the resolved dependency target.
-    always @(posedge clk_i) begin : issue_entry_metadata
-        integer entry;
-
+        selected_release_hit = {ISSUE_DEPTH{1'b0}};
         for (entry = 0; entry < ISSUE_DEPTH; entry = entry + 1) begin
-            if (alloc_entry_write_en[entry]) begin
-                issue_seq_tag_q[entry] <= alloc_entry_seq_tag[entry];
-                issue_delay_q[entry] <= alloc_entry_delay[entry];
-                issue_dep_required_q[entry] <=
-                    alloc_entry_dep_required[entry];
-            end
-            if (dep_status_pending_entry[entry]) begin
-                issue_target_seq_tag_q[entry] <=
-                    dep_status_target_entry[entry];
+            for (fe = 0; fe < FE_NUM; fe = fe + 1) begin
+                if (selected_valid_q[fe]
+                    && (selected_seq_tag_q[fe][ROB_ID_W-1:0]
+                        == entry[ROB_ID_W-1:0])) begin
+                    selected_release_hit[entry] = 1'b1;
+                end
             end
         end
     end
@@ -1235,41 +1305,40 @@ module PPE_SCHEDULER #(
         end
     end
 
-    // D2A/D2B: lock the grant, fairness state, and source-gather addresses.
-    always @(posedge clk_i or negedge rst_ni) begin : grant_state
-        integer bank;
+    // W0: completion tags provide the dependency-wakeup safety net.
+    always @* begin : completion_wakeup_scan
+        integer entry;
         integer fe;
 
-        if (!rst_ni) begin
-            grant_valid_q         <= {FE_NUM{1'b0}};
-            grant_onehot_q        <= {CAND_WINDOW_DEPTH{1'b0}};
-            grant_dep_required_q  <= {FE_NUM{1'b0}};
-            candidate_way_rr_q    <= {FE_NUM{1'b0}};
-            group_rr_q            <= 2'b00;
+        wake_hit = {ISSUE_DEPTH{1'b0}};
+        for (entry = 0; entry < ISSUE_DEPTH; entry = entry + 1) begin
             for (fe = 0; fe < FE_NUM; fe = fe + 1) begin
-                grant_pending_block_q[fe] <= 3'b000;
-            end
-        end else begin
-            grant_valid_q         <= grant_valid_d;
-            grant_onehot_q        <= grant_onehot_d;
-            candidate_way_rr_q    <= ~candidate_way_rr_q;
-            group_rr_q            <= ~group_rr_q;
-            for (fe = 0; fe < FE_NUM; fe = fe + 1) begin
-                grant_pending_block_q[fe] <= grant_pending_block_d[fe];
-                if (grant_valid_d[fe]) begin
-                    grant_seq_tag_q[fe] <= grant_seq_tag_d[fe];
-                    grant_target_seq_tag_q[fe] <=
-                        grant_target_seq_tag_d[fe];
-                    grant_delay_q[fe] <= grant_delay_d[fe];
-                    grant_dep_required_q[fe] <=
-                        grant_dep_required_d[fe];
+                if (completion_valid_i[fe]
+                    && (issue_state_q[entry] == ISSUE_WAIT_DEP)
+                    && !dep_status_pending_entry[entry]
+                    && (issue_target_seq_tag_q[entry]
+                        == completion_seq_tag_i[fe])) begin
+                    wake_hit[entry] = 1'b1;
                 end
             end
-            for (bank = 0; bank < ADMIT_BANKS; bank = bank + 1) begin
-                if (source_bank_update_en[bank]) begin
-                    source_bank_row_o[bank] <= source_bank_row_d[bank];
-                    source_bank_tag_hi_o[bank] <=
-                        source_bank_tag_hi_d[bank];
+        end
+    end
+
+    // W0: clear waiter rows when a producer is allocated or completes.
+    always @* begin : reverse_waiter_clear_decode
+        integer fe;
+        integer producer;
+
+        waiter_clear = alloc_entry_write_en;
+        for (producer = 0; producer < ISSUE_DEPTH;
+             producer = producer + 1) begin
+            for (fe = 0; fe < FE_NUM; fe = fe + 1) begin
+                if (completion_valid_i[fe]
+                    && (completion_seq_tag_i[fe][ROB_ID_W-1:0]
+                        == producer[ROB_ID_W-1:0])
+                    && (issue_seq_tag_q[producer]
+                        == completion_seq_tag_i[fe])) begin
+                    waiter_clear[producer] = 1'b1;
                 end
             end
         end
@@ -1349,28 +1418,43 @@ module PPE_SCHEDULER #(
         end
     endgenerate
 
-    // D1/D2B: commit candidate-window state and candidate metadata.
-    always @(posedge clk_i or negedge rst_ni) begin : candidate_state
-        integer slot;
+    //==========================================================================
+    // Cross-stage registered state update.
+    // Keep this lifecycle owner whole so its D0C, D2B, D3, and W0 priority
+    // order remains explicit and no state element acquires multiple owners.
+    //==========================================================================
+    // D0B/D0C/D2B/D3: own the issue-entry lifecycle state.
+    always @(posedge clk_i or negedge rst_ni) begin : issue_entry_state
+        integer entry;
 
         if (!rst_ni) begin
-            candidate_valid_q <= {CAND_WINDOW_DEPTH{1'b0}};
-            candidate_present_q <= {ISSUE_DEPTH{1'b0}};
-            candidate_dep_required_q <= {CAND_WINDOW_DEPTH{1'b0}};
+            for (entry = 0; entry < ISSUE_DEPTH; entry = entry + 1) begin
+                issue_state_q[entry] <= ISSUE_FREE;
+            end
         end else begin
-            candidate_valid_q <= candidate_valid_d;
-            candidate_present_q <= candidate_present_d;
-            candidate_dep_required_q <= candidate_dep_required_d;
-            for (slot = 0; slot < CAND_WINDOW_DEPTH; slot = slot + 1) begin
-                if (candidate_valid_d[slot]
-                    && (!candidate_valid_q[slot]
-                        || candidate_remove[slot]
-                        || (candidate_seq_tag_d[slot]
-                            != candidate_seq_tag_q[slot]))) begin
-                    candidate_seq_tag_q[slot] <= candidate_seq_tag_d[slot];
-                    candidate_target_seq_tag_q[slot] <=
-                        candidate_target_seq_tag_d[slot];
-                    candidate_delay_q[slot] <= candidate_delay_d[slot];
+            for (entry = 0; entry < ISSUE_DEPTH; entry = entry + 1) begin
+                if (selected_release_hit[entry]) begin
+                    issue_state_q[entry] <= ISSUE_FREE;
+                end
+                if (wake_hit[entry]) begin
+                    issue_state_q[entry] <= ISSUE_READY;
+                end
+                if (early_wake_hit_q[entry]
+                    && (issue_state_q[entry] == ISSUE_WAIT_DEP)
+                    && !dep_status_pending_entry[entry]) begin
+                    issue_state_q[entry] <= ISSUE_READY;
+                end
+                if (dep_status_available_entry[entry]
+                    && (issue_state_q[entry] == ISSUE_WAIT_DEP)) begin
+                    issue_state_q[entry] <= ISSUE_READY;
+                end
+                if (select_entry_hit[entry]) begin
+                    issue_state_q[entry] <= ISSUE_SELECTED;
+                end
+                if (alloc_entry_write_en[entry]) begin
+                    issue_state_q[entry] <=
+                        alloc_entry_dep_required[entry]
+                        ? ISSUE_WAIT_DEP : ISSUE_READY;
                 end
             end
         end

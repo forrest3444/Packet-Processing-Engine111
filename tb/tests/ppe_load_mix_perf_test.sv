@@ -8,8 +8,8 @@
 class ppe_load_mix_perf_test extends uvm_test;
     `uvm_component_utils(ppe_load_mix_perf_test)
 
-    localparam int unsigned MEDIUM_BEATS   = 189;
-    localparam int unsigned HEAVY_BEATS    = 210;
+    localparam int unsigned MEDIUM_BEATS   = 3780;
+    localparam int unsigned HEAVY_BEATS    = 4200;
     localparam int unsigned MEDIUM_PACKETS = MEDIUM_BEATS * (TB_N / 2);
     localparam int unsigned HEAVY_PACKETS  = (HEAVY_BEATS / 5)
                                            * ((5 * TB_N) - 2);
@@ -188,14 +188,14 @@ class ppe_load_mix_perf_test extends uvm_test;
                 "medium=%0d/%0d heavy=%0d/%0d", medium_accept_beats,
                 MEDIUM_BEATS, heavy_accept_beats, HEAVY_BEATS))
         end
-        expected_dep_count = (21 - dep_per_21) * 54;
+        expected_dep_count = (21 - dep_per_21) * 1080;
         if (dep_hist[0] != expected_dep_count) begin
             `uvm_error("LOAD_DEP_DIST", $sformatf(
                 "no-dependency count=%0d expected=%0d", dep_hist[0],
                 expected_dep_count))
         end
         for (dep = 1; dep < 8; dep++) begin
-            expected_dep_count = 54 * ((dep_per_21 / 7)
+            expected_dep_count = 1080 * ((dep_per_21 / 7)
                 + ((dep <= (dep_per_21 % 7)) ? 1 : 0));
             if (dep_hist[dep] != expected_dep_count) begin
                 `uvm_error("LOAD_DEP_DIST", $sformatf(

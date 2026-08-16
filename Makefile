@@ -77,11 +77,11 @@ VERILATOR_LINT_OPTS = --lint-only       \
                       --top-module $(RTL_TOP)
 
 define orfs_synth
-	sg docker -c '$(ORFS_DOCKER) make --file=$(ORFS_FLOW_MAKE) DESIGN_CONFIG=/work/flow/orfs/$(1) WORK_HOME=$(ORFS_WORK_HOME) synth'
+	sg docker -c '$(ORFS_DOCKER) make --file=$(ORFS_FLOW_MAKE) DESIGN_CONFIG=/work/flow/orfs/config/$(1) WORK_HOME=$(ORFS_WORK_HOME) synth'
 endef
 
 define orfs_module_report
-	sg docker -c '$(ORFS_DOCKER) env REPORT_DB=$(ORFS_WORK_HOME)/results/nangate45/$(1)/base/1_synth.odb REPORT_SDC=/work/flow/orfs/$(2) REPORT_OUT=/work/flow/orfs/$(3) REPORT_NAME=$(4) openroad -exit /work/flow/orfs/report_module_1p25ghz.tcl'
+	sg docker -c '$(ORFS_DOCKER) env REPORT_DB=$(ORFS_WORK_HOME)/results/nangate45/$(1)/base/1_synth.odb REPORT_SDC=/work/flow/orfs/constraints/$(2) REPORT_OUT=/work/flow/orfs/reports/$(3) REPORT_NAME=$(4) openroad -exit /work/flow/orfs/scripts/report_module_1p25ghz.tcl'
 endef
 
 ###############################################################################
@@ -150,7 +150,7 @@ synth: synth-top
 
 synth-top:
 	$(call orfs_synth,config_top_sv_1p25ghz.mk)
-	sg docker -c '$(ORFS_DOCKER) openroad -exit /work/flow/orfs/report_top_sv_1p25ghz_functional.tcl'
+	sg docker -c '$(ORFS_DOCKER) openroad -exit /work/flow/orfs/scripts/report_top_sv_1p25ghz_functional.tcl'
 
 synth-modules: synth-ingress synth-scheduler synth-rob synth-retire-output
 
@@ -160,7 +160,7 @@ synth-ingress:
 
 synth-scheduler:
 	$(call orfs_synth,config_scheduler_local_pairs_1p25ghz.mk)
-	sg docker -c '$(ORFS_DOCKER) openroad -exit /work/flow/orfs/report_scheduler_local_pairs_1p25ghz.tcl'
+	sg docker -c '$(ORFS_DOCKER) openroad -exit /work/flow/orfs/scripts/report_scheduler_local_pairs_1p25ghz.tcl'
 
 synth-rob:
 	$(call orfs_synth,config_rob_1p25ghz.mk)

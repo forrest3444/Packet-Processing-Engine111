@@ -34,7 +34,7 @@ module PPE_ROB #(
     input  wire [`PPE_ROB_TAG_HI_W-1:0]              source_bank_tag_hi_i [0:`PPE_N-1],
     output reg  [PACKET_W-1:0]                       source_bank_packet_o [0:`PPE_N-1],
 
-    // D2B/G0: dependency-data gather query and authoritative response.
+    // D2A/D2B/G0: dependency-data prefetch query and pipelined response.
     input  wire [`PPE_ISSUE_WIDTH-1:0]               gather_dep_required_i,
     input  wire [`PPE_SEQ_W-1:0]                     gather_target_seq_tag_i [0:`PPE_ISSUE_WIDTH-1],
     output wire [PACKET_W-1:0]                       gather_dep_data_o [0:`PPE_ISSUE_WIDTH-1],
@@ -178,11 +178,21 @@ module PPE_ROB #(
     reg [FE_NUM-1:0] issue_dep_wb_match [0:ISSUE_WIDTH-1];
     reg [ISSUE_WIDTH-1:0] issue_dep_wb_any;
     reg [PACKET_W-1:0] issue_dep_wb_data [0:ISSUE_WIDTH-1];
+
+    // D2B response candidates.  Each source path is captured independently
+    // so the FE-facing cycle only contains the final shallow priority mux.
+    reg [ISSUE_WIDTH-1:0] dep_wb_any_q;
+    reg [PACKET_W-1:0] dep_wb_data_q [0:ISSUE_WIDTH-1];
+    reg [ISSUE_WIDTH-1:0] dep_active_match_q;
+    reg [ISSUE_WIDTH-1:0] dep_active_available_q;
+    reg [PACKET_W-1:0] dep_active_data_q [0:ISSUE_WIDTH-1];
+    reg [ISSUE_WIDTH-1:0] dep_history_match_q;
+    reg [PACKET_W-1:0] dep_history_data_q [0:ISSUE_WIDTH-1];
     reg [PACKET_W-1:0] issue_dep_data_d [0:ISSUE_WIDTH-1];
 
-    // The gather query is the narrow intermediate register.  The wide
-    // authoritative data selection runs after this boundary and is sampled
-    // by the internal FE input register on the following edge.
+    // The gather query is the narrow D2A intermediate register.  The
+    // source-specific dependency candidates are captured at D2B; only their
+    // final priority selection remains on the FE-facing cycle.
     reg [ISSUE_WIDTH-1:0] gather_dep_required_q;
     reg [SEQ_W-1:0] gather_target_seq_tag_q [0:ISSUE_WIDTH-1];
 
@@ -191,26 +201,44 @@ module PPE_ROB #(
     //-------------------------------------------------------------------------
     integer done_bank;
     integer done_row;
-    // W0/R0: combine stored completion state with the next-return prediction.
-    always @* begin : done_bank_decode
-        for (done_bank = 0; done_bank < DATA_BANK_NUM;
-             done_bank = done_bank + 1) begin
-            rob_done_bank[done_bank] = {DATA_ROW_NUM{1'b0}};
-            for (done_row = 0; done_row < DATA_ROW_NUM;
-                 done_row = done_row + 1) begin
-                rob_done_bank[done_bank][done_row] =
-                    rob_valid_q[done_row*DATA_BANK_NUM+done_bank]
-                    && (rob_result_valid_q[
-                            done_row*DATA_BANK_NUM+done_bank]
-                        || wb_entry_predict[
-                            done_row*DATA_BANK_NUM+done_bank]);
-            end
-        end
-    end
 
-    assign head_ptr_q =
-        {retire_bank_row_q[retire_head_bank_q], retire_head_bank_q};
-    assign alloc_commit = alloc_commit_valid_i;
+    // A0: calculate registered reservation capacity and next occupancy.
+    always @* begin : allocation_capacity
+        reserve_capacity_ext =
+            {1'b0, alloc_reserve_credit_o}
+            + {{(CAPACITY_EXT_W-LANE_COUNT_W){1'b0}},
+               alloc_pending_retire_count_o};
+
+        occupancy_after_retire_ext =
+            {1'b0, occupancy_q}
+            - {{(CAPACITY_EXT_W-LANE_COUNT_W){1'b0}},
+               alloc_pending_retire_count_o};
+        accepted_reserve_count = {LANE_COUNT_W{1'b0}};
+        if ((alloc_reserve_count_i != {LANE_COUNT_W{1'b0}})
+            && ({{(CAPACITY_EXT_W-LANE_COUNT_W){1'b0}},
+                 alloc_reserve_count_i} <= reserve_capacity_ext)) begin
+            accepted_reserve_count = alloc_reserve_count_i;
+        end
+
+        occupancy_next_ext =
+            occupancy_after_retire_ext
+            + {{(CAPACITY_EXT_W-LANE_COUNT_W){1'b0}},
+               accepted_reserve_count};
+        occupancy_next = occupancy_next_ext[OCCUPANCY_W-1:0];
+
+        // Capacity is split into registered free space and a registered
+        // retirement lookahead.  The current head scan is not on this path.
+        // Reuse the same post-retirement capacity sum used by the admission
+        // comparison.  The previous expression rebuilt credit + pending
+        // retirements after the accepted-count mux, creating a second adder
+        // chain on the credit register path.
+        credit_next_ext =
+            reserve_capacity_ext
+            - {{(CAPACITY_EXT_W-LANE_COUNT_W){1'b0}},
+               accepted_reserve_count};
+        alloc_reserve_credit_next =
+            credit_next_ext[OCCUPANCY_W-1:0];
+    end
 
     // A0: derive local ROB indices from the committed sequence tags.
     always @* begin : allocation_request_decode
@@ -249,6 +277,34 @@ module PPE_ROB #(
                 alloc_data_capture_valid[alloc_bank] = 1'b1;
             end
         end
+    end
+
+    assign head_ptr_q =
+        {retire_bank_row_q[retire_head_bank_q], retire_head_bank_q};
+    assign alloc_commit = alloc_commit_valid_i;
+
+    // A0/A1: register bank-local allocation row/control state.
+    always @(posedge clk_i or negedge rst_ni) begin : alloc_data_control
+        integer bank_idx;
+        if (!rst_ni) begin
+            alloc_data_valid_q <= {DATA_BANK_NUM{1'b0}};
+        end else begin
+            alloc_data_valid_q <= alloc_data_capture_valid;
+            for (bank_idx = 0; bank_idx < DATA_BANK_NUM;
+                 bank_idx = bank_idx + 1)
+                if (alloc_data_capture_en[bank_idx])
+                    alloc_data_row_q[bank_idx] <=
+                        alloc_data_capture_row[bank_idx];
+        end
+    end
+
+    // A1: register bank-local allocation payloads.
+    always @(posedge clk_i) begin : alloc_data_payload
+        integer bank_idx;
+        for (bank_idx = 0; bank_idx < DATA_BANK_NUM;
+             bank_idx = bank_idx + 1)
+            if (alloc_data_capture_en[bank_idx])
+                alloc_data_q[bank_idx] <= alloc_data_capture[bank_idx];
     end
 
     // W0: qualify writeback lanes and form entry-local write enables/data.
@@ -333,6 +389,23 @@ module PPE_ROB #(
 
         for (wb_idx = 0; wb_idx < FE_NUM; wb_idx = wb_idx + 1) begin
             wb_commit[wb_idx] = |wb_lane_entry_commit[wb_idx];
+        end
+    end
+
+    // W0/R0: combine stored completion state with the next-return prediction.
+    always @* begin : done_bank_decode
+        for (done_bank = 0; done_bank < DATA_BANK_NUM;
+             done_bank = done_bank + 1) begin
+            rob_done_bank[done_bank] = {DATA_ROW_NUM{1'b0}};
+            for (done_row = 0; done_row < DATA_ROW_NUM;
+                 done_row = done_row + 1) begin
+                rob_done_bank[done_bank][done_row] =
+                    rob_valid_q[done_row*DATA_BANK_NUM+done_bank]
+                    && (rob_result_valid_q[
+                            done_row*DATA_BANK_NUM+done_bank]
+                        || wb_entry_predict[
+                            done_row*DATA_BANK_NUM+done_bank]);
+            end
         end
     end
 
@@ -525,40 +598,62 @@ module PPE_ROB #(
         end
     end
 
-    // A0: calculate registered reservation capacity and next occupancy.
-    always @* begin : allocation_capacity
-        reserve_capacity_ext =
-            {1'b0, alloc_reserve_credit_o}
-            + {{(CAPACITY_EXT_W-LANE_COUNT_W){1'b0}},
-               alloc_pending_retire_count_o};
+    // R0: register the retirement prefix and pending capacity credit.
+    always @(posedge clk_i or negedge rst_ni) begin : retire_pending_control
+        integer retire_idx;
 
-        occupancy_after_retire_ext =
-            {1'b0, occupancy_q}
-            - {{(CAPACITY_EXT_W-LANE_COUNT_W){1'b0}},
-               alloc_pending_retire_count_o};
-        accepted_reserve_count = {LANE_COUNT_W{1'b0}};
-        if ((alloc_reserve_count_i != {LANE_COUNT_W{1'b0}})
-            && ({{(CAPACITY_EXT_W-LANE_COUNT_W){1'b0}},
-                 alloc_reserve_count_i} <= reserve_capacity_ext)) begin
-            accepted_reserve_count = alloc_reserve_count_i;
+        if (!rst_ni) begin
+            retire_pending_valid_q <= {N{1'b0}};
+            alloc_pending_retire_count_o <= {LANE_COUNT_W{1'b0}};
+        end else begin
+            retire_pending_valid_q <= retire_valid_o;
+            alloc_pending_retire_count_o <= retire_count;
+            for (retire_idx = 0; retire_idx < N;
+                 retire_idx = retire_idx + 1)
+                if (retire_valid_o[retire_idx]) begin
+                    retire_pending_rob_id_q[retire_idx] <=
+                        retire_rob_id[retire_idx];
+                    retire_pending_seq_tag_q[retire_idx] <=
+                        retire_seq_tag[retire_idx];
+                end
         end
+    end
 
-        occupancy_next_ext =
-            occupancy_after_retire_ext
-            + {{(CAPACITY_EXT_W-LANE_COUNT_W){1'b0}},
-               accepted_reserve_count};
-        occupancy_next = occupancy_next_ext[OCCUPANCY_W-1:0];
+    // R0: register the retiring payload for the history write in the next edge.
+    always @(posedge clk_i) begin : retire_pending_data
+        integer retire_idx;
+        for (retire_idx = 0; retire_idx < N;
+             retire_idx = retire_idx + 1)
+            if (retire_valid_o[retire_idx])
+                retire_pending_data_q[retire_idx] <=
+                    retire_data_o[retire_idx];
+    end
 
-        // Capacity is split into registered free space and a registered
-        // retirement lookahead.  The current head scan is not on this path.
-        credit_next_ext =
-            {1'b0, alloc_reserve_credit_o}
-            - {{(CAPACITY_EXT_W-LANE_COUNT_W){1'b0}},
-               accepted_reserve_count}
-            + {{(CAPACITY_EXT_W-LANE_COUNT_W){1'b0}},
-               alloc_pending_retire_count_o};
-        alloc_reserve_credit_next =
-            credit_next_ext[OCCUPANCY_W-1:0];
+    // R0: update retired-history metadata.
+    always @(posedge clk_i or negedge rst_ni)
+        begin : history_metadata_update
+        integer history_idx;
+        if (!rst_ni) begin
+            history_valid_q <= {RESULT_BANKS{1'b0}};
+        end else begin
+            for (history_idx = 0; history_idx < RESULT_BANKS;
+                 history_idx = history_idx + 1)
+                if (history_write_en[history_idx]) begin
+                    history_valid_q[history_idx] <= 1'b1;
+                    history_tag_hi_q[history_idx] <=
+                        history_write_seq_tag[history_idx][
+                            SEQ_W-1:HISTORY_ID_W];
+                end
+        end
+    end
+
+    // R0: update history payloads.
+    always @(posedge clk_i) begin : history_data_update
+        integer history_idx;
+        for (history_idx = 0; history_idx < RESULT_BANKS;
+             history_idx = history_idx + 1)
+            if (history_write_en[history_idx])
+                history_data_q[history_idx] <= history_write_data[history_idx];
     end
 
     //-------------------------------------------------------------------------
@@ -753,25 +848,23 @@ module PPE_ROB #(
         end
     end
 
-    // G0: apply the fixed completion/active/history data priority.
+    // D3/G0: apply the fixed priority to the D2B-registered candidates.
     always @* begin : dependency_data_resolve
         integer query_idx;
 
         for (query_idx = 0; query_idx < ISSUE_WIDTH;
              query_idx = query_idx + 1) begin
             issue_dep_data_d[query_idx] = {PACKET_W{1'b0}};
-            if (gather_dep_required_q[query_idx]) begin
-                if (issue_dep_wb_any[query_idx]) begin
-                    issue_dep_data_d[query_idx] = issue_dep_wb_data[query_idx];
-                end else if (issue_dep_active_match[query_idx]) begin
-                    if (issue_dep_active_available[query_idx]) begin
-                        issue_dep_data_d[query_idx] =
-                            issue_dep_active_data[query_idx];
-                    end
-                end else if (issue_dep_history_match[query_idx]) begin
+            if (dep_wb_any_q[query_idx]) begin
+                issue_dep_data_d[query_idx] = dep_wb_data_q[query_idx];
+            end else if (dep_active_match_q[query_idx]) begin
+                if (dep_active_available_q[query_idx]) begin
                     issue_dep_data_d[query_idx] =
-                        issue_dep_history_data[query_idx];
+                        dep_active_data_q[query_idx];
                 end
+            end else if (dep_history_match_q[query_idx]) begin
+                issue_dep_data_d[query_idx] =
+                    dep_history_data_q[query_idx];
             end
         end
     end
@@ -784,17 +877,47 @@ module PPE_ROB #(
         end
     endgenerate
 
-    // D2B/G0: register the narrow dependency gather query.
+    // D2A/D2B/G0: capture the current query response before accepting the
+    // next D2A query.  This keeps one response aligned with one grant while
+    // allowing a new query every cycle.
     always @(posedge clk_i or negedge rst_ni) begin : gather_query_state
         integer query_idx;
 
         if (!rst_ni) begin
             gather_dep_required_q <= {ISSUE_WIDTH{1'b0}};
+            dep_wb_any_q <= {ISSUE_WIDTH{1'b0}};
+            dep_active_match_q <= {ISSUE_WIDTH{1'b0}};
+            dep_active_available_q <= {ISSUE_WIDTH{1'b0}};
+            dep_history_match_q <= {ISSUE_WIDTH{1'b0}};
             for (query_idx = 0; query_idx < ISSUE_WIDTH;
                  query_idx = query_idx + 1) begin
                 gather_target_seq_tag_q[query_idx] <= {SEQ_W{1'b0}};
             end
         end else begin
+            /*
+             * These values describe gather_dep_*_q from the cycle before
+             * this edge.  The next assignments below then replace the
+             * narrow query with the new D2A request.
+             */
+            for (query_idx = 0; query_idx < ISSUE_WIDTH;
+                 query_idx = query_idx + 1) begin
+                dep_wb_any_q[query_idx] <= issue_dep_wb_any[query_idx];
+                dep_active_match_q[query_idx] <=
+                    issue_dep_active_match[query_idx];
+                dep_active_available_q[query_idx] <=
+                    issue_dep_active_available[query_idx];
+                dep_history_match_q[query_idx] <=
+                    issue_dep_history_match[query_idx];
+                if (gather_dep_required_q[query_idx]) begin
+                    dep_wb_data_q[query_idx] <=
+                        issue_dep_wb_data[query_idx];
+                    dep_active_data_q[query_idx] <=
+                        issue_dep_active_data[query_idx];
+                    dep_history_data_q[query_idx] <=
+                        issue_dep_history_data[query_idx];
+                end
+            end
+
             gather_dep_required_q <= gather_dep_required_i;
             for (query_idx = 0; query_idx < ISSUE_WIDTH;
                  query_idx = query_idx + 1) begin
@@ -842,61 +965,6 @@ module PPE_ROB #(
         end
     end
 
-    // R0/A0: register the retirement prefix and pending capacity credit.
-    always @(posedge clk_i or negedge rst_ni) begin : retire_pending_control
-        integer retire_idx;
-
-        if (!rst_ni) begin
-            retire_pending_valid_q <= {N{1'b0}};
-            alloc_pending_retire_count_o <= {LANE_COUNT_W{1'b0}};
-        end else begin
-            retire_pending_valid_q <= retire_valid_o;
-            alloc_pending_retire_count_o <= retire_count;
-            for (retire_idx = 0; retire_idx < N;
-                 retire_idx = retire_idx + 1)
-                if (retire_valid_o[retire_idx]) begin
-                    retire_pending_rob_id_q[retire_idx] <=
-                        retire_rob_id[retire_idx];
-                    retire_pending_seq_tag_q[retire_idx] <=
-                        retire_seq_tag[retire_idx];
-                end
-        end
-    end
-
-    // R0: register the retiring payload for the history write in the next edge.
-    always @(posedge clk_i) begin : retire_pending_data
-        integer retire_idx;
-        for (retire_idx = 0; retire_idx < N;
-             retire_idx = retire_idx + 1)
-            if (retire_valid_o[retire_idx])
-                retire_pending_data_q[retire_idx] <=
-                    retire_data_o[retire_idx];
-    end
-
-    // A0/A1: register bank-local allocation row/control state.
-    always @(posedge clk_i or negedge rst_ni) begin : alloc_data_control
-        integer bank_idx;
-        if (!rst_ni) begin
-            alloc_data_valid_q <= {DATA_BANK_NUM{1'b0}};
-        end else begin
-            alloc_data_valid_q <= alloc_data_capture_valid;
-            for (bank_idx = 0; bank_idx < DATA_BANK_NUM;
-                 bank_idx = bank_idx + 1)
-                if (alloc_data_capture_en[bank_idx])
-                    alloc_data_row_q[bank_idx] <=
-                        alloc_data_capture_row[bank_idx];
-        end
-    end
-
-    // A1: register bank-local allocation payloads.
-    always @(posedge clk_i) begin : alloc_data_payload
-        integer bank_idx;
-        for (bank_idx = 0; bank_idx < DATA_BANK_NUM;
-             bank_idx = bank_idx + 1)
-            if (alloc_data_capture_en[bank_idx])
-                alloc_data_q[bank_idx] <= alloc_data_capture[bank_idx];
-    end
-
     // A1/W0: commit allocation payloads and FE results into the data banks.
     always @(posedge clk_i) begin : rob_data_update
         integer bank_idx;
@@ -916,33 +984,6 @@ module PPE_ROB #(
                     rob_data_q[bank_idx][row_idx]
                         <= alloc_data_q[bank_idx];
             end
-    end
-
-    // R0: update retired-history metadata.
-    always @(posedge clk_i or negedge rst_ni)
-        begin : history_metadata_update
-        integer history_idx;
-        if (!rst_ni) begin
-            history_valid_q <= {RESULT_BANKS{1'b0}};
-        end else begin
-            for (history_idx = 0; history_idx < RESULT_BANKS;
-                 history_idx = history_idx + 1)
-                if (history_write_en[history_idx]) begin
-                    history_valid_q[history_idx] <= 1'b1;
-                    history_tag_hi_q[history_idx] <=
-                        history_write_seq_tag[history_idx][
-                            SEQ_W-1:HISTORY_ID_W];
-                end
-        end
-    end
-
-    // R0: update history payloads.
-    always @(posedge clk_i) begin : history_data_update
-        integer history_idx;
-        for (history_idx = 0; history_idx < RESULT_BANKS;
-             history_idx = history_idx + 1)
-            if (history_write_en[history_idx])
-                history_data_q[history_idx] <= history_write_data[history_idx];
     end
 
     // A0/R0: advance the ROB head, bank rows, occupancy, and reserve credit.

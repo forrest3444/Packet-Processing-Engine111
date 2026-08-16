@@ -8,8 +8,8 @@
 class ppe_load_mix_perf_seq extends uvm_sequence #(ppe_item);
     `uvm_object_utils(ppe_load_mix_perf_seq)
 
-    localparam int unsigned MEDIUM_BEATS   = 189;
-    localparam int unsigned HEAVY_BEATS    = 210;
+    localparam int unsigned MEDIUM_BEATS   = 3780;
+    localparam int unsigned HEAVY_BEATS    = 4200;
     localparam int unsigned MEDIUM_PACKETS = MEDIUM_BEATS * (TB_N / 2);
     localparam int unsigned HEAVY_PACKETS  = (HEAVY_BEATS / 5)
                                            * ((5 * TB_N) - 2);

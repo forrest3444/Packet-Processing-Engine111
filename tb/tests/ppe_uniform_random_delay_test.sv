@@ -8,8 +8,8 @@
 class ppe_uniform_random_delay_test extends uvm_test;
     `uvm_component_utils(ppe_uniform_random_delay_test)
 
-    localparam int unsigned PACKET_COUNT   = 8192;
-    localparam int unsigned WARMUP_PACKETS = 512;
+    localparam int unsigned PACKET_COUNT   = 163840;
+    localparam int unsigned WARMUP_PACKETS = 10240;
     localparam int unsigned TIMEOUT_CYCLES = 100000;
 
     ppe_env   env;

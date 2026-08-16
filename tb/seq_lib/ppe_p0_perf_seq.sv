@@ -8,7 +8,7 @@
 class ppe_p0_perf_seq extends uvm_sequence #(ppe_item);
     `uvm_object_utils(ppe_p0_perf_seq)
 
-    localparam int unsigned PACKET_COUNT = 1024;
+    localparam int unsigned PACKET_COUNT = 20480;
     localparam int unsigned BATCH_COUNT = PACKET_COUNT / TB_N;
 
     function new(string name = "ppe_p0_perf_seq");

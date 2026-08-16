@@ -185,10 +185,11 @@ READY提名使用ROB输出的4个bank-local退休row年龄提示，在每个bank
 Scheduler在D2A使用当周期calendar并行计算两个本地way的legal，选出至多一个合法way
 后执行固定2x2匹配。delay 3直接形成全合法向量，不读取future table。D2A捕获不可撤销grant；
 D2B消费grant时释放候选槽、将issue entry转为SELECTED并允许同bank补位。
-已锁定metadata同时作为寄存gather请求读ROB，ROB返回completion bypass、active ROB
-和history优先级解析后的权威dependency data。ROB只在gather请求侧寄存窄的target tag
-和dep_required；完整数据选择位于该寄存器之后，并通过scheduler到FE的内部组合通路
-由FE输入寄存器采样。scheduler不再复制两组宽候选数据。
+依赖查询与grant在同一个D2A沿发起，使用当前D2A组合grant的target tag和dep_required；
+ROB在D2A沿锁存窄query。D2A到D2B之间，completion bypass、active ROB和history分别形成
+候选命中与数据，D2B沿按固定优先级流水寄存这些候选。D3/FE周期只执行已寄存候选的
+浅层优先级选择，避免下一条query覆盖当前grant的响应。scheduler不复制长期依赖状态，
+ROB中的候选寄存器只作为单拍响应流水。
 
 Scheduler继续拥有per-FE 6项相对未来返回表和完整tag关联。Grant提交时使用
 已锁存seq tag/delay写入返回表；FE结果数据仍直达ROB，不经过Scheduler宽数据
@@ -258,9 +259,10 @@ retirement bypass与active读取数值相同；实现将二者折叠为一条act
 比较广播到D0/D3，同时保持completion、retirement/active、history的可见性顺序。
 Completion bypass按dependency target的bank奇偶只检查对应FE pair：偶数target检查
 FE0/1，奇数target检查FE2/3，并以固定2选1归并128 bit数据；
-ROB在窄query寄存器之后完成completion、active、history固定优先级选择，不使用跨四路
-串行greedy选择链。selected metadata和source packet仍在D2B末端寄存，dependency data
-通过内部FE接口组合直通，不再额外增加FE发射周期。
+ROB在D2A query寄存器之后分别形成completion、active、history候选，并在D2B寄存候选
+数据和命中信息。D3只在per-FE路径上进行固定优先级选择，不使用跨四路串行greedy
+选择链。selected metadata、source packet和对应依赖响应在D2B末端对齐，不额外增加
+FE发射周期。
 为避免grant valid同时控制ROB宽数据查询并驱动selected operand大量寄存器CE，grant
 metadata在无效周期保持，ROB dependency datapath不使用gather valid门控；selected
 operand数据字段允许无条件捕获，只有selected valid定义其语义。该策略不改变流水边界，
@@ -319,10 +321,11 @@ scheduler只接收delay和dep_required。一次输入周期必须整体接收或
 依赖报文在allocation时保存完整target seq tag。D0C状态探针和FE completion tag只更新
 issue状态；被唤醒报文最早下一周期参与READY提名。Scheduler不保存非权威依赖副本。
 
-候选获得最终grant后，寄存target seq tag在D2B请求backend读取权威依赖数据。Backend
-依次检查completion bypass、active ROB和8-bank retired history；响应在per-FE operand
-寄存器捕获。宽依赖数据不复制到32项issue entry或8项候选窗，也不存在fast-cache、
-fallback或replay状态。
+候选获得最终grant后，在D2A沿使用当前grant组合结果发起窄target query。Backend
+在D2A到D2B之间并行检查completion bypass、active ROB和8-bank retired history，并在D2B
+按per-FE寄存候选响应。D3/FE周期只做候选数据的固定优先级选择。宽依赖数据不复制到
+32项issue entry或8项候选窗；ROB响应寄存器仅保存一拍候选，不形成fast-cache、fallback
+或replay状态。
 
 4.3 FE 调度
 
@@ -337,13 +340,14 @@ D2A从每bank两个way中选择至多1项合法候选形成4项shortlist；仅�
 way轮询状态。偶数bank和奇数bank分别进入
 两个独立的固定2x2匹配网络。每组优先选择可双发的直连或交叉映射；不能双发时由本组
 1 bit轮询状态决定候选和FE优先级。Grant不可撤销。D2A锁存窄metadata和candidate
-one-hot；D2B再原子删除候选、更新candidate_present和issue状态。等待D2B消费的way不参与
-新匹配，同bank另一way不受阻塞。
+one-hot，并同时发起依赖窄query；D2B再原子删除候选、更新candidate_present和issue状态，
+同时接收与该grant对应的分源依赖候选。同bank另一way不受阻塞。
 
 Scheduler维护per-FE 6项相对未来返回表。delay 0..2分别检查future slot3..5和上一拍
-grant的虚拟预约，delay 3对所有FE合法。D2B以寄存grant metadata请求ROB gather并将
-预约写入slot[delay+1]；D3从per-FE operand寄存器送入FE。流水允许连续周期grant、
-gather和FE issue并行，不因候选释放或operand寄存器产生隔周期气泡。
+grant的虚拟预约，delay 3对所有FE合法。D2B以寄存grant metadata写入预约slot[delay+1]，
+并与ROB的D2B依赖候选响应对齐；D3从per-FE selected operand路径完成最终数据选择并送入FE。
+流水允许连续周期grant、query、candidate response和FE issue并行，不因候选释放或响应
+寄存器产生隔周期气泡。
 
 4.4 FE 写回
 
@@ -488,20 +492,21 @@ retry链。该结构牺牲跨组FE借用能力，以缩短匹配路径并降低�
 
 6.3 D2B Operand Gather
 
-Grant后gather包含4个bank-local 8:1 source读取以及最多4路active ROB/history依赖读取。
-Source请求来自四个不同issue bank，因此每个source data bank至多一读；dependency target
-允许同bank冲突，继续保持每路独立语义。Bank0/2的请求和响应只连接FE0/1，Bank1/3
-只连接FE2/3；每bank请求归并和每FE响应选择均为固定2路，不形成通用4x4交叉网络。
-宽mux由grant寄存边界与D3 operand寄存边界夹住，
-不进入D2A匹配路径。ROB扩深或增加依赖读取端口时必须重新评估该级时序和面积。
+Grant后source gather仍包含4个bank-local 8:1 source读取；依赖查询在D2A沿发起，D2A到D2B
+之间并行执行completion pair、active ROB和history的局部读取与tag匹配。Source请求来自
+四个不同issue bank，因此每个source data bank至多一读；dependency target允许同bank冲突，
+继续保持每路独立语义。Bank0/2的请求和响应只连接FE0/1，Bank1/3只连接FE2/3；每bank
+请求归并和每FE响应选择均为固定2路，不形成通用4x4交叉网络。
+D2B寄存各依赖来源候选，D3只保留固定优先级宽mux，不进入D2A匹配路径。ROB扩深或增加
+依赖读取端口时必须重新评估D2A-D2B局部读取、候选寄存器面积以及D3宽mux时序。
 
 6.4 G0多路依赖读取
 
-G0需要支持最多4个已grant依赖报文的数据解析并允许一份结果广播到多个FE。Completion
+G0需要支持最多4个D2A已发起依赖报文的候选解析并允许一份结果广播到多个FE。Completion
 bypass根据target_seq_tag[0]选择合法completion pair：偶数target只比较FE0/1，奇数
-target只比较FE2/3，再以固定2选1选择128-bit数据；ROB在窄query寄存器之后完成
-completion、active、history固定优先级选择。若该级限制频率，可以增加gather内部流水，但必须同步调整返回日历距离
-和LLD周期定义，不得降低每周期4路gather能力。
+target只比较FE2/3，再以固定2选1形成completion候选；active和history各自形成局部候选，
+在D2B寄存后由D3按固定优先级选择。该拆分不增加FE发射周期，也不得降低每周期4路
+gather能力。
 
 6.5 W0 多路写回
 
