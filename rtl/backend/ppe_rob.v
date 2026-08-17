@@ -13,11 +13,9 @@ module PPE_ROB #(
     input  wire                                      rst_ni,
 
     // A0: capacity reservation request from the registered ingress head.
-    input  wire [`PPE_LANE_COUNT_W-1:0]              alloc_reserve_count_i,
-
-    // A0: registered free-space and pending-retirement credit to ingress.
-    output reg  [`PPE_ROB_OCCUPANCY_W-1:0]           alloc_reserve_credit_o,
-    output reg  [`PPE_LANE_COUNT_W-1:0]              alloc_pending_retire_count_o,
+    input  wire [`PPE_N-1:0]                         alloc_reserve_valid_i,
+    // A0: combinational ready decision for the exact requested batch.
+    output reg                                       alloc_reserve_ready_o,
 
     // A1: committed allocation metadata and original packet from ingress.
     input  wire [`PPE_N-1:0]                         alloc_commit_valid_i,
@@ -63,8 +61,16 @@ module PPE_ROB #(
     localparam integer LANE_COUNT_W     = `PPE_LANE_COUNT_W;
     localparam integer OCCUPANCY_W      = `PPE_ROB_OCCUPANCY_W;
     localparam integer CAPACITY_EXT_W  = OCCUPANCY_W + 1;
-    localparam [OCCUPANCY_W-1:0] ROB_DEPTH_VALUE =
-        ROB_DEPTH[OCCUPANCY_W-1:0];
+    localparam [CAPACITY_EXT_W-1:0] ROB_DEPTH_EXT =
+        ROB_DEPTH[CAPACITY_EXT_W-1:0];
+    localparam [CAPACITY_EXT_W-1:0] ROB_CAPACITY_1 =
+        ROB_DEPTH_EXT - {{(CAPACITY_EXT_W-1){1'b0}}, 1'b1};
+    localparam [CAPACITY_EXT_W-1:0] ROB_CAPACITY_2 =
+        ROB_DEPTH_EXT - {{(CAPACITY_EXT_W-2){1'b0}}, 2'd2};
+    localparam [CAPACITY_EXT_W-1:0] ROB_CAPACITY_3 =
+        ROB_DEPTH_EXT - {{(CAPACITY_EXT_W-2){1'b0}}, 2'd3};
+    localparam [CAPACITY_EXT_W-1:0] ROB_CAPACITY_4 =
+        ROB_DEPTH_EXT - {{(CAPACITY_EXT_W-3){1'b0}}, 3'd4};
     localparam integer DATA_BANK_NUM    = N;
     localparam integer DATA_BANK_W      = 2;
     localparam integer DATA_ROW_NUM     = ROB_DEPTH / DATA_BANK_NUM;
@@ -103,14 +109,12 @@ module PPE_ROB #(
     reg [DATA_ROW_W-1:0] retire_bank_row_q [0:DATA_BANK_NUM-1];
     wire [ROB_ID_W-1:0] head_ptr_q;
     reg [OCCUPANCY_W-1:0] occupancy_q;
+    reg [LANE_COUNT_W-1:0] alloc_pending_retire_count_q;
     reg [LANE_COUNT_W-1:0] retire_count;
     reg [OCCUPANCY_W-1:0] occupancy_next;
-    reg [OCCUPANCY_W-1:0] alloc_reserve_credit_next;
     reg [LANE_COUNT_W-1:0] accepted_reserve_count;
     reg [CAPACITY_EXT_W-1:0] occupancy_after_retire_ext;
     reg [CAPACITY_EXT_W-1:0] occupancy_next_ext;
-    reg [CAPACITY_EXT_W-1:0] credit_next_ext;
-    reg [CAPACITY_EXT_W-1:0] reserve_capacity_ext;
 
     reg [FE_NUM-1:0] wb_commit;
     reg [ROB_ID_W-1:0] wb_rob_id [0:FE_NUM-1];
@@ -202,42 +206,53 @@ module PPE_ROB #(
     integer done_bank;
     integer done_row;
 
-    // A0: calculate registered reservation capacity and next occupancy.
+    // A0: calculate the historical exact-mask admission decision and the
+    // next occupancy.  Retirement lookahead is still registered, but the
+    // request-size decode is local to the ROB and does not cross back through
+    // an ingress-side count/limit comparator.
     always @* begin : allocation_capacity
-        reserve_capacity_ext =
-            {1'b0, alloc_reserve_credit_o}
-            + {{(CAPACITY_EXT_W-LANE_COUNT_W){1'b0}},
-               alloc_pending_retire_count_o};
-
         occupancy_after_retire_ext =
             {1'b0, occupancy_q}
             - {{(CAPACITY_EXT_W-LANE_COUNT_W){1'b0}},
-               alloc_pending_retire_count_o};
+               alloc_pending_retire_count_q};
         accepted_reserve_count = {LANE_COUNT_W{1'b0}};
-        if ((alloc_reserve_count_i != {LANE_COUNT_W{1'b0}})
-            && ({{(CAPACITY_EXT_W-LANE_COUNT_W){1'b0}},
-                 alloc_reserve_count_i} <= reserve_capacity_ext)) begin
-            accepted_reserve_count = alloc_reserve_count_i;
-        end
+        alloc_reserve_ready_o = 1'b0;
+        case (alloc_reserve_valid_i)
+            4'b0001, 4'b0010, 4'b0100, 4'b1000: begin
+                if (occupancy_after_retire_ext <= ROB_CAPACITY_1) begin
+                    alloc_reserve_ready_o = 1'b1;
+                    accepted_reserve_count = 3'd1;
+                end
+            end
+            4'b0011, 4'b0101, 4'b0110,
+            4'b1001, 4'b1010, 4'b1100: begin
+                if (occupancy_after_retire_ext <= ROB_CAPACITY_2) begin
+                    alloc_reserve_ready_o = 1'b1;
+                    accepted_reserve_count = 3'd2;
+                end
+            end
+            4'b0111, 4'b1011, 4'b1101, 4'b1110: begin
+                if (occupancy_after_retire_ext <= ROB_CAPACITY_3) begin
+                    alloc_reserve_ready_o = 1'b1;
+                    accepted_reserve_count = 3'd3;
+                end
+            end
+            4'b1111: begin
+                if (occupancy_after_retire_ext <= ROB_CAPACITY_4) begin
+                    alloc_reserve_ready_o = 1'b1;
+                    accepted_reserve_count = 3'd4;
+                end
+            end
+            default: begin
+                alloc_reserve_ready_o = 1'b0;
+            end
+        endcase
 
         occupancy_next_ext =
             occupancy_after_retire_ext
             + {{(CAPACITY_EXT_W-LANE_COUNT_W){1'b0}},
                accepted_reserve_count};
         occupancy_next = occupancy_next_ext[OCCUPANCY_W-1:0];
-
-        // Capacity is split into registered free space and a registered
-        // retirement lookahead.  The current head scan is not on this path.
-        // Reuse the same post-retirement capacity sum used by the admission
-        // comparison.  The previous expression rebuilt credit + pending
-        // retirements after the accepted-count mux, creating a second adder
-        // chain on the credit register path.
-        credit_next_ext =
-            reserve_capacity_ext
-            - {{(CAPACITY_EXT_W-LANE_COUNT_W){1'b0}},
-               accepted_reserve_count};
-        alloc_reserve_credit_next =
-            credit_next_ext[OCCUPANCY_W-1:0];
     end
 
     // A0: derive local ROB indices from the committed sequence tags.
@@ -598,16 +613,16 @@ module PPE_ROB #(
         end
     end
 
-    // R0: register the retirement prefix and pending capacity credit.
+    // R0: register the retirement prefix and private pending capacity credit.
     always @(posedge clk_i or negedge rst_ni) begin : retire_pending_control
         integer retire_idx;
 
         if (!rst_ni) begin
             retire_pending_valid_q <= {N{1'b0}};
-            alloc_pending_retire_count_o <= {LANE_COUNT_W{1'b0}};
+            alloc_pending_retire_count_q <= {LANE_COUNT_W{1'b0}};
         end else begin
             retire_pending_valid_q <= retire_valid_o;
-            alloc_pending_retire_count_o <= retire_count;
+            alloc_pending_retire_count_q <= retire_count;
             for (retire_idx = 0; retire_idx < N;
                  retire_idx = retire_idx + 1)
                 if (retire_valid_o[retire_idx]) begin
@@ -986,13 +1001,12 @@ module PPE_ROB #(
             end
     end
 
-    // A0/R0: advance the ROB head, bank rows, occupancy, and reserve credit.
+    // A0/R0: advance the ROB head, bank rows, occupancy, and capacity state.
     always @(posedge clk_i or negedge rst_ni) begin : rob_control_update
         integer bank_idx;
         if (!rst_ni) begin
             retire_head_bank_q <= {DATA_BANK_W{1'b0}};
             occupancy_q <= {OCCUPANCY_W{1'b0}};
-            alloc_reserve_credit_o <= ROB_DEPTH_VALUE;
             for (bank_idx = 0; bank_idx < DATA_BANK_NUM;
                  bank_idx = bank_idx + 1)
                 retire_bank_row_q[bank_idx] <= {DATA_ROW_W{1'b0}};
@@ -1004,7 +1018,6 @@ module PPE_ROB #(
                     retire_bank_row_q[bank_idx] <=
                         retire_bank_row_q[bank_idx] + 3'd1;
             occupancy_q <= occupancy_next;
-            alloc_reserve_credit_o <= alloc_reserve_credit_next;
         end
     end
 

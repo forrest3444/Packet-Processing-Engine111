@@ -98,7 +98,7 @@ typical Liberty、0.050 ns时钟不确定度和0.200 ns输入输出延迟，并�
   |  |       active results / bypasses / 8-bank retired history        |  |
   |  |  retire_output: lane mapping / registers / start-lane rotation  |  |
   |  +---------------------------+--------------------------------------+  |
-  |                              +--> registered reservation credit / output |
+  |                              +--> reservation mask/ready / output        |
   |  ingress registered bkps ------------------------------------------->  |
   +------------------------------------------------------------------------+
 
@@ -108,7 +108,7 @@ typical Liberty、0.050 ns时钟不确定度和0.200 ns输入输出延迟，并�
 
 主要控制回馈：
 
-  Backend -> Ingress：基于沿前pending-retire的寄存allocation reservation credit
+  Backend -> Ingress：基于occupancy和已寄存退休lookahead的reservation ready
   Ingress -> Top/Input：寄存全局bkps
   Top Input -> Ingress：仅连接输入捕获寄存器
   Backend -> Scheduler：依赖满足状态、依赖结果数据和retirement事件
@@ -221,9 +221,9 @@ ppe_rob是全局顺序、结果和容量状态的唯一所有者，负责：
   - FE completion 写回；
   - completion bypass、retirement bypass、active ROB和retired history四级依赖解析；
   - 8-bank已退休history生命周期管理；
-  - 维护寄存的free reservation credit和pending-retire count；Ingress将两者相加判断可用容量；
+  - 维护ROB occupancy和pending-retire count，并按Ingress reservation mask输出ready；
   - reservation沿提前计入occupancy，使下一周期allocation commit无需再次反压；
-  - 不向Ingress返回由当前请求组合生成的ready，避免ROB到Ingress的组合反馈。
+  - ready只在ROB内部按固定1/2/3/4项case判断，不把宽容量算术搬到Ingress。
 
 ppe_rob不保存物理输出lane状态，也不直接驱动顶层输出寄存器。它向ppe_retire_output输出
 按报文序排列、从slot 0开始无空洞的逻辑retirement bundle。
@@ -239,10 +239,10 @@ D0B commit沿从该槽读取沿前旧packet并捕获bank-local row/data。
 密集seq tag保证一个allocation批次对每个bank至多一写；若grant后source gather与A1
 捕获寄存命中同一bank/row，从A1捕获寄存器转发，否则读取data bank。
 Allocation容量判断不组合借用本周期retirement prefix释放的entry，只借用已经寄存且
-本沿必提交的pending-retire credit。D0A接受reservation时立即更新occupancy，D0B使用
-寄存bundle无条件提交metadata和packet捕获；下一批reservation因此能看到上一批已经
-占用的credit。该边界切断FIFO head解析到ROB/Issue Table状态阵列的路径，同时允许
-满载稳态retire、reservation和commit逐周期并行。
+本沿必提交的pending-retire count。ROB按reservation mask的有效lane数做固定case判断；
+D0A接受reservation时立即更新occupancy，D0B使用寄存bundle无条件提交metadata和packet
+捕获。该边界切断FIFO head解析到ROB/Issue Table状态阵列的路径，同时允许满载稳态retire、
+reservation和commit逐周期并行。
 Writeback复用Scheduler的奇偶bank约束：FE0/1只写Bank0/2，FE2/3只写Bank1/3。
 每个entry只检查所属FE pair并在本地完成完整tag资格检查和固定2选1数据归并；同一bank
 仍允许对应FE pair同时写不同row，不设置bank冲突停顿。不得以动态宽数组写索引生成
@@ -284,11 +284,11 @@ one-hot由完整future seq tag生成，且active entry在其completion之前不�
 预测DONE只检查one-hot、active valid和result-valid，不重复完整tag比较。实际writeback
 路径仍执行完整tag及状态检查。
 这使head completion、逻辑退休和retire-count寄存在同一沿发生，容量判断仍只借用
-沿前已寄存的retire-count credit，不引入当前退休扫描到reservation credit的组合通路。
+沿前已寄存的retire-count，不引入当前退休扫描到reservation ready的组合通路。
 退休DONE prefix以两组两项AND平衡生成；ROB head-bank和output start-lane都从
 dense retire-valid推导两位modulo-4 advance并计算next-state，不串接3 bit retire-count
 编码和通用加法。实现可使用等价的奇偶/XOR逻辑，retire-count仍在独立支路上寄存，
-仅供occupancy credit使用。
+仅供occupancy容量判断使用。
 
 3.5 PPE_RETIRE_OUTPUT
 
@@ -312,7 +312,7 @@ ROB状态释放和history写入仍由ROB在原退休沿完成，start_lane与输
 当寄存bkps允许接收时，ingress只把当前所有lane的valid、packet和descriptor写入
 两项elastic FIFO的寄存tail槽位，不在该沿执行sequence allocation、空批判断或ROB容量
 计算。FIFO保持批次顺序；下一周期起，寄存head为空批时直接释放，非空head获得backend
-内部reservation credit足够后，ingress计算密集seq tag和dependency target并在
+ROB ready允许后，ingress计算密集seq tag和dependency target并在
 D0A末端寄存；D0B再把同一commit bundle送入Scheduler和ROB。完整descriptor不离开ingress；
 scheduler只接收delay和dep_required。一次输入周期必须整体接收或整体停止，禁止部分lane接收。
 
@@ -374,10 +374,10 @@ bkps由ingress寄存器直接驱动，任何原始顶层输入或ROB状态均不
 两项elastic FIFO槽位直接终止所有原始输入，总计提供两批物理容量。bkps next-state
 只根据寄存占用、当前bkps状态和寄存head是否将在本沿释放计算；不读取任何当前原始输入。
 
-Backend维护两项寄存容量状态：free reservation credit和pending-retire count。credit
-每个时钟沿扣除当前接受的reservation并加入沿前已登记的pending-retire；Ingress将两项
-寄存值相加后判断head批次是否可接受。这样当前head scan不进入Ingress容量反馈路径，
-同时保留pending-retire带来的同周期容量复用，不会因反馈延迟超卖ROB。
+Backend维护occupancy和pending-retire count。Ingress把已寄存head的lane-valid mask送入ROB，
+ROB按有效lane数直接case判断occupancy减去pending-retire后的容量；ready返回Ingress后，
+Ingress只在ready为真时释放head并产生reservation。这样当前retirement scan不进入容量路径，
+同时保留pending-retire带来的同周期容量复用，不会因容量反馈延迟超卖ROB。
 当bkps_q=0时，tail capture和head release允许同沿发生，因此连续可分配流量不产生结构
 气泡。若capture后两槽占满，则下一拍bkps拉高；满状态中的head释放后，bkps在下一有效沿
 重新拉低。相较三批结构，本方案减少一批宽数据存储和一级搬移选择，代价是依赖重载或ROB
@@ -521,8 +521,8 @@ R0需要完成连续DONE检查、最多4路数据选择和history更新。第一
 退休。Head和逻辑retirement bundle在R0生成；entry清除和history写入由一项逐周期
 pending-retire寄存器在下一沿提交。提交前旧active entry继续提供依赖数据，提交后history
 接替，禁止产生不可用空窗。ppe_retire_output在ROB bundle之后增加一项内部capture寄存器，
-把输出旋转与ROB退休扫描解耦；Occupancy使用寄存的上一周期retire_count释放credit，
-allocation容量可安全借用该已寄存且本沿必提交的credit，不依赖当前head扫描。
+把输出旋转与ROB退休扫描解耦；Occupancy使用寄存的上一周期retire_count释放空间，
+allocation容量可安全借用该已寄存且本沿必提交的retirement lookahead，不依赖当前head扫描。
 Active result的4-bank组织保证连续4个ROB ID分别落入不同bank。R0对每个bank只执行
 一次8:1行选择。物理head拆分为2 bit head bank和每bank一个3 bit row cursor，
 各bank直接以寄存cursor读取DONE和data；退休沿只推进被消费bank的cursor。
@@ -568,7 +568,7 @@ clock-gating推断机会并抑制无效lane宽数据翻转。
      不维护全局候选compact、跨bank重排或严格年龄队列；候选槽只保存窄metadata，
      packet和所需dependency在grant后从ROB gather。
   9) ingress使用两项整批elastic FIFO并寄存输出bkps；两个槽位均是输入边界寄存器，
-     原始顶层输入不进入任何功能组合路径，backend只向Ingress提供寄存reservation credit。
+     原始顶层输入不进入任何功能组合路径，Ingress与backend之间使用已寄存head mask和reservation ready。
 
 上述项目只有在后续时序或性能数据证明有必要时才重新评估。变更任一项都必须先同步
 HLD和LLD，不得在RTL中自行启用。

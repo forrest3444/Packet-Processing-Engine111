@@ -69,7 +69,7 @@ valid、enable和mask在需要按位运算时仍使用packed vector。其余RTL�
   |                | registered FIFO head                                    |
   |                v                                                         |
   |  +---------------------------+                                           |
-  |  | D0A Reservation           |<------------ registered reserve_credit    |
+  |  | D0A Reservation           |<------------ reservation ready          |
   |  | - valid rank / dense seq  |                                           |
   |  | - registered commit data  |---- D0B alloc metadata --------------+---|--+
   |  +-------------+-------------+                                           |  |
@@ -130,7 +130,7 @@ valid、enable和mask在需要按位运算时仍使用packed vector。其余RTL�
 2.2 Backend内部架构图
 
                          From PPE_INGRESS
-              reserve_count + registered credit / commit bundle
+              reserve_valid mask + ready / commit bundle
                                   |
                                   | Flow R-A：ROB分配
                                   v
@@ -177,9 +177,9 @@ valid、enable和mask在需要按位运算时仍使用packed vector。其余RTL�
   |                                          +-----------------------------+   |
   |                                                                            |
   |  +--------------------------+                                              |
-  |  | Allocation Capacity      |<--- occupancy / retire_count / reserve request|
+  |  | Allocation Capacity      |<--- occupancy / retire_count / reserve mask  |
   |  +-------------+------------+                                              |
-  |                | registered reserve_credit                                |
+  |                | reservation ready                                      |
   +----------------+-----------------------------------------------------------+
 
   Backend内部四条通路：
@@ -192,7 +192,7 @@ valid、enable和mask在需要按位运算时仍使用packed vector。其余RTL�
 2.3 典型无依赖报文数据流
 
   1) I0在bkps允许时把外部输入捕获到两项elastic FIFO的寄存tail槽位；
-  2) D0A在寄存credit足够时为FIFO head分配seq并寄存commit bundle，
+  2) D0A在ROB ready允许时为FIFO head分配seq并寄存commit bundle，
      同沿ROB提前占用对应容量；
   3) D0B把保证提交的bundle写入ROB entry，并由Scheduler将无依赖报文标记为
      ISSUE_READY；
@@ -475,20 +475,19 @@ D0B从commit bundle保存的FIFO槽位读取沿前旧packet并捕获bank-local r
 
   head_ptr[4:0]
   occupancy[5:0]
-reserve_credit[5:0]
+  pending_retire_count[2:0]           (ROB内部)
   retire_bank_row[4][2:0]
 
   occupancy_after_retire = occupancy - pending_retire_count
 
 head_ptr按32自然回绕。Allocation物理索引由alloc_seq_tag低位直接产生，不保存tail_ptr。
 retire_bank_row用于data/tag的物理读取、DONE选择和对外ready row。
-occupancy范围为0..32，并包含最多一项已经reservation但尚未commit的batch。reserve_credit
-free reservation credit表示不含当前pending-retire的物理空闲数量，复位值为32；Ingress
-将它与同样寄存的pending-retire count相加后得到下一reservation沿可安全接收的entry数量。
-free credit在同一更新中扣除当前接受的reservation count并加入沿前pending-retire；本沿
-新扫描出的retire count只更新pending-retire寄存器，不进入当前credit组合路径。该策略
-不会超卖ROB，且退休scan不进入Ingress容量路径。固定4-lane实现由Ingress直接提供0..4的窄
-alloc_reserve_count，ROB只执行一次小位宽credit比较，不再对16种valid向量做重复译码。
+occupancy范围为0..32，并包含最多一项已经reservation但尚未commit的batch。ROB使用
+occupancy减去同样寄存的pending-retire count作为下一reservation的可用基线；本沿新扫描出的
+retire count只更新pending-retire寄存器，不进入当前reservation组合路径。该策略不会超卖ROB，
+且退休scan不进入Ingress容量路径。固定4-lane实现由Ingress提供已寄存的
+alloc_reserve_valid[N]，ROB按有效lane数对1/2/3/4项做固定case容量判断并输出
+alloc_reserve_ready；不需要在Ingress重新计算容量，也不保存独立credit。
 
 4.3 Retired History Bank
 
@@ -531,18 +530,14 @@ Top外部多位lane端口使用unpacked array，以下方括号表示逻辑维�
 Ingress对FIFO寄存head保持原始lane索引，不对128 bit packet做物理压缩。D0A送往ROB的
 容量reservation接口为：
 
-  alloc_reserve_count_o[2:0]
-  alloc_reserve_credit_i[5:0]
-  alloc_pending_retire_count_i[2:0]
+  alloc_reserve_valid_o[N-1:0]
+  alloc_reserve_ready_i
 
-alloc_reserve_count是FIFO head保存的有效报文数量，来自已寄存FIFO head，取值为0..4；
-alloc_reserve_credit和alloc_pending_retire_count均由ROB寄存输出，二者之和表示当前批次
-可安全预留的entry数量。Ingress不再把四位lane-valid mask发送给ROB做容量译码，
-reservation接受条件为：
+alloc_reserve_valid是已寄存FIFO head的lane-valid mask；ROB根据mask中的1数和已寄存的
+pending-retire count给出ready。Ingress不在本地重建ROB容量，reservation接受条件为：
 
-  reserve_fire = (alloc_reserve_count != 0)
-               && (alloc_reserve_count <=
-                   alloc_reserve_credit + alloc_pending_retire_count)
+  reserve_fire = (alloc_reserve_valid != 0)
+               && alloc_reserve_ready
 
 D0A接受reservation时，ROB立即把reserve_count计入occupancy，Ingress弹出FIFO head、
 推进next_seq_tag并寄存一项commit bundle。D0B commit不再携带ready或接受反馈：
@@ -738,10 +733,9 @@ ppe_retire_output和四个FE
 在上升沿且bkps_q=0时，ingress将全部lane的in_valid、in_packet和in_desc无条件写入
 slot_wr_ptr选择的寄存槽位，同时推进写指针和占用计数。原始输入不参与任何其他状态
 更新。两项槽位本身构成有序FIFO，不存在capture到FIFO的第二次宽数据搬移。下一周期
-仅根据寄存head lane-valid和ROB提供的寄存credit判断：空批直接释放；非空批在
-alloc_reserve_count不超过alloc_reserve_credit与alloc_pending_retire_count之和时完成
-reservation、寄存commit bundle并
-释放。tail capture与head release允许同沿发生。
+仅根据寄存head lane-valid和ROB提供的reservation ready判断：空批直接释放；非空批在
+ready为真时完成reservation、寄存commit bundle并释放。tail capture与head release允许
+同沿发生。
 
 6.2 D0 Registered-Head Rank
 
@@ -759,18 +753,20 @@ reservation、寄存commit bundle并
   lane_rank[3] = lower_pair_count + valid[2]
   head_packet_count = lower_pair_count + upper_pair_count
 
+上述 valid 和 packet_count 均由已寄存的 slot_lane_valid 计算；原始 in_valid 只在 I0
+沿写入 slot_lane_valid、slot_packet 和 slot_desc，不参与该组合计数或后续 reservation
+与反压 next-state 计算。
+
 每个slot独立计算上述rank和packet_count；slot_rd_ptr只在这些窄结果之后选择
 非空FIFO head。对所选head：
 
   seq_tag[i]           = next_seq_tag + lane_rank[i]
   head_lane_valid[i]   = slot_lane_valid[slot_rd_ptr][i]
-  alloc_reserve_count    = head_packet_count
+  alloc_reserve_valid[i] = head_lane_valid[i]
   reserve_fire[i]        = head_lane_valid[i]
-                         && (alloc_reserve_count <=
-                             alloc_reserve_credit
-                             + alloc_pending_retire_count)
+                         && alloc_reserve_ready
 
-当alloc_reserve_credit不足或internal_rst_n=0时，reserve_fire必须为0，FIFO head、
+当alloc_reserve_ready不足或internal_rst_n=0时，reserve_fire必须为0，FIFO head、
 next_seq_tag和commit bundle不得接受该请求。上一周期已经寄存的commit bundle不受
 当前ready影响，并在本沿无条件写ROB和Issue Table。
 
@@ -804,15 +800,14 @@ ROB和history索引均由完整tag低位组合派生，不作为ingress输出或
 
 6.5 D0A Reservation / D0B Commit
 
-|alloc_reserve_count != 0 && alloc_reserve_count <=
-alloc_reserve_credit + alloc_pending_retire_count的D0A reservation沿同时完成：
+|alloc_reserve_valid != 0 && alloc_reserve_ready的D0A reservation沿同时完成：
 
   - backend把reserve_count计入occupancy，提前占用下一周期commit所需容量；
   - ingress把当前head预览标记为有效commit，并保存原FIFO槽位号；
   - ingress释放elastic FIFO head并按有效lane数量推进next_seq_tag。
 
 FIFO非空时，Ingress的commit metadata寄存器每沿预览当前head的seq_tag、
-target_seq_tag、delay和dep_required，不以credit比较结果作为metadata预览写使能。
+target_seq_tag、delay和dep_required，不以ready比较结果作为metadata预览写使能。
 alloc_commit_valid单独由reservation成功限定；因此未取得reservation的预览不得被
 ROB或Issue Table使用，且ROB ready不广播到各metadata寄存器CE。
 
@@ -1222,35 +1217,28 @@ FE/calendar协议错误，RTL不设置可综合恢复通路。
 14. 全局反压
 ================================================================================
 
-Backend维护寄存的allocation reservation credit：
+Backend维护occupancy和寄存的pending-retire count：
 
   occupancy_after_retire = occupancy - pending_retire_count
-  reserve_capacity       = reserve_credit + pending_retire_count
-  reserve_accept         = reserve_count != 0
-                            && reserve_count <= reserve_capacity
-  occupancy_next         = occupancy_after_retire
-                            + (reserve_accept ? reserve_count : 0)
-  reserve_credit_next    = reserve_credit - accepted_reserve_count
-                            + pending_retire_count
+  reserve_accept         = case(valid_mask, occupancy_after_retire)
+  accepted_reserve_count = reserve_accept ? popcount(valid_mask) : 0
+  occupancy_next         = occupancy_after_retire + accepted_reserve_count
   pending_retire_next    = retire_count
 
-容量计算只借用已寄存且本沿必提交的pending-retire credit，避免当前retirement scan
-进入Ingress容量路径。接受reservation的同一沿把reserve_count计入occupancy；新扫描
-出的retire count写入pending-retire寄存器，随下一沿容量判断使用。free credit与pending
-count分离寄存，既保持容量安全也避免把当前head scan串入credit D路径。
-Ingress直接提供0..4的reserve_count，ROB不再对16种请求向量做宽译码。
+其中reserve_accept对1/2/3/4项请求使用固定case容量阈值。容量计算只借用已寄存且本沿必
+提交的pending-retire count，避免当前retirement scan进入Ingress容量路径。接受reservation
+的同一沿把有效lane数计入occupancy；新扫描出的retire count写入pending-retire寄存器，随
+下一沿容量判断使用。ready由ROB本地生成并返回Ingress，保证不会超卖ROB。
 
 Ingress以两项elastic FIFO吸收寄存反压延迟。定义：
 
   capture_batch   = !bkps_q
-  head_nonempty   = (alloc_reserve_count != 0)
+  head_nonempty   = (alloc_reserve_valid != 0)
   reserve_batch   = (slot_count != 0) && head_nonempty
-                    && (alloc_reserve_count <=
-                        alloc_reserve_credit + alloc_pending_retire_count)
+                    && alloc_reserve_ready
   head_release    = (slot_count != 0) &&
                     (!head_nonempty
-                     || (alloc_reserve_count <=
-                         alloc_reserve_credit + alloc_pending_retire_count))
+                     || alloc_reserve_ready)
 
 沿后占用按capture与head release统一更新：
 
@@ -1276,7 +1264,7 @@ capture_batch时翻转。不得用动态bank索引形成覆盖全部宽存储的
 让原始lane-valid参与bank写使能。
 
 复位期间bkps_q置1，slot_count和读写指针清零。复位释放后bkps只能在时钟沿拉低。
-原始in_valid不得参与alloc_reserve_count、reserve_credit、bkps_d或任何其他功能组合逻辑。
+原始in_valid不得参与alloc_reserve_valid、bkps_d或任何其他功能组合逻辑。
 
 ROB_DEPTH=32且issue table以seq_tag低位索引。ROB entry能够退休意味着对应issue entry
 此前已经派发并释放，因此backend释放的物理槽在同沿也可由相同低位的新allocation复用。
@@ -1290,7 +1278,7 @@ A0、G0、W0和R0允许同周期作用于不同entry。W0不写history；R0是hi
 
 必须满足：
 
-  - 新reservation允许借用本沿提交的pending-retire credit；对应allocation commit
+  - 新reservation允许借用本沿提交的pending-retire lookahead；对应allocation commit
     在下一沿写入已经保证可用的entry；
   - 重叠entry的退休输出、retirement bypass和history写入读取沿前旧内容，allocation
     对沿后ROB valid、seq_tag和result_valid具有最终优先权；
@@ -1300,15 +1288,13 @@ A0、G0、W0和R0允许同周期作用于不同entry。W0不写history；R0是hi
   - 已DONE退休entry不再次收到writeback；
   - 同周期4路writeback ID互不相同；
   - 同周期reservation和pending retirement数量统一合并更新occupancy；commit不再次
-    修改occupancy；reserve_credit同步更新为下一沿可安全接收的容量；
+    修改occupancy；pending-retire同步更新为下一沿可安全接收的lookahead；
   - ROB valid、result_valid、head和occupancy只有ppe_rob一个时序状态所有者；
   - start_lane和out_valid/out_packet只有ppe_retire_output一个时序状态所有者。
 
 必须按统一next-state计算：
 
   occupancy_next = occupancy - pending_retire_count + accepted_reserve_count
-  reserve_credit_next = reserve_credit - accepted_reserve_count
-                         + pending_retire_count
   pending_retire_next = retire_count
 
 valid/result_valid数组在同一个时序always block中按writeback、retire、allocation

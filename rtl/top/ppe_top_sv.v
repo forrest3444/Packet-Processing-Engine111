@@ -23,9 +23,8 @@ module PPE_TOP_SV #(
     wire       internal_rst_n;
 
     // Point-to-point interconnects omit direction suffixes intentionally.
-    wire [`PPE_LANE_COUNT_W-1:0]              alloc_reserve_count;
-    wire [`PPE_ROB_OCCUPANCY_W-1:0]           alloc_reserve_credit;
-    wire [`PPE_LANE_COUNT_W-1:0]              alloc_pending_retire_count;
+    wire [`PPE_N-1:0]                         alloc_reserve_valid;
+    wire                                      alloc_reserve_ready;
     wire [`PPE_N-1:0]                         alloc_commit_valid;
     wire [`PPE_SEQ_W-1:0]                     alloc_seq_tag [0:`PPE_N-1];
     wire [`PPE_SEQ_W-1:0]                     alloc_target_seq_tag [0:`PPE_N-1];
@@ -82,9 +81,8 @@ module PPE_TOP_SV #(
         .in_packet_i              (in_packet),
         .in_desc_i                (in_desc),
         .bkps_o                   (bkps),
-        .alloc_reserve_count_o    (alloc_reserve_count),
-        .alloc_reserve_credit_i   (alloc_reserve_credit),
-        .alloc_pending_retire_count_i (alloc_pending_retire_count),
+        .alloc_reserve_valid_o    (alloc_reserve_valid),
+        .alloc_reserve_ready_i    (alloc_reserve_ready),
         .alloc_commit_valid_o     (alloc_commit_valid),
         .alloc_seq_tag_o          (alloc_seq_tag),
         .alloc_target_seq_tag_o   (alloc_target_seq_tag),
@@ -152,9 +150,8 @@ module PPE_TOP_SV #(
     ) u_rob (
         .clk_i                       (clk),
         .rst_ni                      (internal_rst_n),
-        .alloc_reserve_count_i       (alloc_reserve_count),
-        .alloc_reserve_credit_o      (alloc_reserve_credit),
-        .alloc_pending_retire_count_o(alloc_pending_retire_count),
+        .alloc_reserve_valid_i       (alloc_reserve_valid),
+        .alloc_reserve_ready_o       (alloc_reserve_ready),
         .alloc_commit_valid_i        (alloc_commit_valid),
         .alloc_seq_tag_i             (alloc_seq_tag),
         .alloc_packet_i              (alloc_packet),
