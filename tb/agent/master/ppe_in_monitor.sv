@@ -27,10 +27,12 @@ class ppe_in_monitor extends uvm_component;
     task run_phase(uvm_phase phase);
         ppe_item tr;
 
-        @(posedge vif.rst_n);
+        accepted_batches = 0;
         forever begin
-            @(posedge vif.clk);
-            if (!vif.bkps && (|vif.in_valid)) begin
+            @(posedge vif.clk or negedge vif.rst_n);
+            if (!vif.rst_n) begin
+                accepted_batches = 0;
+            end else if (!vif.bkps && (|vif.in_valid)) begin
                 tr = ppe_item::type_id::create(
                     $sformatf("accepted_batch_%0d", accepted_batches));
                 for (int unsigned lane = 0; lane < TB_N; lane++) begin

@@ -13,6 +13,7 @@
 class ppe_scoreboard extends uvm_component;
     `uvm_component_utils(ppe_scoreboard)
 
+    ppe_vif_t vif;
     uvm_analysis_imp_in #(ppe_item, ppe_scoreboard) in_imp;
     uvm_analysis_imp_out #(ppe_out_item, ppe_scoreboard) out_imp;
 
@@ -27,11 +28,37 @@ class ppe_scoreboard extends uvm_component;
         out_imp = new("out_imp", this);
     endfunction
 
+    function void build_phase(uvm_phase phase);
+        super.build_phase(phase);
+        if (!uvm_config_db #(ppe_vif_t)::get(this, "", "vif", vif)) begin
+            `uvm_fatal("NOVIF", "ppe_scoreboard cannot get vif")
+        end
+    endfunction
+
+    task run_phase(uvm_phase phase);
+        reset_state();
+        forever begin
+            @(negedge vif.rst_n);
+            reset_state();
+        end
+    endtask
+
+    function void reset_state();
+        exp_total = 0;
+        got_total = 0;
+        result_history.delete();
+        expected_q.delete();
+    endfunction
+
     function void write_in(ppe_item tr);
         int unsigned dep_offset;
         bit [127:0] dep_data;
         bit [127:0] vip_data_in;
         bit [127:0] expected;
+
+        if (!vif.rst_n) begin
+            return;
+        end
 
         foreach (tr.valid[i]) begin
             if (tr.valid[i]) begin
@@ -55,6 +82,10 @@ class ppe_scoreboard extends uvm_component;
 
     function void write_out(ppe_out_item item);
         bit [127:0] expected;
+
+        if (!vif.rst_n) begin
+            return;
+        end
 
         if (expected_q.size() == 0) begin
             `uvm_error("UNEXPECTED", "output observed with an empty expected queue")

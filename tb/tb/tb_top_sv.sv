@@ -174,6 +174,8 @@ module tb_top_sv;
             null, "uvm_test_top.env.master_agent.*", "vif", pif);
         uvm_config_db #(ppe_vif_t)::set(
             null, "uvm_test_top.env.slave_agent.*", "vif", pif);
+        uvm_config_db #(ppe_vif_t)::set(
+            null, "uvm_test_top.env.scb", "vif", pif);
         run_test();
     end
 

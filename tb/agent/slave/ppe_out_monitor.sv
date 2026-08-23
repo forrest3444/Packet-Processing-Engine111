@@ -31,10 +31,14 @@ class ppe_out_monitor extends uvm_component;
         int unsigned index;
         bit [TB_LANE_W-1:0] lane;
 
-        @(posedge vif.rst_n);
         start_lane = '0;
         forever begin
-            @(posedge vif.clk);
+            @(posedge vif.clk or negedge vif.rst_n);
+            if (!vif.rst_n) begin
+                start_lane = '0;
+                continue;
+            end
+
             valid_count = 0;
             for (int unsigned lane_idx = 0; lane_idx < TB_N; lane_idx++) begin
                 valid_count += vif.out_valid[lane_idx];

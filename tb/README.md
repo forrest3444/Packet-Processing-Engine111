@@ -3,6 +3,10 @@
 The environment verifies the maintained four-FE RTL with shared agents, FE
 reference model, and end-to-end scoreboard.
 
+The black-box top-level test-point decomposition is available in
+[`doc/ppe_test_plan.md`](doc/ppe_test_plan.md) (中文) and
+[`doc/ppe_test_plan.en.md`](doc/ppe_test_plan.en.md) (English).
+
 Functional tests have distinct primary responsibilities:
 
 - `ppe_basic_test`: short end-to-end smoke test.

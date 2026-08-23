@@ -84,6 +84,36 @@ module ppe_pipeline_stall_probe #(
         end
     endfunction
 
+    task automatic reset_metrics;
+        int unsigned width;
+        begin
+            measuring = 1'b0;
+            reported = 1'b0;
+            cycles = 0;
+            accepted_packets = 0;
+            issued_packets = 0;
+            completed_packets = 0;
+            retired_packets = 0;
+            output_packets = 0;
+            ingress_backpressure_cycles = 0;
+            rob_full_cycles = 0;
+            rob_head_wait_cycles = 0;
+            ready_empty_cycles = 0;
+            candidate_empty_cycles = 0;
+            calendar_blocked_candidate_slots = 0;
+            matcher_ungranted_shortlists = 0;
+            wait_dep_entry_cycles = 0;
+            ready_entry_cycles = 0;
+            selected_entry_cycles = 0;
+            candidate_entry_cycles = 0;
+            for (width = 0; width <= LANES; width++) begin
+                grant_width_hist[width] = 0;
+                issue_width_hist[width] = 0;
+                retire_width_hist[width] = 0;
+            end
+        end
+    endtask
+
     task automatic report_probe;
         real issue_rate;
         real retire_rate;
@@ -117,34 +147,9 @@ module ppe_pipeline_stall_probe #(
     endtask
 
     initial begin
-        int unsigned width;
-
         enabled = $test$plusargs("PIPELINE_PROBE");
-        measuring = 1'b0;
-        reported = 1'b0;
         expected_packets = EXPECTED_PACKETS;
-        cycles = 0;
-        accepted_packets = 0;
-        issued_packets = 0;
-        completed_packets = 0;
-        retired_packets = 0;
-        output_packets = 0;
-        ingress_backpressure_cycles = 0;
-        rob_full_cycles = 0;
-        rob_head_wait_cycles = 0;
-        ready_empty_cycles = 0;
-        candidate_empty_cycles = 0;
-        calendar_blocked_candidate_slots = 0;
-        matcher_ungranted_shortlists = 0;
-        wait_dep_entry_cycles = 0;
-        ready_entry_cycles = 0;
-        selected_entry_cycles = 0;
-        candidate_entry_cycles = 0;
-        for (width = 0; width <= LANES; width++) begin
-            grant_width_hist[width] = 0;
-            issue_width_hist[width] = 0;
-            retire_width_hist[width] = 0;
-        end
+        reset_metrics();
         if ($value$plusargs("UVM_TESTNAME=%s", testname)
             && (testname == "ppe_pipeline_stall_test")) begin
             enabled = 1'b1;
@@ -152,7 +157,7 @@ module ppe_pipeline_stall_probe #(
         void'($value$plusargs("PROBE_PACKETS=%d", expected_packets));
     end
 
-    always @(negedge clk) begin : collect_pipeline_metrics
+    always @(negedge clk or negedge rst_n) begin : collect_pipeline_metrics
         int unsigned entry;
         int unsigned slot;
         int unsigned accepted_now;
@@ -168,7 +173,9 @@ module ppe_pipeline_stall_probe #(
         int unsigned grant_now;
         logic [CAND_DEPTH-1:0] candidate_available;
 
-        if (enabled && rst_n && !reported) begin
+        if (!rst_n) begin
+            reset_metrics();
+        end else if (enabled && !reported) begin
             accepted_now = bkps ? 0 : popcount_lanes(in_valid);
             issued_now = popcount_lanes(issue_valid);
             completed_now = popcount_lanes(completion_valid);
